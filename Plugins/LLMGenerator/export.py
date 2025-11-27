@@ -1,349 +1,245 @@
+#!/usr/bin/env python3
+"""
+Export Hugging Face LLMs to CoreML format for use with LlamaANE.
+
+Usage:
+    python export.py <model_id> [options]
+
+Examples:
+    python export.py meta-llama/Llama-3.2-1B-Instruct
+    python export.py Qwen/Qwen2.5-1.5B-Instruct --max-context 4096
+    python export.py mistralai/Mistral-7B-Instruct-v0.3 --quantize int4
+"""
+
+import argparse
 import logging
 import os
-from coremltools.models import MLModel
-from coremltools.models.neural_network.printer import print_network_spec
+import sys
+from pathlib import Path
+from typing import Optional
 
-
-import torch
-import torch.nn as nn
 import coremltools as ct
-import coremltools.optimize as cto
 import numpy as np
-from coremltools.optimize.coreml import OpPalettizerConfig, OptimizationConfig, palettize_weights, \
-    OpLinearQuantizerConfig, linear_quantize_weights
+import torch
+from coremltools.models import MLModel
+from transformers import AutoConfig, AutoTokenizer
 
-from transformers.models.auto import AutoTokenizer
-from transformers.models.auto.tokenization_auto import get_tokenizer_config
-from transformers.models.auto import AutoConfig
-
-from modeling_llama import StatefulLlamaForCausalLM
-from modeling_mistral import StatefulMistralForCausalLM
+# Suppress coremltools logging
 logging.getLogger("coremltools").setLevel(logging.ERROR)
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
-# https://huggingface.co/meta-llama/Llama-3.2-3B-Instruct
-# MODEL_ID: str = "JesperSqv/Llama-3.2-1B-Instruct-Financial-RAG"
-MODEL_ID: str = 'mistralai/Mistral-Small-24B-Instruct-2501'
-METADATA_TOKENIZER: str = "co.huggingface.exporters.name"
-BASE_NAME = os.path.basename(MODEL_ID)
+# Metadata keys for Swift to read
+METADATA_KEYS = {
+    "model_id": "co.huggingface.exporters.name",
+    "num_hidden_layers": "co.llamaane.num_hidden_layers",
+    "num_attention_heads": "co.llamaane.num_attention_heads",
+    "num_key_value_heads": "co.llamaane.num_key_value_heads",
+    "hidden_size": "co.llamaane.hidden_size",
+    "head_dim": "co.llamaane.head_dim",
+    "vocab_size": "co.llamaane.vocab_size",
+    "max_position_embeddings": "co.llamaane.max_position_embeddings",
+    "model_type": "co.llamaane.model_type",
+}
 
-max_context_size: int = 8192
-config = AutoConfig.from_pretrained(MODEL_ID)
-tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
-if config.architectures[0] == "MistralForCausalLM":
-    is_mistral = True
-else:
-    is_mistral = False
 
-if config.architectures[0] == "MistralForCausalLM":
-    CausalLM = StatefulMistralForCausalLM
-elif config.architectures[0] == "LlamaForCausalLM":
-    CausalLM = StatefulLlamaForCausalLM
-else:
-    print('Unsupported model type. LLMKit currently only supports Mistral and Llama models.')
-    exit(1)
+def get_model_wrapper(architecture: str):
+    """Get the appropriate stateful model wrapper for the architecture."""
+    from modeling_llama import StatefulLlamaForCausalLM
+    from modeling_mistral import StatefulMistralForCausalLM
+    from modeling_qwen import StatefulQwen2ForCausalLM
+    from modeling_deepseek import StatefulDeepseekV3ForCausalLM
 
-tokenizer.save_pretrained(f"models/{BASE_NAME}_tokenizer")
-# config = get_tokenizer_config(MODEL_ID)
-# print(config)
-# auto_config = AutoConfig.from_pretrained(MODEL_ID)
-def test_model_output(mlmodel: MLModel,
-                      input_ids_pt,
-                      attention_mask_pt,
-                      use_fixed_size: bool,
-                      use_state: bool):
-    eos_token_id = tokenizer.eos_token_id
-    generated_ids = input_ids_pt[0].tolist()  # (1, prompt_length) -> prompt_length tokens
+    wrappers = {
+        "LlamaForCausalLM": StatefulLlamaForCausalLM,
+        "MistralForCausalLM": StatefulMistralForCausalLM,
+        "Qwen2ForCausalLM": StatefulQwen2ForCausalLM,
+        "DeepseekV3ForCausalLM": StatefulDeepseekV3ForCausalLM,
+    }
 
-    if use_fixed_size:
-        # Number of active tokens
-        used_tokens = (attention_mask_pt[0] == 1).sum().item()
-    else:
-        # Just use the prompt length
-        used_tokens = input_ids_pt.shape[1]
+    if architecture not in wrappers:
+        supported = ", ".join(wrappers.keys())
+        raise ValueError(f"Unsupported architecture: {architecture}\nSupported: {supported}")
 
-    if use_state:
-        state = mlmodel.make_state()
-    else:
-        state = None
+    return wrappers[architecture]
 
-    decoded_text_so_far = tokenizer.decode(generated_ids[:used_tokens])
 
-    for i in range(100):
-        input_ids_np = np.array([generated_ids], dtype=np.int32)
+def generate_causal_mask(seq_length: int) -> np.ndarray:
+    """Generate a lower-triangular causal attention mask."""
+    mask = np.tril(np.ones((seq_length, seq_length), dtype=np.float16))
+    return mask.reshape(1, 1, seq_length, seq_length)
 
-        if use_fixed_size:
-            # Fixed sized mask
-            attention_mask_np = np.zeros((1, max_context_size), dtype=np.int32)
-            attention_mask_np[0, :used_tokens] = 1
-        elif use_state:
-            # Causal mask (lower-triangular), same shape each step
-            # Make sure dtype matches what model expects (float16)
-            attention_mask_np = _generate_causal_mask(used_tokens)
-        else:
-            # Flexible size without state: just use a 2D mask of shape (1, used_tokens)
-            attention_mask_np = np.ones((1, used_tokens), dtype=np.int32)
 
-        # Run inference
-        if use_state:
-            predictions = mlmodel.predict({
-                "inputIds": input_ids_np,
-                "causalMask": attention_mask_np
-            }, state=state)
-        else:
-            predictions = mlmodel.predict({
-                "inputIds": input_ids_np,
-                "attentionMask": attention_mask_np
-            })
+def build_model_metadata(config, model_id: str, max_context: int) -> dict:
+    """Build metadata dictionary to embed in the CoreML model."""
+    head_dim = config.hidden_size // config.num_attention_heads
+    return {
+        METADATA_KEYS["model_id"]: model_id,
+        METADATA_KEYS["num_hidden_layers"]: str(config.num_hidden_layers),
+        METADATA_KEYS["num_attention_heads"]: str(config.num_attention_heads),
+        METADATA_KEYS["num_key_value_heads"]: str(getattr(config, "num_key_value_heads", config.num_attention_heads)),
+        METADATA_KEYS["hidden_size"]: str(config.hidden_size),
+        METADATA_KEYS["head_dim"]: str(head_dim),
+        METADATA_KEYS["vocab_size"]: str(config.vocab_size),
+        METADATA_KEYS["max_position_embeddings"]: str(getattr(config, "max_position_embeddings", max_context)),
+        METADATA_KEYS["model_type"]: str(config.model_type),
+    }
 
-        logits = predictions["logits"]  # Check the shape of logits
 
-        # Handle indexing based on how model returns logits
-        if use_state:
-            # If incremental decoding: logits shape might be (1,1,vocab_size)
-            last_token_logits = logits[0, -1, :]
-        else:
-            # Full sequence decoding: logits shape might be (1, used_tokens, vocab_size)
-            last_token_logits = logits[0, used_tokens - 1, :]
-
-        # Choose next token (greedy)
-        next_token_id = int(np.argmax(last_token_logits))
-
-        # Append next token
-        if use_fixed_size:
-            if used_tokens < max_context_size:
-                generated_ids[used_tokens] = next_token_id
-            else:
-                print("Reached max context size.")
-                break
-        else:
-            generated_ids.append(next_token_id)
-
-        used_tokens += 1
-
-        # Stop if EOS
-        if next_token_id == eos_token_id:
-            break
-
-        full_text = tokenizer.decode(generated_ids[:used_tokens], skip_special_tokens=False,
-                                     clean_up_tokenization_spaces=False)
-        new_text = full_text[len(decoded_text_so_far):]
-        decoded_text_so_far = full_text
-        print(new_text, end="", flush=True)
-
-    print("\nFinal output:")
-    final_output = tokenizer.decode(generated_ids[:used_tokens], skip_special_tokens=True,
-                                    clean_up_tokenization_spaces=True)
-    print(final_output)
-
-def convert_model_to_a16w8(mlmodel: MLModel):
-    # Create a quantization configuration for weights only (to INT8)
-    weight_config = cto.coreml.OptimizationConfig(
-        global_config=cto.coreml.OpLinearQuantizerConfig(
-            mode="linear_symmetric",  # or "linear_symmetric" / "linear_lut" etc.
-            dtype="int8"  # Set weights to 8-bit integers
-        )
-    )
-
-    # Apply weight-only quantization
-    mlmodel_w8 = cto.coreml.linear_quantize_weights(mlmodel, config=weight_config)
-
-    # The resulting model has W8A16 (since activations remain FP16 from the original model)
-    mlmodel_w8.save(f"models/{BASE_NAME}_A16W8.mlpackage")
-    print('Converted A16W8')
-    return mlmodel_w8
-
-def convert_model_a8w8(mlmodel: MLModel):
-    # first palettize the model
-    # this will produce an LUT with Float values
-    op_config = OpPalettizerConfig(nbits=8)
-    config = OptimizationConfig(global_config=op_config)
-    mlmodel_palettized = palettize_weights(mlmodel, config)
-    mlmodel_palettized.save(f'models/{BASE_NAME}_Fixed_Stateless_Int8.mlpackage')
-    # now apply weight quantization on the model,
-    # with "joint_compression" set to True.
-    # this will result in quantizing the LUT to 8 bits.
-    # (granularity must be set to "per-tensor" for this scenario)
-    op_config = OpLinearQuantizerConfig(mode="linear_symmetric",
-                                        granularity="per_tensor")
-    linear_weight_quantize_config = OptimizationConfig(global_config=op_config)
-
-    mlmodel_palettized_with_8bit_lut = linear_quantize_weights(mlmodel_palettized,
-                                                               linear_weight_quantize_config,
-                                                               joint_compression=True)
-    mlmodel_palettized_with_8bit_lut.save(f'models/{BASE_NAME}_A8W8.mlpackage')
-    print('Converted to A8W8')
-    return mlmodel_palettized_with_8bit_lut
-
-def convert_model_a8w4(mlmodel: MLModel):
-    # Create a quantization configuration for weights only (to INT8)
-    weight_config = cto.coreml.OptimizationConfig(
-        global_config=cto.coreml.OpLinearQuantizerConfig(
-            mode="linear_symmetric",  # or "linear_symmetric" / "linear_lut" etc.
-            dtype="int8"  # Set weights to 8-bit integers
-        )
-    )
-
-    # Apply weight-only quantization
-    mlmodel_w8 = cto.coreml.linear_quantize_weights(mlmodel, config=weight_config)
-
-    op_config = OpPalettizerConfig(nbits=4)
-    config = OptimizationConfig(global_config=op_config)
-    mlmodel_palettized = palettize_weights(mlmodel_w8, config)
-    op_config = OpLinearQuantizerConfig(mode="linear_symmetric",
-                                        granularity="per_tensor")
-    linear_weight_quantize_config = OptimizationConfig(global_config=op_config)
-    mlmodel_palettized_with_8bit_lut = linear_quantize_weights(mlmodel_palettized,
-                                                               linear_weight_quantize_config,
-                                                               joint_compression=True)
-    mlmodel_palettized_with_8bit_lut.save(f'models/{BASE_NAME}_A8W4.mlpackage')
-    print('Converted to A8W4')
-    return mlmodel_palettized_with_8bit_lut
-
-def convert_model_to_int4(mlmodel: MLModel):
-    # # Block-wise quantize model weights to int4
+def quantize_to_int4(mlmodel: MLModel, output_path: str) -> MLModel:
+    """Apply INT4 block-wise quantization to the model."""
+    print("Applying INT4 quantization...")
     op_config = ct.optimize.coreml.OpLinearQuantizerConfig(
         mode="linear_symmetric",
         dtype="int4",
         granularity="per_block",
         block_size=32,
     )
-    config = ct.optimize.coreml.OptimizationConfig(global_config=op_config)
-    mlmodel_int4 = ct.optimize.coreml.linear_quantize_weights(mlmodel, config=config)
-    mlmodel_int4._spec.description.metadata.userDefined.update({METADATA_TOKENIZER: MODEL_ID})
-    mlmodel_int4.save(f"models/{BASE_NAME}_Int4.mlpackage")
+    quant_config = ct.optimize.coreml.OptimizationConfig(global_config=op_config)
+    mlmodel_int4 = ct.optimize.coreml.linear_quantize_weights(mlmodel, config=quant_config)
+
+    # Copy metadata from original model
+    for key, value in mlmodel._spec.description.metadata.userDefined.items():
+        mlmodel_int4._spec.description.metadata.userDefined[key] = value
+
+    mlmodel_int4.save(output_path)
+    print(f"Saved INT4 model to: {output_path}")
     return mlmodel_int4
 
-def _generate_causal_mask(prompt_length: int):
-    # Python version of the Swift logic
-    maskValues = []
-    for i in range(prompt_length):
-        for j in range(prompt_length):
-            value = 1.0 if j <= i else 0.0
-            maskValues.append(value)
 
-    causalMask_np = np.array(maskValues, dtype=np.float16).reshape(1, 1, prompt_length, prompt_length)
-    return causalMask_np
+def test_generation(
+    mlmodel: MLModel,
+    tokenizer,
+    prompt: str,
+    max_new_tokens: int = 50,
+) -> str:
+    """Test the exported model with a simple generation."""
+    print(f"\nTesting generation with prompt: {prompt[:50]}...")
 
-def export(use_fixed_size: bool = False,
-           use_state: bool = False) -> None:
-    # if tokenizer.pad_token_type_id
-    templated = tokenizer.apply_chat_template([
-        {
-            "role": "system",
-            "content": "You are an AI assistant. Continue the conversation below."
-        },
-        {
-            "role": "user",
-            "content": "How are you doing today?"
-        }
-    ])
-    templated_decoded = tokenizer.decode(templated)
-    if is_mistral:
-        prompt = """
-        <s>[SYSTEM_PROMPT]You are an AI assistant. Continue the conversation below.[/SYSTEM_PROMPT][INST]How are you doing today?[/INST]
-        """
+    # Tokenize
+    tokens = tokenizer(prompt, return_tensors="np")
+    input_ids = tokens["input_ids"].astype(np.int32)
+    seq_len = input_ids.shape[1]
+
+    # Create state and generate
+    state = mlmodel.make_state()
+    generated_ids = input_ids[0].tolist()
+
+    for _ in range(max_new_tokens):
+        causal_mask = generate_causal_mask(len(generated_ids))
+        input_array = np.array([generated_ids], dtype=np.int32)
+
+        predictions = mlmodel.predict(
+            {"inputIds": input_array, "causalMask": causal_mask},
+            state=state,
+        )
+
+        logits = predictions["logits"]
+        next_token = int(np.argmax(logits[0, -1, :]))
+        generated_ids.append(next_token)
+
+        if next_token == tokenizer.eos_token_id:
+            break
+
+    output = tokenizer.decode(generated_ids, skip_special_tokens=True)
+    print(f"Generated: {output}\n")
+    return output
+
+
+def export_model(
+    model_id: str,
+    output_dir: str = "models",
+    max_context: int = 8192,
+    quantize: Optional[str] = None,
+    skip_test: bool = False,
+) -> str:
+    """
+    Export a Hugging Face model to CoreML format.
+
+    Args:
+        model_id: Hugging Face model ID (e.g., "meta-llama/Llama-3.2-1B-Instruct")
+        output_dir: Directory to save exported models
+        max_context: Maximum context length
+        quantize: Quantization type ("int4" or None)
+        skip_test: Skip generation test after export
+
+    Returns:
+        Path to the exported model
+    """
+    print(f"Exporting model: {model_id}")
+    print(f"Max context: {max_context}")
+
+    # Create output directory
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Load config and tokenizer
+    print("Loading model configuration...")
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+
+    # Detect architecture
+    architecture = config.architectures[0] if config.architectures else None
+    if not architecture:
+        raise ValueError(f"Could not detect model architecture for {model_id}")
+    print(f"Detected architecture: {architecture}")
+
+    # Get model wrapper class
+    ModelWrapper = get_model_wrapper(architecture)
+
+    # Define output paths
+    base_name = Path(model_id).name
+    fp16_path = output_path / f"{base_name}.mlpackage"
+    int4_path = output_path / f"{base_name}_Int4.mlpackage"
+    tokenizer_path = output_path / f"{base_name}_tokenizer"
+
+    # Save tokenizer
+    print(f"Saving tokenizer to: {tokenizer_path}")
+    tokenizer.save_pretrained(tokenizer_path)
+
+    # Check if model already exists
+    if fp16_path.exists():
+        print(f"Loading existing model from: {fp16_path}")
+        mlmodel = ct.models.MLModel(str(fp16_path))
     else:
-        prompt = """
-                <|begin_of_text|><|start_header_id|>system<|end_header_id|>
-                You are an AI assistant.
-
-                Continue the conversation below.<|eot_id|>
-                <|start_header_id|>user<|end_header_id|>
-                How are you doing today?
-                <|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
-    # Tokenize the prompt
-    tokenized = tokenizer(prompt, return_tensors='pt', truncation=True, max_length=max_context_size)
-    input_ids_pt = tokenized["input_ids"]  # shape: (1, prompt_length)
-    prompt_length = input_ids_pt.shape[1]
-
-    if use_state:
-        # input_ids_pt = torch.zeros((1, 2), dtype=torch.int32)
-        attention_mask_pt =  torch.from_numpy(_generate_causal_mask(prompt_length)).to(torch.float32) # torch.zeros((1, 1, 2, 5), dtype=torch.float32)
-    else:
-        attention_mask_pt = tokenized["attention_mask"]  # shape: (1, prompt_length)
-
-    if use_fixed_size:
-        if prompt_length < max_context_size:
-            pad_length = max_context_size - prompt_length
-            pad_ids = torch.full((1, pad_length), tokenizer.pad_token_type_id, dtype=torch.long)
-            pad_mask = torch.zeros((1, pad_length), dtype=torch.long)
-            # Append pads at the end (right-padding)
-            input_ids_pt = torch.cat([input_ids_pt, pad_ids], dim=1)
-            attention_mask_pt = torch.cat([attention_mask_pt, pad_mask], dim=1)
-        else:
-            # If prompt is longer or equal to max_context_size, it’s already set
-            input_ids_pt = input_ids_pt[:, :max_context_size]
-            attention_mask_pt = attention_mask_pt[:, :max_context_size]
-
-    if os.path.exists(f"models/{BASE_NAME}.mlpackage"):
-        mlmodel = ct.models.MLModel(f"models/{BASE_NAME}.mlpackage")
-    else:
-        # Construct model and tokenizer
-        if use_state:
-            print('Loading Stateful LM')
-            torch_model = CausalLM(MODEL_ID, max_context_size=max_context_size)
-        else:
-            print('Loading Simple LM')
-            torch_model = SimpleLlamaModel(MODEL_ID)
+        # Load and wrap the PyTorch model
+        print("Loading PyTorch model (this may take a while)...")
+        torch_model = ModelWrapper(model_id, max_context_size=max_context)
         torch_model.eval()
 
-        # Trace the PyTorch model
-        traced_model = torch.jit.trace(torch_model, (input_ids_pt, attention_mask_pt))
+        # Create sample inputs for tracing
+        sample_prompt = "Hello"
+        sample_tokens = tokenizer(sample_prompt, return_tensors="pt")
+        input_ids = sample_tokens["input_ids"]
+        seq_len = input_ids.shape[1]
+        causal_mask = torch.from_numpy(generate_causal_mask(seq_len)).to(torch.float32)
+
+        # Trace the model
+        print("Tracing model...")
+        traced_model = torch.jit.trace(torch_model, (input_ids, causal_mask))
         traced_model.eval()
 
-        # Define input/output specs for Core ML conversion
-        states = None
+        # Define CoreML input/output specs
+        query_length = ct.RangeDim(lower_bound=1, upper_bound=max_context, default=1)
+        end_step_dim = ct.RangeDim(lower_bound=1, upper_bound=max_context, default=1)
+
+        inputs = [
+            ct.TensorType(shape=(1, query_length), dtype=np.int32, name="inputIds"),
+            ct.TensorType(shape=(1, 1, query_length, end_step_dim), dtype=np.float16, name="causalMask"),
+        ]
         outputs = [ct.TensorType(dtype=np.float16, name="logits")]
+        states = [
+            ct.StateType(
+                wrapped_type=ct.TensorType(shape=torch_model.kv_cache_shape, dtype=np.float16),
+                name="keyCache",
+            ),
+            ct.StateType(
+                wrapped_type=ct.TensorType(shape=torch_model.kv_cache_shape, dtype=np.float16),
+                name="valueCache",
+            ),
+        ]
 
-        if use_fixed_size:
-            inputs = [
-                ct.TensorType(shape=(1, max_context_size), dtype=np.int32, name="inputIds"),
-                ct.TensorType(shape=(1, max_context_size), dtype=np.int32, name="attentionMask"),
-            ]
-            outputs = [ct.TensorType(dtype=np.float16, name="logits")]
-        elif use_state is False:
-
-            # Define dynamic input dimensions with RangeDim
-            seq_len_dim = ct.RangeDim(lower_bound=1, upper_bound=max_context_size, default=prompt_length)
-
-            inputs = [
-                ct.TensorType(shape=(1, seq_len_dim), dtype=np.int32, name="inputIds"),
-                ct.TensorType(shape=(1, seq_len_dim), dtype=np.int32, name="attentionMask"),
-            ]
-        else:
-            query_length = ct.RangeDim(lower_bound=1, upper_bound=max_context_size, default=1)
-            end_step_dim = ct.RangeDim(lower_bound=1, upper_bound=max_context_size, default=1)
-            inputs: List[ct.TensorType] = [
-                ct.TensorType(shape=(1, query_length), dtype=np.int32, name="inputIds"),
-                ct.TensorType(
-                    shape=(1, 1, query_length, end_step_dim),
-                    dtype=np.float16,
-                    name="causalMask",
-                ),
-            ]
-            states = [
-                ct.StateType(
-                    wrapped_type=ct.TensorType(shape=torch_model.kv_cache_shape, dtype=np.float16),
-                    name="keyCache",
-                ),
-                ct.StateType(
-                    wrapped_type=ct.TensorType(shape=torch_model.kv_cache_shape, dtype=np.float16),
-                    name="valueCache",
-                ),
-            ]
-
-        # mlmodel_f32 = ct.convert(
-        #     traced_model,
-        #     inputs=inputs,
-        #     outputs=outputs,
-        #     states=states,
-        #     compute_precision=ct.precision.FLOAT32,
-        #     minimum_deployment_target=ct.target.iOS18,
-        # )
-        # mlmodel_f32.save(f"models/{BASE_NAME}_Fp32.mlpackage")
-
-        # Convert to Core ML model
+        # Convert to CoreML
+        print("Converting to CoreML (this may take a while)...")
         mlmodel = ct.convert(
             traced_model,
             inputs=inputs,
@@ -351,23 +247,95 @@ def export(use_fixed_size: bool = False,
             states=states,
             minimum_deployment_target=ct.target.iOS18,
         )
-        mlmodel._spec.description.metadata.userDefined.update({METADATA_TOKENIZER: MODEL_ID})
-        # Save the model
-        mlmodel.save(f"models/{BASE_NAME}.mlpackage")
-        print("Model converted and saved.")
 
-    test_model_output(mlmodel, input_ids_pt, attention_mask_pt, use_fixed_size, use_state)
-    # if os.path.exists(f"models/{BASE_NAME}_A16W8.mlpackage") is False:
-    #     test_model_output(convert_model_to_a16w8(mlmodel), input_ids_pt, attention_mask_pt, use_fixed_size, use_state)
-    # if os.path.exists(f"models/{BASE_NAME}_A8W8.mlpackage") is False:
-    #     test_model_output(convert_model_a8w8(mlmodel), input_ids_pt, attention_mask_pt, use_fixed_size, use_state)
-    # if os.path.exists(f"models/{BASE_NAME}_A8W4.mlpackage") is False:
-    #     test_model_output(convert_model_a8w4(mlmodel), input_ids_pt, attention_mask_pt, use_fixed_size, use_state)
-    if os.path.exists(f"models/{BASE_NAME}_Int4.mlpackage") is False:
-        test_model_output(convert_model_to_int4(mlmodel), input_ids_pt, attention_mask_pt, use_fixed_size, use_state)
+        # Add metadata
+        metadata = build_model_metadata(config, model_id, max_context)
+        mlmodel._spec.description.metadata.userDefined.update(metadata)
 
-    
+        # Save FP16 model
+        print(f"Saving FP16 model to: {fp16_path}")
+        mlmodel.save(str(fp16_path))
+
+    # Apply quantization if requested
+    final_model = mlmodel
+    final_path = str(fp16_path)
+
+    if quantize == "int4":
+        if int4_path.exists():
+            print(f"Loading existing INT4 model from: {int4_path}")
+        else:
+            quantize_to_int4(mlmodel, str(int4_path))
+        # Always reload from disk to get proper state support
+        final_model = ct.models.MLModel(str(int4_path))
+        final_path = str(int4_path)
+
+    # Test generation
+    if not skip_test:
+        test_prompt = tokenizer.apply_chat_template(
+            [{"role": "user", "content": "What is 2+2?"}],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        test_generation(final_model, tokenizer, test_prompt)
+
+    print(f"\nExport complete!")
+    print(f"Model: {final_path}")
+    print(f"Tokenizer: {tokenizer_path}")
+
+    return final_path
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Export Hugging Face LLMs to CoreML format",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  %(prog)s meta-llama/Llama-3.2-1B-Instruct
+  %(prog)s Qwen/Qwen2.5-1.5B-Instruct --max-context 4096
+  %(prog)s mistralai/Mistral-7B-Instruct-v0.3 --quantize int4
+        """,
+    )
+    parser.add_argument(
+        "model_id",
+        help="Hugging Face model ID (e.g., 'meta-llama/Llama-3.2-1B-Instruct')",
+    )
+    parser.add_argument(
+        "--output-dir", "-o",
+        default="models",
+        help="Output directory for exported models (default: models)",
+    )
+    parser.add_argument(
+        "--max-context", "-c",
+        type=int,
+        default=8192,
+        help="Maximum context length (default: 8192)",
+    )
+    parser.add_argument(
+        "--quantize", "-q",
+        choices=["int4"],
+        help="Quantization type (default: none, exports FP16)",
+    )
+    parser.add_argument(
+        "--skip-test",
+        action="store_true",
+        help="Skip generation test after export",
+    )
+
+    args = parser.parse_args()
+
+    try:
+        export_model(
+            model_id=args.model_id,
+            output_dir=args.output_dir,
+            max_context=args.max_context,
+            quantize=args.quantize,
+            skip_test=args.skip_test,
+        )
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    export(use_state=True)
+    main()

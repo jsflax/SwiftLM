@@ -6,12 +6,265 @@ import Tokenizers
 import TensorUtils
 import Generation
 import Hub
-import Models
+//import Models
 import XCTest
 import JSONSchema
 
+// Path to test models - update this to point to your exported models
+let testModelsPath = "/Users/jason/Documents/LlamaANE/Plugins/LLMGenerator/models"
+
 @Suite("LlamaANETest Suite")
 struct LlamaANETests {
+
+    // MARK: - Basic Model Loading Test
+
+    @Test("Load model from path and run basic inference")
+    func testBasicInference() async throws {
+        let modelPath = "\(testModelsPath)/Llama-3.2-3B-Instruct.mlpackage"
+        let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
+
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = .cpuAndGPU
+        let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
+
+        let lm = try LanguageModel(model: mlModel)
+
+        // Verify model loaded
+        print("Model loaded: \(lm.modelName ?? "unknown")")
+        print("Context Length: \(lm.minContextLength) - \(lm.maxContextLength)")
+
+        // Warm up the model
+        print("Warming up...")
+        let warmupStart = Date()
+        try await lm.warmup()
+        let warmupTime = Date().timeIntervalSince(warmupStart)
+        print("Warmup took: \(String(format: "%.2f", warmupTime))s")
+
+        // Create a session and run inference
+        let session = try await lm.makeSession(systemPrompt: "You are a helpful assistant.")
+        let stream = await session.infer(prompt: "Say hello in one sentence.")
+
+        var output = ""
+        for await token in stream {
+            output += token
+            print(token, terminator: "")
+        }
+        print()
+
+        #expect(!output.isEmpty, "Model should generate some output")
+    }
+
+    @Test("Test INT4 quantized model")
+    func testInt4Model() async throws {
+        let modelPath = "\(testModelsPath)/Llama-3.2-3B-Instruct_Int4.mlpackage"
+        let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
+
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = .cpuAndGPU
+        let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
+
+        let lm = try LanguageModel(model: mlModel)
+        let session = try await lm.makeSession()
+        let stream = await session.infer(prompt: "What is 2 + 2?")
+
+        var output = ""
+        for await token in stream {
+            output += token
+            print(token, terminator: "")
+        }
+        print()
+
+        #expect(!output.isEmpty, "INT4 model should generate some output")
+    }
+
+    // MARK: - Grammar Session Test
+
+    @Test("Test GrammarSession with JSON schema constraint")
+    func testGrammarSession() async throws {
+        let modelPath = "\(testModelsPath)/Llama-3.2-3B-Instruct_Int4.mlpackage"
+        let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
+
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = .cpuAndGPU
+        let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
+
+        let lm = try LanguageModel(model: mlModel)
+        let session = try await lm.makeSession(
+            SimpleResponse.self,
+            systemPrompt: "You are a helpful assistant that responds in JSON format."
+        )
+
+        let result: SimpleResponse = try await session.infer(prompt: "What is the capital of France?")
+        print("Grammar result: \(result)")
+
+        #expect(!result.answer.isEmpty, "Grammar session should produce a valid response")
+    }
+
+    // MARK: - Qwen Model Test
+
+    @Test("Test Qwen 2.5 model", .timeLimit(.minutes(1)))
+    func testQwenModel() async throws {
+        // Try FP16 model first (INT4 has CoreML execution issues on some systems)
+        let modelPath = "\(testModelsPath)/Qwen2.5-1.5B-Instruct.mlpackage"
+
+        // Compile and load the model
+        print("Compiling model...")
+        let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = .cpuAndGPU  // Qwen requires GPU; produces NaN on CPU-only (root cause unknown)
+        let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
+
+        // Create LanguageModel - tokenizer is auto-selected based on model metadata
+        let lm = try LanguageModel(model: mlModel)
+
+        // Verify model loaded
+        print("Model loaded: \(lm.modelName ?? "unknown")")
+        print("Model type: \(lm.modelConfig.modelType ?? "unknown")")
+        print("Model family: \(lm.modelConfig.modelFamily)")
+        print("Context Length: \(lm.minContextLength) - \(lm.maxContextLength)")
+
+        // Create a session and run inference
+        let session = try await lm.makeSession(systemPrompt: "You are a helpful assistant.")
+        let stream = await session.infer(prompt: "What is the capital of Japan?")
+
+        var output = ""
+        for await token in stream {
+            output += token
+            print(token, terminator: "")
+        }
+        print()
+
+        #expect(!output.isEmpty, "Qwen model should generate some output")
+    }
+
+    // MARK: - Performance Test
+
+    enum TestModelKind: String, CaseIterable {
+        case llamaInt4 = "Llama-3.2-3B-Instruct_Int4.mlpackage"
+        case qwen = "Qwen2.5-1.5B-Instruct.mlpackage"
+        case qwenInt4 = "Qwen2.5-1.5B-Instruct_Int4.mlpackage"
+    }
+
+    @Test("Grammar session performance with complex schema", .timeLimit(.minutes(2)), arguments: [TestModelKind.llamaInt4, TestModelKind.qwenInt4])
+    func testGrammarSessionPerformance(modelKind: TestModelKind) async throws {
+        let modelPath = "\(testModelsPath)/\(modelKind.rawValue)"
+        let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
+
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = .cpuAndGPU
+        let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
+
+        let lm = try LanguageModel(model: mlModel)
+
+        // Warm up
+        try await lm.warmup()
+
+        let session = try await lm.makeSession(
+            MovieReview.self,
+            systemPrompt: """
+            You are a movie critic assistant. When asked about a movie, provide a structured review in JSON format.
+            Include the title, director, release year, rating (0-10), genre, and a brief summary.
+            """
+        )
+
+        let prompt = "Give me a review of the movie Inception directed by Christopher Nolan."
+
+        print("\n--- Grammar Session Performance Test ---")
+        print("Model: \(modelKind)")
+        print("Schema: MovieReview (6 fields: title, director, releaseYear, rating, genre, summary)")
+
+        let startTime = Date()
+        var firstTokenTime: Date?
+        var tokenCount = 0
+        var output = ""
+
+        // Use the AsyncStream<String> overload for streaming tokens
+        let stream: AsyncStream<String> = await session.infer(prompt: prompt)
+        for await token in stream {
+            if firstTokenTime == nil {
+                firstTokenTime = Date()
+            }
+            output += token
+            tokenCount += 1
+            print(token, terminator: "")
+        }
+        print()
+
+        let totalTime = Date().timeIntervalSince(startTime)
+        let timeToFirstToken = firstTokenTime?.timeIntervalSince(startTime) ?? 0
+        let generationTime = totalTime - timeToFirstToken
+        let tokensPerSecond = tokenCount > 0 ? Double(tokenCount) / generationTime : 0
+
+        print("\n--- Performance Metrics ---")
+        print("Time to first token: \(String(format: "%.3f", timeToFirstToken))s")
+        print("Total tokens: \(tokenCount)")
+        print("Total time: \(String(format: "%.2f", totalTime))s")
+        print("Generation time: \(String(format: "%.2f", generationTime))s")
+        print("Tokens/second: \(String(format: "%.2f", tokensPerSecond))")
+        print("---------------------------")
+
+        // Try to decode the result
+        if let jsonData = output.data(using: .utf8) {
+            do {
+                let review = try JSONDecoder().decode(MovieReview.self, from: jsonData)
+                print("Parsed MovieReview:")
+                print("  Title: \(review.title)")
+                print("  Director: \(review.director)")
+                print("  Year: \(review.releaseYear)")
+                print("  Rating: \(review.rating)")
+                print("  Genre: \(review.genre)")
+                print("  Summary: \(review.summary)")
+            } catch {
+                print("Failed to decode JSON: \(error)")
+                print("Raw output: \(output)")
+            }
+        }
+
+        #expect(!output.isEmpty, "Grammar session should generate output")
+        #expect(tokenCount > 5, "Should generate multiple tokens")
+    }
+
+    @Test("Performance test with longer generation", arguments: TestModelKind.allCases)
+    func testPerformanceLongerGeneration(modelKind: TestModelKind) async throws {
+        let modelPath = "\(testModelsPath)/\(modelKind.rawValue)"
+        let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
+
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = .cpuAndGPU
+        let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
+
+        let lm = try LanguageModel(model: mlModel)
+        let session = try await lm.makeSession(systemPrompt: "You are a helpful assistant.")
+
+        let prompt = "Explain in 3-4 sentences why the sky is blue."
+
+        let startTime = Date()
+        let stream = await session.infer(prompt: prompt)
+
+        var output = ""
+        var tokenCount = 0
+        for await token in stream {
+            output += token
+            tokenCount += 1
+            print(token, terminator: "")
+        }
+        print()
+
+        let elapsed = Date().timeIntervalSince(startTime)
+        let tokensPerSecond = Double(tokenCount) / elapsed
+
+        print("--- Performance Metrics ---")
+        print("Model: \(modelKind)")
+        print("Total tokens: \(tokenCount)")
+        print("Total time: \(String(format: "%.2f", elapsed))s")
+        print("Tokens/second: \(String(format: "%.2f", tokensPerSecond))")
+        print("---------------------------")
+
+        #expect(!output.isEmpty, "Model should generate output")
+        #expect(tokenCount > 10, "Should generate more than 10 tokens for this prompt")
+    }
+
+    // MARK: - Legacy Tests (commented out, require specific model classes)
     //    @Test("Test basic generation fixed size") func testExample() throws {
     //        // Load your Core ML model
     //        // Replace "MyModel" with the actual name of your MLModel class generated by Xcode
@@ -350,7 +603,12 @@ struct LlamaANETests {
     //
     //        print("\nFinal output:\n\(decodedTextSoFar)")
     //    }
-    
+
+    // NOTE: The following tests are commented out because they reference
+    // model classes that need to be generated from compiled CoreML models.
+    // Use testBasicInference and testInt4Model above for testing with path-based loading.
+
+    /*
     @Test func testGreedy() async throws {
         let lm = try LlamaANE.LanguageModel(model: Llama_3_2_3B_Instruct_uncensored().model)
         let session = try await lm.makeSession()
@@ -359,7 +617,8 @@ struct LlamaANETests {
             print(token, terminator: "")
         }
     }
-    
+    */
+
     @Test func testSortAndGather2() async throws {
         let x = MLTensor(shape: [1, 3, 4], scalars: [
             // First 3x4 matrix
@@ -450,7 +709,12 @@ struct LlamaANETests {
         (values, indices) = values.flattened().topK(49)
         print(values, indices)
     }
-    
+
+    /*
+    // MARK: - Tests requiring specific model classes (commented out)
+    // These tests need model classes generated from compiled CoreML models.
+    // Uncomment when you have the appropriate models available.
+
     @Test func testSampling() async throws {
         let lm = try LlamaANE.LanguageModel(model: Llama_3_2_3B_Instruct_uncensored().model
                                             ,
@@ -988,10 +1252,12 @@ struct LlamaANETests {
         
         print(try await session.infer(prompt: "Generate me prose with dialogue, e.g, Tim said \"Hello\"."))
     }
-//    @Test func testLlamaTools() async throws {
-//        let lm = try LanguageModel(model: Llama_3_2_3B_Instruct_uncensored().model)
-//        lm.makeSession(systemPrompt: <#T##String#>, tools: MyTools(), temperature: <#T##Double#>, topK: <#T##Int#>, topP: <#T##Double#>, repetitionPenalty: <#T##Double#>, isLogginEnabled: <#T##Bool#>)
-//    }
+
+    @Test func testLlamaTools() async throws {
+        let lm = try LanguageModel(model: Llama_3_2_3B_Instruct_uncensored().model)
+        lm.makeSession(systemPrompt: "", tools: MyTools(), temperature: 1.0, topK: 0, topP: 1.0, repetitionPenalty: 1.0, isLogginEnabled: false)
+    }
+    */ // End of commented-out tests requiring specific model classes
 }
 
 @llamaActor(.v3_2) actor MyTools {
@@ -1026,4 +1292,18 @@ struct LlamaANETests {
 
 @JSONSchema struct NegativeTest {
     let negativeNumber: Float
+}
+
+@JSONSchema struct SimpleResponse {
+    let answer: String
+}
+
+// Complex data model for grammar performance testing
+@JSONSchema struct MovieReview {
+    let title: String
+    let director: String
+    let releaseYear: Int
+    let rating: Float
+    let genre: String
+    let summary: String
 }

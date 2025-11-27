@@ -1,16 +1,15 @@
-from transformers import PretrainedConfig, AutoTokenizer
+"""Mistral model wrapper for CoreML export with stateful KV cache."""
+from typing import Tuple, Dict, Optional, Any
+
+import torch
+from transformers import AutoModelForCausalLM, PretrainedConfig
 from transformers.cache_utils import Cache
 from transformers.models.mistral.modeling_mistral import (
-    MISTRAL_ATTENTION_CLASSES,
     MistralAttention,
     MistralConfig,
-    MistralForCausalLM,
     apply_rotary_pos_emb,
     repeat_kv,
 )
-from typing import Tuple, Dict, Optional, Any, List
-import torch
-import torch.nn as nn
 
 class SliceUpdateKeyValueCache(Cache):
     def __init__(
@@ -111,10 +110,11 @@ class StatefulMistralForCausalLM(torch.nn.Module):
     def __init__(self, model_path: str, max_context_size: int = 2048, batch_size: int = 1) -> None:
         super().__init__()
 
-        # Custom attention implementation for stateful slice update key/value cache, override
-        # "sdpa" to compliance with transformers.modeling_utils._autoset_attn_implementation
-        MISTRAL_ATTENTION_CLASSES["sdpa"] = SliceUpdateMistralAttention
-        self.model = MistralForCausalLM.from_pretrained(model_path)
+        # Monkey-patch the attention class before loading the model
+        from transformers.models.mistral import modeling_mistral
+        modeling_mistral.MistralAttention = SliceUpdateMistralAttention
+
+        self.model = AutoModelForCausalLM.from_pretrained(model_path)
 
         # Register KV cache buffers to be recognized as Core ML states
         config: PretrainedConfig = self.model.config

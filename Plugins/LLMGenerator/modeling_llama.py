@@ -1,16 +1,15 @@
-from transformers import PretrainedConfig, AutoTokenizer
+"""Llama model wrapper for CoreML export with stateful KV cache."""
+from typing import Tuple, Dict, Optional, Any
+
+import torch
+from transformers import AutoModelForCausalLM, PretrainedConfig
 from transformers.cache_utils import Cache
 from transformers.models.llama.modeling_llama import (
-    LLAMA_ATTENTION_CLASSES,
     LlamaAttention,
     LlamaConfig,
-    LlamaForCausalLM,
     apply_rotary_pos_emb,
     repeat_kv,
 )
-from typing import Tuple, Dict, Optional, Any, List
-import torch
-import torch.nn as nn
 
 class SliceUpdateKeyValueCache(Cache):
     def __init__(
@@ -55,16 +54,20 @@ class SliceUpdateKeyValueCache(Cache):
 class SliceUpdateLlamaAttention(LlamaAttention):
     def __init__(self, config: LlamaConfig, layer_idx: Optional[int] = None):
         super().__init__(config=config, layer_idx=layer_idx)
+        # Explicitly store attributes needed for forward pass
+        self.num_heads = config.num_attention_heads
+        self.num_key_value_heads = config.num_key_value_heads
+        self.hidden_size = config.hidden_size
 
     @torch.no_grad()
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor,
-        position_ids: Optional[torch.LongTensor] = None,
+        position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+        attention_mask: Optional[torch.Tensor] = None,
         past_key_value: Optional[Cache] = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor | None, ...]:
+    ) -> Tuple[torch.Tensor, ...]:
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states)
@@ -79,7 +82,7 @@ class SliceUpdateLlamaAttention(LlamaAttention):
             bsz, q_len, self.num_key_value_heads, self.head_dim
         ).transpose(1, 2)
 
-        cos, sin = self.rotary_emb(value_states, position_ids)
+        cos, sin = position_embeddings
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         # Slice update key/value cache
@@ -94,27 +97,41 @@ class SliceUpdateLlamaAttention(LlamaAttention):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
+        # Slice the attention mask to match query length
+        # attention_mask shape: (bsz, 1, full_seq_len, full_seq_len)
+        # We need: (bsz, 1, q_len, kv_len) where kv_len = end_step
+        attn_mask = attention_mask[:, :, -q_len:, :end_step]
+
+        # Convert boolean/float mask to additive format for SDPA
+        # SDPA expects: 0 for positions to attend, -inf for positions to mask
+        # Our input has: 1 for attend, 0 for mask (lower triangular)
+        # Use multiplication: (mask - 1) * large_value gives 0 for mask=1, -large for mask=0
+        # NOTE: Use 1e4 instead of 1e9 to avoid Float16 overflow (max ~65504)
+        # 1e9 becomes inf in float16, and 0*inf=NaN which breaks CPU-only execution
+        attn_mask = (attn_mask - 1.0) * 1e4
+
         attn_output = torch.nn.functional.scaled_dot_product_attention(
             query_states,
             key_states,
             value_states,
-            attn_mask=attention_mask,
+            attn_mask=attn_mask,
         )
 
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output)
-        return attn_output, None, None
+        return attn_output, None
 
 
 class StatefulLlamaForCausalLM(torch.nn.Module):
     def __init__(self, model_path: str, max_context_size: int = 2048, batch_size: int = 1) -> None:
         super().__init__()
 
-        # Custom attention implementation for stateful slice update key/value cache, override
-        # "sdpa" to compliance with transformers.modeling_utils._autoset_attn_implementation
-        LLAMA_ATTENTION_CLASSES["sdpa"] = SliceUpdateLlamaAttention
-        self.model = LlamaForCausalLM.from_pretrained(model_path)
+        # Monkey-patch the attention class before loading the model
+        from transformers.models.llama import modeling_llama
+        modeling_llama.LlamaAttention = SliceUpdateLlamaAttention
+
+        self.model = AutoModelForCausalLM.from_pretrained(model_path)
 
         # Register KV cache buffers to be recognized as Core ML states
         config: PretrainedConfig = self.model.config

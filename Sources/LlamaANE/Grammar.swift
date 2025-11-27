@@ -1,9 +1,26 @@
 import Foundation
 import JSONSchema
-import Tokenizers
+@preconcurrency import Tokenizers
 import CoreML
 import NaturalLanguage
 import Accelerate
+
+public enum GrammarError: Error, LocalizedError {
+    case missingSchemaProperties
+    case unsupportedPropertyType(String)
+    case invalidParserState(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .missingSchemaProperties:
+            return "JSON schema is missing required properties"
+        case .unsupportedPropertyType(let type):
+            return "Unsupported property type in schema: \(type)"
+        case .invalidParserState(let state):
+            return "Invalid parser state: \(state)"
+        }
+    }
+}
 
 private protocol Parser: Sendable {
     mutating func updateState(with token: Int, _ totalDecoded: inout [Int])

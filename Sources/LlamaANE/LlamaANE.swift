@@ -1,5 +1,5 @@
 import Foundation
-import Models
+//import Models
 @preconcurrency import CoreML
 import Hub
 import Tokenizers
@@ -10,9 +10,263 @@ import TensorUtils
 import GameKit
 import OSLog
 
+// MARK: - Error Types
+
+public enum LlamaANEError: Error, LocalizedError {
+    case modelLoadFailed(underlying: Error)
+    case missingShapeConstraint(inputName: String)
+    case missingModelName
+    case tokenizerLoadFailed(underlying: Error)
+    case tokenizerConfigInvalid
+    case resourceNotFound(name: String, extension: String)
+    case predictionFailed(underlying: Error)
+    case contextLengthExceeded(current: Int, maximum: Int)
+    case invalidLogitsOutput
+    case unsupportedModelArchitecture(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .modelLoadFailed(let error):
+            return "Failed to load model: \(error.localizedDescription)"
+        case .missingShapeConstraint(let name):
+            return "Cannot obtain shape information for input '\(name)'"
+        case .missingModelName:
+            return "Model must have a name that identifies it"
+        case .tokenizerLoadFailed(let error):
+            return "Failed to load tokenizer: \(error.localizedDescription)"
+        case .tokenizerConfigInvalid:
+            return "Tokenizer configuration is invalid"
+        case .resourceNotFound(let name, let ext):
+            return "Resource '\(name).\(ext)' not found in bundle"
+        case .predictionFailed(let error):
+            return "Model prediction failed: \(error.localizedDescription)"
+        case .contextLengthExceeded(let current, let maximum):
+            return "Context length exceeded: \(current) > \(maximum)"
+        case .invalidLogitsOutput:
+            return "Model returned invalid logits output"
+        case .unsupportedModelArchitecture(let arch):
+            return "Unsupported model architecture: \(arch)"
+        }
+    }
+}
+
+// MARK: - Model Configuration
+
+public struct ModelConfiguration: Sendable {
+    public let modelId: String?
+    public let modelType: String?
+    public let numHiddenLayers: Int
+    public let numAttentionHeads: Int
+    public let numKeyValueHeads: Int
+    public let hiddenSize: Int
+    public let headDim: Int
+    public let vocabSize: Int
+    public let maxPositionEmbeddings: Int
+
+    private static let metadataPrefix = "co.llamaane."
+    private static let tokenizerKey = "co.huggingface.exporters.name"
+
+    public init(from model: MLModel) {
+        let metadata = (model.modelDescription.metadata[MLModelMetadataKey.creatorDefinedKey] as? [String: String]) ?? [:]
+
+        self.modelId = metadata[Self.tokenizerKey]
+        self.modelType = metadata["\(Self.metadataPrefix)model_type"]
+        self.numHiddenLayers = Int(metadata["\(Self.metadataPrefix)num_hidden_layers"] ?? "") ?? 28
+        self.numAttentionHeads = Int(metadata["\(Self.metadataPrefix)num_attention_heads"] ?? "") ?? 32
+        self.numKeyValueHeads = Int(metadata["\(Self.metadataPrefix)num_key_value_heads"] ?? "") ?? 8
+        self.hiddenSize = Int(metadata["\(Self.metadataPrefix)hidden_size"] ?? "") ?? 3072
+        self.headDim = Int(metadata["\(Self.metadataPrefix)head_dim"] ?? "") ?? 128
+        self.vocabSize = Int(metadata["\(Self.metadataPrefix)vocab_size"] ?? "") ?? 128256
+        self.maxPositionEmbeddings = Int(metadata["\(Self.metadataPrefix)max_position_embeddings"] ?? "") ?? 8192
+    }
+
+    /// Detect the model family from modelType or modelId
+    public var modelFamily: ModelFamily {
+        if let type = modelType?.lowercased() {
+            if type.contains("llama") { return .llama }
+            if type.contains("mistral") { return .mistral }
+            if type.contains("qwen") { return .qwen }
+            if type.contains("deepseek") { return .deepseek }
+        }
+        if let id = modelId?.lowercased() {
+            if id.contains("llama") { return .llama }
+            if id.contains("mistral") { return .mistral }
+            if id.contains("qwen") { return .qwen }
+            if id.contains("deepseek") { return .deepseek }
+        }
+        return .unknown
+    }
+}
+
+public enum ModelFamily: String, Sendable {
+    case llama
+    case mistral
+    case qwen
+    case deepseek
+    case unknown
+}
+
+// MARK: - Chat Template
+
+public protocol ChatTemplate: Sendable {
+    func formatSystemPrompt(_ prompt: String) -> String
+    func formatUserMessage(_ message: String) -> String
+    func formatAssistantPrefix() -> String
+    func formatFullPrompt(system: String, userMessages: [(role: String, content: String)]) -> String
+    var beginOfText: String { get }
+    var endOfTurn: String { get }
+}
+
+public struct Llama3ChatTemplate: ChatTemplate, Sendable {
+    public init() {}
+
+    public var beginOfText: String { "<|begin_of_text|>" }
+    public var endOfTurn: String { "<|eot_id|>" }
+
+    public func formatSystemPrompt(_ prompt: String) -> String {
+        "<|start_header_id|>system<|end_header_id|>\n\(prompt)\(endOfTurn)"
+    }
+
+    public func formatUserMessage(_ message: String) -> String {
+        "<|start_header_id|>user<|end_header_id|>\n\(message)\(endOfTurn)"
+    }
+
+    public func formatAssistantPrefix() -> String {
+        "<|start_header_id|>assistant<|end_header_id|>\n"
+    }
+
+    public func formatFullPrompt(system: String, userMessages: [(role: String, content: String)]) -> String {
+        var result = beginOfText + formatSystemPrompt(system)
+        for message in userMessages {
+            if message.role == "user" {
+                result += formatUserMessage(message.content)
+            } else if message.role == "assistant" {
+                result += formatAssistantPrefix() + message.content + endOfTurn
+            }
+        }
+        result += formatAssistantPrefix()
+        return result
+    }
+}
+
+public struct MistralChatTemplate: ChatTemplate, Sendable {
+    public init() {}
+
+    public var beginOfText: String { "<s>" }
+    public var endOfTurn: String { "</s>" }
+
+    public func formatSystemPrompt(_ prompt: String) -> String {
+        "[SYSTEM_PROMPT]\(prompt)[/SYSTEM_PROMPT]"
+    }
+
+    public func formatUserMessage(_ message: String) -> String {
+        "[INST]\(message)[/INST]"
+    }
+
+    public func formatAssistantPrefix() -> String {
+        ""
+    }
+
+    public func formatFullPrompt(system: String, userMessages: [(role: String, content: String)]) -> String {
+        var result = beginOfText + formatSystemPrompt(system)
+        for message in userMessages {
+            if message.role == "user" {
+                result += formatUserMessage(message.content)
+            } else if message.role == "assistant" {
+                result += message.content + endOfTurn
+            }
+        }
+        return result
+    }
+}
+
+public struct QwenChatTemplate: ChatTemplate, Sendable {
+    public init() {}
+
+    public var beginOfText: String { "" }
+    public var endOfTurn: String { "<|im_end|>" }
+
+    public func formatSystemPrompt(_ prompt: String) -> String {
+        "<|im_start|>system\n\(prompt)\(endOfTurn)\n"
+    }
+
+    public func formatUserMessage(_ message: String) -> String {
+        "<|im_start|>user\n\(message)\(endOfTurn)\n"
+    }
+
+    public func formatAssistantPrefix() -> String {
+        "<|im_start|>assistant\n"
+    }
+
+    public func formatFullPrompt(system: String, userMessages: [(role: String, content: String)]) -> String {
+        var result = formatSystemPrompt(system)
+        for message in userMessages {
+            if message.role == "user" {
+                result += formatUserMessage(message.content)
+            } else if message.role == "assistant" {
+                result += formatAssistantPrefix() + message.content + endOfTurn + "\n"
+            }
+        }
+        result += formatAssistantPrefix()
+        return result
+    }
+}
+
+public struct DeepSeekChatTemplate: ChatTemplate, Sendable {
+    public init() {}
+
+    // DeepSeek R1 Distill uses Qwen's ChatML format
+    public var beginOfText: String { "" }
+    public var endOfTurn: String { "<|im_end|>" }
+
+    public func formatSystemPrompt(_ prompt: String) -> String {
+        "<|im_start|>system\n\(prompt)\(endOfTurn)\n"
+    }
+
+    public func formatUserMessage(_ message: String) -> String {
+        "<|im_start|>user\n\(message)\(endOfTurn)\n"
+    }
+
+    public func formatAssistantPrefix() -> String {
+        "<|im_start|>assistant\n"
+    }
+
+    public func formatFullPrompt(system: String, userMessages: [(role: String, content: String)]) -> String {
+        var result = formatSystemPrompt(system)
+        for message in userMessages {
+            if message.role == "user" {
+                result += formatUserMessage(message.content)
+            } else if message.role == "assistant" {
+                result += formatAssistantPrefix() + message.content + endOfTurn + "\n"
+            }
+        }
+        result += formatAssistantPrefix()
+        return result
+    }
+}
+
+public extension ModelFamily {
+    var chatTemplate: any ChatTemplate {
+        switch self {
+        case .llama:
+            return Llama3ChatTemplate()
+        case .mistral:
+            return MistralChatTemplate()
+        case .qwen:
+            return QwenChatTemplate()
+        case .deepseek:
+            return DeepSeekChatTemplate()
+        case .unknown:
+            return Llama3ChatTemplate() // Default fallback
+        }
+    }
+}
+
+// MARK: - Logger Extension
+
 extension Logger {
     /// Using your bundle identifier is a great way to ensure a unique identifier.
-    private static let subsystem = Bundle.module.bundleIdentifier!
+    private static let subsystem = Bundle.module.bundleIdentifier ?? "com.llamaane"
 
     /// Logs the view cycles like a view that appeared.
     static let languageModel = Logger(subsystem: subsystem, category: "llama")
@@ -49,58 +303,75 @@ public protocol LanguageModelProtocol: AnyObject {
 
 public final class LanguageModel: @unchecked Sendable, LanguageModelProtocol {
     public let model: MLModel
-    
+    public let modelConfig: ModelConfiguration
+
     public let minContextLength: Int
     public let maxContextLength: Int
-    
-    let input_ids = "inputIds"
-    let attention_mask = "attentionMask"
-    
-    struct Configurations {
-        var modelConfig: Config
-        var tokenizerConfig: Config?
-        var tokenizerData: Config
-    }
-    
-//    private var configuration: LanguageModelConfigurationFromHub? = nil
-    private var _tokenizer: Tokenizer? = nil
-    let numHiddenLayers = 26  // Example for Llama-3B
-    let batchSize = 1
-    let numKeyValueHeads = 16
-    let headDim = 128
+
+    static let inputIdsKey = "inputIds"
+    static let attentionMaskKey = "attentionMask"
 
     public let tokenizer: Tokenizer
-    
+
     lazy var requiresAttention: Bool =
-        model.modelDescription.inputDescriptionsByName[attention_mask] != nil
-    
-    lazy var requiresCausal: Bool
-        = model.modelDescription.inputDescriptionsByName["causalMask"] != nil
-    
+        model.modelDescription.inputDescriptionsByName[Self.attentionMaskKey] != nil
+
+    lazy var requiresCausal: Bool =
+        model.modelDescription.inputDescriptionsByName["causalMask"] != nil
+
+    public var chatTemplate: any ChatTemplate {
+        modelConfig.modelFamily.chatTemplate
+    }
+
     private let tools: (any Llama32Tools)?
-    
-    
+
     lazy var config = GenerationConfig(maxLength: maxContextLength,
                                        maxNewTokens: 2000)
-    
+
+    /// Initialize with a CoreML model, automatically selecting the appropriate tokenizer.
+    /// The tokenizer is selected based on the model's metadata (model_type field).
+    public convenience init(model: MLModel,
+                            temperature: Double = 1.0,
+                            topK: Int = 0,
+                            topP: Double = 1.0,
+                            repetitionPenalty: Double = 1.0,
+                            tools: (any Llama32Tools)? = nil) throws {
+        // Detect model family from metadata and load appropriate tokenizer
+        let config = ModelConfiguration(from: model)
+        let tokenizer = try Self.loadBundledTokenizer(for: config.modelFamily)
+        try self.init(
+            model: model,
+            tokenizer: tokenizer,
+            temperature: temperature,
+            topK: topK,
+            topP: topP,
+            repetitionPenalty: repetitionPenalty,
+            tools: tools
+        )
+    }
+
+    /// Initialize with a CoreML model and custom tokenizer.
+    /// Use this when your model requires a different tokenizer (e.g., Qwen, Mistral).
     public init(model: MLModel,
+                tokenizer: Tokenizer,
                 temperature: Double = 1.0,
                 topK: Int = 0,
                 topP: Double = 1.0,
                 repetitionPenalty: Double = 1.0,
-                tools: (any Llama32Tools)? = nil) {
+                tools: (any Llama32Tools)? = nil) throws {
         self.model = model
-        // We assume inputs named "input_ids" with shape (1, seq_length)
-        // Perhaps we should convert to vectors of shape (seq_length) and use sequenceConstraint instead of shapeConstraint
-        let inputDescription = model.modelDescription.inputDescriptionsByName[input_ids]
-        // print(inputDescription)
+        self.modelConfig = ModelConfiguration(from: model)
+        self.tokenizer = tokenizer
+
+        // Parse shape constraints from model description
+        let inputDescription = model.modelDescription.inputDescriptionsByName[Self.inputIdsKey]
         guard let shapeConstraint = inputDescription?.multiArrayConstraint?.shapeConstraint else {
-            fatalError("Cannot obtain shape information")
+            throw LlamaANEError.missingShapeConstraint(inputName: Self.inputIdsKey)
         }
-        
+
         switch shapeConstraint.type {
         case .enumerated:
-            // TODO: support a set of fixed shapes (keeping the first one here)
+            // Support enumerated shapes (use first shape)
             minContextLength = shapeConstraint.enumeratedShapes[0][1].intValue
             maxContextLength = minContextLength
         case .range:
@@ -114,19 +385,9 @@ public final class LanguageModel: @unchecked Sendable, LanguageModelProtocol {
             minContextLength = 128
             maxContextLength = 128
         }
-                
-//        kvCacheShape = [numHiddenLayers, batchSize, numKeyValueHeads, contextSize, headDim]
-//        keyCache = try! MLMultiArray(shape: kvCacheShape.map { NSNumber(value: $0) }, dataType: .float16)
-//        valueCache = try! MLMultiArray(shape: kvCacheShape.map { NSNumber(value: $0) }, dataType: .float16)
-        let tokenizerConfig = try! JSONSerialization.jsonObject(with: try! Data(contentsOf: Bundle.module.url(forResource: "tokenizer_config", withExtension: "json")!))
-        let tokenizerData = try! JSONSerialization.jsonObject(with: try! Data(contentsOf: Bundle.module.url(forResource: "tokenizer", withExtension: "json")!))
-        self.tokenizer = try! AutoTokenizer.from(tokenizerConfig: Config(tokenizerConfig as! [NSString : Any]),
-                                            tokenizerData: Config(tokenizerData as! [NSString : Any]))
-//        if !model.modelDescription.stateDescriptionsByName.isEmpty {
-//            kvCache = model.makeState()
-//        }
+
         self.tools = tools
-        
+
         self.config.topK = topK
         self.config.topP = topP
         self.config.repetitionPenalty = repetitionPenalty
@@ -136,6 +397,133 @@ public final class LanguageModel: @unchecked Sendable, LanguageModelProtocol {
             config.doSample = true
         } else {
             config.doSample = false
+        }
+    }
+
+    /// Load a tokenizer from a local directory containing tokenizer.json and tokenizer_config.json.
+    /// This is useful for loading tokenizers saved by the export script.
+    public static func loadTokenizer(from directory: URL) throws -> Tokenizer {
+        let configURL = directory.appendingPathComponent("tokenizer_config.json")
+        let dataURL = directory.appendingPathComponent("tokenizer.json")
+
+        guard FileManager.default.fileExists(atPath: configURL.path) else {
+            throw LlamaANEError.resourceNotFound(name: "tokenizer_config", extension: "json")
+        }
+        guard FileManager.default.fileExists(atPath: dataURL.path) else {
+            throw LlamaANEError.resourceNotFound(name: "tokenizer", extension: "json")
+        }
+
+        do {
+            let configData = try Data(contentsOf: configURL)
+            let tokenizerDataContent = try Data(contentsOf: dataURL)
+
+            let tokenizerConfig = try JSONSerialization.jsonObject(with: configData)
+            let tokenizerData = try JSONSerialization.jsonObject(with: tokenizerDataContent)
+
+            guard let configDict = tokenizerConfig as? [NSString: Any],
+                  let dataDict = tokenizerData as? [NSString: Any] else {
+                throw LlamaANEError.tokenizerConfigInvalid
+            }
+
+            return try AutoTokenizer.from(
+                tokenizerConfig: Config(configDict),
+                tokenizerData: Config(dataDict)
+            )
+        } catch let error as LlamaANEError {
+            throw error
+        } catch {
+            throw LlamaANEError.tokenizerLoadFailed(underlying: error)
+        }
+    }
+
+    /// Download and load a tokenizer from Hugging Face Hub.
+    /// This downloads the tokenizer files to a local cache and loads them.
+    public static func downloadTokenizer(from modelId: String) async throws -> Tokenizer {
+        do {
+            return try await AutoTokenizer.from(pretrained: modelId)
+        } catch {
+            throw LlamaANEError.tokenizerLoadFailed(underlying: error)
+        }
+    }
+
+    /// Load a bundled tokenizer for a specific model family.
+    public static func loadBundledTokenizer(for family: ModelFamily) throws -> Tokenizer {
+        let prefix: String
+        switch family {
+        case .llama:
+            prefix = "llama"
+        case .qwen:
+            prefix = "qwen"
+        case .mistral:
+            // Mistral uses the same tokenizer format as Llama
+            prefix = "llama"
+        case .deepseek:
+            // DeepSeek uses Llama tokenizer as base
+            prefix = "llama"
+        case .unknown:
+            // Default to Llama
+            prefix = "llama"
+        }
+
+        guard let configURL = Bundle.module.url(forResource: "\(prefix)_tokenizer_config", withExtension: "json") else {
+            throw LlamaANEError.resourceNotFound(name: "\(prefix)_tokenizer_config", extension: "json")
+        }
+        guard let dataURL = Bundle.module.url(forResource: "\(prefix)_tokenizer", withExtension: "json") else {
+            throw LlamaANEError.resourceNotFound(name: "\(prefix)_tokenizer", extension: "json")
+        }
+
+        do {
+            let configData = try Data(contentsOf: configURL)
+            let tokenizerDataContent = try Data(contentsOf: dataURL)
+
+            let tokenizerConfig = try JSONSerialization.jsonObject(with: configData)
+            let tokenizerData = try JSONSerialization.jsonObject(with: tokenizerDataContent)
+
+            guard let configDict = tokenizerConfig as? [NSString: Any],
+                  let dataDict = tokenizerData as? [NSString: Any] else {
+                throw LlamaANEError.tokenizerConfigInvalid
+            }
+
+            return try AutoTokenizer.from(
+                tokenizerConfig: Config(configDict),
+                tokenizerData: Config(dataDict)
+            )
+        } catch let error as LlamaANEError {
+            throw error
+        } catch {
+            throw LlamaANEError.tokenizerLoadFailed(underlying: error)
+        }
+    }
+
+    private static func loadBundledTokenizer() throws -> Tokenizer {
+        // Default to Llama tokenizer for backwards compatibility
+        guard let configURL = Bundle.module.url(forResource: "llama_tokenizer_config", withExtension: "json") else {
+            throw LlamaANEError.resourceNotFound(name: "llama_tokenizer_config", extension: "json")
+        }
+        guard let dataURL = Bundle.module.url(forResource: "llama_tokenizer", withExtension: "json") else {
+            throw LlamaANEError.resourceNotFound(name: "llama_tokenizer", extension: "json")
+        }
+
+        do {
+            let configData = try Data(contentsOf: configURL)
+            let tokenizerDataContent = try Data(contentsOf: dataURL)
+
+            let tokenizerConfig = try JSONSerialization.jsonObject(with: configData)
+            let tokenizerData = try JSONSerialization.jsonObject(with: tokenizerDataContent)
+
+            guard let configDict = tokenizerConfig as? [NSString: Any],
+                  let dataDict = tokenizerData as? [NSString: Any] else {
+                throw LlamaANEError.tokenizerConfigInvalid
+            }
+
+            return try AutoTokenizer.from(
+                tokenizerConfig: Config(configDict),
+                tokenizerData: Config(dataDict)
+            )
+        } catch let error as LlamaANEError {
+            throw error
+        } catch {
+            throw LlamaANEError.tokenizerLoadFailed(underlying: error)
         }
     }
     
@@ -187,10 +575,16 @@ public final class LanguageModel: @unchecked Sendable, LanguageModelProtocol {
 
 public extension LanguageModel {
     static func loadCompiled(url: URL, computeUnits: MLComputeUnits = .cpuAndGPU) throws -> LanguageModel {
-        let config = MLModelConfiguration()
-        config.computeUnits = computeUnits
-        let model = try MLModel(contentsOf: url, configuration: config)
-        return LanguageModel(model: model)
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = computeUnits
+        do {
+            let model = try MLModel(contentsOf: url, configuration: mlConfig)
+            return try LanguageModel(model: model)
+        } catch let error as LlamaANEError {
+            throw error
+        } catch {
+            throw LlamaANEError.modelLoadFailed(underlying: error)
+        }
     }
 }
 
@@ -204,38 +598,67 @@ public extension LanguageModel {
     }
     
     /// `name_or_path` in the Python world
-    var modelName: String {
-        if let userFields = model.modelDescription.metadata[MLModelMetadataKey.creatorDefinedKey] as? [String : String],
-           let name = userFields["co.huggingface.exporters.name"] {
-            return name
-        }
-        // This is usually the basename of the file, that's our best bet if no metadata exists
-        guard let modelName = model.configuration.modelDisplayName else { fatalError("Models must have a name that identifies them") }
-        return modelName
+    var modelName: String? {
+        modelConfig.modelId ?? model.configuration.modelDisplayName
     }
-        
-    var inputIdsDescription: MLFeatureDescription {
-        model.modelDescription.inputDescriptionsByName[input_ids]!
+
+    var inputIdsDescription: MLFeatureDescription? {
+        model.modelDescription.inputDescriptionsByName[Self.inputIdsKey]
     }
-    
+
     var inputIdsName: String {
-        inputIdsDescription.name
+        inputIdsDescription?.name ?? Self.inputIdsKey
     }
-    
-    /// The expected shape of the models latent sample input
-    var inputIdsShape: [Int] {
-        inputIdsDescription.multiArrayConstraint!.shape.map { $0.intValue }
+
+    /// The expected shape of the model's latent sample input
+    var inputIdsShape: [Int]? {
+        inputIdsDescription?.multiArrayConstraint?.shape.map { $0.intValue }
     }
 
     var requiresCache: Bool {
         model.modelDescription.inputDescriptionsByName["keyCache"] != nil
     }
     
-    func tokenize(text: String) throws -> [Int] {
+    public func tokenize(text: String) throws -> [Int] {
         tokenizer.encode(text: text)
     }
-    
-    func makeSession(systemPrompt: String = """
+
+    /// Warm up the model by running a dummy inference.
+    /// Call this before first real inference to avoid cold-start latency.
+    /// The ANE/GPU needs to initialize on first use, which can add noticeable delay.
+    public func warmup() async throws {
+        // Use BOS token or token ID 1 as dummy input
+        let dummyToken = tokenizer.bosTokenId ?? 1
+        let inputIds = MLShapedArray<Int32>(scalars: [Int32(dummyToken)], shape: [1, 1])
+
+        var inputDict: [String: MLFeatureValue] = [
+            Self.inputIdsKey: MLFeatureValue(shapedArray: inputIds)
+        ]
+
+        // Add causal mask if required
+        if requiresCausal {
+            let causalMask = MLShapedArray<Float16>(repeating: 1.0, shape: [1, 1, 1, 1])
+            inputDict["causalMask"] = MLFeatureValue(shapedArray: causalMask)
+        }
+
+        // Add attention mask if required
+        if requiresAttention {
+            let attentionMask = MLShapedArray<Int32>(scalars: [1], shape: [1, 1])
+            inputDict[Self.attentionMaskKey] = MLFeatureValue(shapedArray: attentionMask)
+        }
+
+        let input = try MLDictionaryFeatureProvider(dictionary: inputDict)
+
+        // Run a single prediction to warm up the compute units
+        if !model.modelDescription.stateDescriptionsByName.isEmpty {
+            let state = model.makeState()
+            _ = try await model.prediction(from: input, using: state)
+        } else {
+            _ = try await model.prediction(from: input)
+        }
+    }
+
+    public func makeSession(systemPrompt: String = """
                     You are an AI Assistant.
                     """,
                      tools: (any Llama32Tools)? = nil,
@@ -256,10 +679,10 @@ public extension LanguageModel {
             config.doSample = false
         }
         
-        return try await Session(model: model, systemPrompt: systemPrompt, requiresAttention: requiresAttention, requiresCausal: requiresCausal, inputIdsKey: input_ids, tokenizer: tokenizer, contextSize: maxContextLength, maxContextLength: maxContextLength, config: config, tools: tools)
+        return try await Session(model: model, systemPrompt: systemPrompt, requiresAttention: requiresAttention, requiresCausal: requiresCausal, inputIdsKey: Self.inputIdsKey, tokenizer: tokenizer, contextSize: maxContextLength, maxContextLength: maxContextLength, config: config, tools: tools, chatTemplate: chatTemplate)
     }
-    
-    func makeSession<J: JSONSchemaConvertible>(_ grammarType: J.Type,
+
+    public func makeSession<J: JSONSchemaConvertible>(_ grammarType: J.Type,
         systemPrompt: String = """
                     You are an AI Assistant.
                     """,
@@ -280,18 +703,19 @@ public extension LanguageModel {
         } else {
             config.doSample = false
         }
-        
+
         return await GrammarSession(systemPrompt: systemPrompt,
                                     requiresCausal: requiresCausal,
                                     requiresAttention: requiresAttention,
                                     config: config,
                                     model: model,
                                     tokenizer: tokenizer,
-                                    contextSize: maxContextLength)
+                                    contextSize: maxContextLength,
+                                    chatTemplate: chatTemplate)
     }
-    
-    func oneShot(prompt: String) async throws -> String {
-        let stream = try await Session.oneShot(model: model, systemPrompt: prompt, requiresAttention: requiresAttention, requiresCausal: requiresCausal, inputIdsKey: input_ids, tokenizer: tokenizer, contextSize: maxContextLength, maxContextLength: maxContextLength, config: config, tools: tools)
+
+    public func oneShot(prompt: String) async throws -> String {
+        let stream = try await Session.oneShot(model: model, systemPrompt: prompt, requiresAttention: requiresAttention, requiresCausal: requiresCausal, inputIdsKey: Self.inputIdsKey, tokenizer: tokenizer, contextSize: maxContextLength, maxContextLength: maxContextLength, config: config, tools: tools, chatTemplate: chatTemplate)
         return await stream.reduce("", +)
     }
     
@@ -306,22 +730,25 @@ public extension LanguageModel {
         let contextSize: Int
         let maxContextLength: Int
         let tools: (any Llama32Tools)?
+        let chatTemplate: any ChatTemplate
         var config: GenerationConfig
         var logger: Logger = .llamaSession
         public let systemPrompt: String
         var hasShownInitialPrompt: Bool = false
-        
+
         init(model: MLModel, systemPrompt: String, requiresAttention: Bool, requiresCausal: Bool, inputIdsKey: String, tokenizer: Tokenizer, contextSize: Int, maxContextLength: Int,
              config: GenerationConfig,
              tools: (any Llama32Tools)?,
+             chatTemplate: any ChatTemplate,
              flush: Bool = true,
              logging: Bool = false) async throws {
             self.model = model
             self.requiresAttention = requiresAttention
             self.requiresCausal = requiresCausal
             self.inputIdsKey = inputIdsKey
+            self.chatTemplate = chatTemplate
             self.config = config
-            self.config.eosTokenId = tokenizer.eosTokenId//("<|eot_id|>", text: "")
+            self.config.eosTokenId = tokenizer.eosTokenId
             if !logging {
                 self.logger = .init(OSLog.disabled)
             }
@@ -335,16 +762,6 @@ public extension LanguageModel {
             self.contextSize = contextSize
             self.maxContextLength = maxContextLength
             self.tools = tools
-            
-            guard flush else {
-                return
-            }
-//            try await infer(prompt: """
-//            <|begin_of_text|><|start_header_id|>system<|end_header_id|>
-//            \(systemPrompt)
-//            <|eot_id|><|start_header_id|>assistant<|end_header_id|>
-//            """, stream: nil) // specifically call non encoding infererence
-//            hasShownInitialPrompt = true
         }
         
         
@@ -354,37 +771,39 @@ public extension LanguageModel {
                                         tokenizer: Tokenizer,
                                         contextSize: Int, maxContextLength: Int,
                                         config: GenerationConfig,
-                                        tools: (any Llama32Tools)?) async throws -> AsyncStream<String> {
-            let session = try await Session(model: model, systemPrompt: systemPrompt, requiresAttention: requiresAttention, requiresCausal: requiresCausal, inputIdsKey: inputIdsKey, tokenizer: tokenizer, contextSize: contextSize, maxContextLength: maxContextLength, config: config, tools: tools, flush: false)
-            
+                                        tools: (any Llama32Tools)?,
+                                        chatTemplate: any ChatTemplate) async throws -> AsyncStream<String> {
+            let session = try await Session(model: model, systemPrompt: systemPrompt, requiresAttention: requiresAttention, requiresCausal: requiresCausal, inputIdsKey: inputIdsKey, tokenizer: tokenizer, contextSize: contextSize, maxContextLength: maxContextLength, config: config, tools: tools, chatTemplate: chatTemplate, flush: false)
+
             return AsyncStream { stream in
                 Task {
-                    // Maybe pad or truncate
-                    
-                    try await session.infer(prompt: """
-                    <|begin_of_text|><|start_header_id|>system<|end_header_id|>
-                    \(systemPrompt)
-                    <|eot_id|><|start_header_id|>assistant<|end_header_id|>
-                    """, stream: stream)
+                    let prompt = chatTemplate.beginOfText + chatTemplate.formatSystemPrompt(systemPrompt) + chatTemplate.formatAssistantPrefix()
+                    try await session.infer(prompt: prompt, stream: stream)
                 }
             }
         }
         
         private func synchronousPredict(input: MLDictionaryFeatureProvider) throws -> any MLFeatureProvider {
-            if let kvCache {
-                try! self.model.prediction(from: input,
-                                           using: kvCache)
-            } else {
-                try! self.model.prediction(from: input)
+            do {
+                if let kvCache {
+                    return try self.model.prediction(from: input, using: kvCache)
+                } else {
+                    return try self.model.prediction(from: input)
+                }
+            } catch {
+                throw LlamaANEError.predictionFailed(underlying: error)
             }
         }
-        
+
         private func asynchronousPredict(input: MLDictionaryFeatureProvider) async throws -> any MLFeatureProvider {
-            if let kvCache {
-                try! await self.model.prediction(from: input,
-                                                 using: kvCache)
-            } else {
-                try! await self.model.prediction(from: input)
+            do {
+                if let kvCache {
+                    return try await self.model.prediction(from: input, using: kvCache)
+                } else {
+                    return try await self.model.prediction(from: input)
+                }
+            } catch {
+                throw LlamaANEError.predictionFailed(underlying: error)
             }
         }
         
@@ -396,14 +815,16 @@ public extension LanguageModel {
             let tokens = tokenizer.encode(text: prompt,
                                           addSpecialTokens: addSpecialTokens)
             outputBuffer.append(contentsOf: tokens)
-            var input: MLDictionaryFeatureProvider = await input(from: outputBuffer, totalBuffer: outputBuffer)
-            if (input["inputIds"]?.multiArrayValue?.count ?? 1) > maxContextLength {
-                print("!! CONTEXT LENGTH EXCEEDED !!")
+            var input: MLDictionaryFeatureProvider = try await input(from: outputBuffer, totalBuffer: outputBuffer)
+            let currentLength = input["inputIds"]?.multiArrayValue?.count ?? 1
+            if currentLength > maxContextLength {
+                logger.warning("Context length exceeded: \(currentLength) > \(self.maxContextLength)")
+                throw LlamaANEError.contextLengthExceeded(current: currentLength, maximum: maxContextLength)
             }
-//            var maxTokens = min(input["inputIds"]?.multiArrayValue?.count ?? 1, maxContextLength)
+
             var totalDecoded = ""
             var isExpectedToolCall = false
-//            let logitsProcessor = LogitsProcessor(logitsWarpers: logitsWarpers(config: config))
+
             while outputBuffer.count < self.contextSize {
                 var time = Date.now
                 let output = try await asynchronousPredict(input: input)
@@ -411,7 +832,7 @@ public extension LanguageModel {
                 logger.debug("\(Thread.current) Prediction took \(elapsed)s")
                 time = Date.now
                 guard let logitsValue = output.featureValue(for: "logits")?.shapedArrayValue(of: Float16.self) else {
-                    fatalError()
+                    throw LlamaANEError.invalidLogitsOutput
                 }
 
                 var mlTensor =  MLTensor(logitsValue).cast(to: Float.self)
@@ -464,7 +885,7 @@ public extension LanguageModel {
                 }
                 let nextToken = outputBuffer.last!
                 time = Date.now
-                input = await self.input(from: [nextToken], totalBuffer: outputBuffer)
+                input = try await self.input(from: [nextToken], totalBuffer: outputBuffer)
                 elapsed = Date.now.timeIntervalSince1970 - time.timeIntervalSince1970
                 logger.debug("Next Input gen took \(elapsed)")
 //                maxTokens = min(input["inputIds"]?.multiArrayValue?.count ?? 1, self.maxContextLength)
@@ -524,25 +945,14 @@ public extension LanguageModel {
         }
         
         public func infer(prompt: String) -> AsyncStream<String> {
-            var prompt = """
-            <|start_header_id|>user<|end_header_id|>
-            \(prompt)<|eot_id|>
-            <|start_header_id|>assistant<|end_header_id|>
-            """
+            var formattedPrompt = chatTemplate.formatUserMessage(prompt) + chatTemplate.formatAssistantPrefix()
             if !hasShownInitialPrompt {
-                prompt = """
-                <|begin_of_text|><|start_header_id|>system<|end_header_id|>
-                \(systemPrompt)
-                <|eot_id|>
-                """.appending(prompt)
+                formattedPrompt = chatTemplate.beginOfText + chatTemplate.formatSystemPrompt(systemPrompt) + formattedPrompt
                 hasShownInitialPrompt = true
             }
             return AsyncStream { stream in
                 Task {
-                    // Maybe pad or truncate
-                    
-                    try await infer(prompt: prompt,
-                                    stream: stream)
+                    try await infer(prompt: formattedPrompt, stream: stream)
                 }
             }
         }
@@ -569,14 +979,11 @@ public extension LanguageModel {
 }
 
 extension LanguageModel {
-    //TODO: retrieve from the json: https://huggingface.co/nlpcloud/instruct-gpt-j-fp16/blob/main/config.json#L26
     public var defaultGenerationConfig: GenerationConfig {
         var config = GenerationConfig(maxNewTokens: 30)
-        switch modelName.lowercased() {
-        case let x where x.contains("gpt"):
+        if let name = modelName?.lowercased(), name.contains("gpt") {
             config.doSample = true
             config.topK = 50
-        default: break
         }
         return config
     }

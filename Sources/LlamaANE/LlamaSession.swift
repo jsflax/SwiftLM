@@ -25,29 +25,34 @@ public protocol LlamaSession: Actor {
 
 extension LlamaSession where Self: _LlamaSession {
     func synchronousPredict(input: MLDictionaryFeatureProvider) throws -> any MLFeatureProvider {
-        if let kvCache {
-            try! self.model.prediction(from: input,
-                                       using: kvCache)
-        } else {
-            try! self.model.prediction(from: input)
+        do {
+            if let kvCache {
+                return try self.model.prediction(from: input, using: kvCache)
+            } else {
+                return try self.model.prediction(from: input)
+            }
+        } catch {
+            throw LlamaANEError.predictionFailed(underlying: error)
         }
     }
-    
+
     func asynchronousPredict(input: MLDictionaryFeatureProvider) async throws -> any MLFeatureProvider {
-        if let kvCache {
-            try! await self.model.prediction(from: input,
-                                             using: kvCache)
-        } else {
-            try! await self.model.prediction(from: input)
+        do {
+            if let kvCache {
+                return try await self.model.prediction(from: input, using: kvCache)
+            } else {
+                return try await self.model.prediction(from: input)
+            }
+        } catch {
+            throw LlamaANEError.predictionFailed(underlying: error)
         }
     }
     
-    internal func input(from tokens: [Int], totalBuffer: borrowing [Int] = []) async -> MLDictionaryFeatureProvider {
+    internal func input(from tokens: [Int], totalBuffer: borrowing [Int] = []) async throws -> MLDictionaryFeatureProvider {
         let maxContextSize = contextSize
         let inputDescription = model.modelDescription.inputDescriptionsByName["inputIds"]
-        // print(inputDescription)
         guard let shapeConstraint = inputDescription?.multiArrayConstraint?.shapeConstraint else {
-            fatalError("Cannot obtain shape information")
+            throw LlamaANEError.missingShapeConstraint(inputName: "inputIds")
         }
         var inputDictionary: [String: MLFeatureValue] = [:]
         if shapeConstraint.type == .range {
@@ -63,62 +68,30 @@ extension LlamaSession where Self: _LlamaSession {
             )
             
             inputDictionary["inputIds"] = MLFeatureValue(shapedArray: inputIds)
-            
-            if requiresCausal {
-                queryLen = min(totalBuffer.count, maxContextSize)
-                // Assume a causal scenario: end_step_dim = queryLen
-                let endStepDim = queryLen
-                
-                // Construct a causal mask (lower-triangular)
-                // Shape: (1, 1, queryLen, endStepDim)
-                // For each query position i:
-                // positions j ≤ i = 1 (allowed), j > i = 0 (blocked)
-//                    var maskValues = [Float16](repeating: 0, count: queryLen * endStepDim)
-//                    maskValues.reserveCapacity(queryLen * endStepDim)
-//
-//                    for i in 0..<queryLen {
-//                        for j in 0...i {
-//                            maskValues[i * endStepDim + j] = Float16(1.0)
-//                        }
-//                    }
-                // Create a flat array with zeros
-                let time = Date.now
-                // Create a tensor filled with ones of the desired shape.
-                // Note: The API for creating a tensor filled with ones may vary.
-                // Here, we assume there's a way to create an MLTensor of ones.
-                let shape = [1, 1, queryLen, endStepDim]
-//                    var onesArray = [Float16](repeating: 1.0, count: queryLen * endStepDim)
-                // Create an MLTensor from this array with the specified shape and appropriate scalar type.
-                let onesTensor = MLTensor(ones: shape, scalarType: Float16.self)
-//                    var onesTensor = MLTensor(shape: shape,
-//                                              data: Data(buffer: UnsafeBufferPointer(start: &onesArray, count: onesArray.count)),
-//                                              scalarType: Float16.self)
 
-                // Now apply bandPart to get a causal mask.
-                let causalMask = await onesTensor.bandPart(lowerBandCount: -1, upperBandCount: 0)
-                    .shapedArray(of: Float16.self)
-//                    var maskValues = [Float](repeating: 0.0, count: queryLen * endStepDim)
-//
-//                    // Use vDSP to fill rows with ones up to the diagonal index
-//                    for i in 0..<queryLen {
-//                        // Pointer to the starting location for the current row
-//                        let startIndex = i * endStepDim
-//
-//                        // Fill `i + 1` elements in the current row with 1.0
-//                        var value: Float = 1.0
-//                        vDSP_vfill(&value, &maskValues[startIndex], 1, vDSP_Length(i + 1))
-//                    }
-//                    let maskValues16 = maskValues
-//                        .map(Float16.init)
-//
-////                    return maskValues
-//                    let causalMask = MLShapedArray<Float16>(
-//                        scalars: maskValues16,
-//                        shape: [1, 1, queryLen, endStepDim]
-//                    )
-                
-                let elapsed = Date.now.timeIntervalSince1970 - time.timeIntervalSince1970
-//                    logger.debug("Causal mask took \(elapsed)")
+            if requiresCausal {
+                let inputQueryLen = queryLen  // Number of new tokens (1 for incremental)
+                let kvLen = min(totalBuffer.count, maxContextSize)  // Total sequence length
+
+                // Construct causal mask
+                // For incremental decoding (inputQueryLen=1): just a row of 1s, shape [1,1,1,kvLen]
+                // For prefill (inputQueryLen>1): full lower triangular, shape [1,1,kvLen,kvLen]
+                let causalMask: MLShapedArray<Float16>
+                if inputQueryLen == 1 {
+                    // Incremental: single new token can attend to all previous tokens
+                    // Simple row of ones - no expensive bandPart operation needed
+                    causalMask = MLShapedArray<Float16>(
+                        repeating: 1.0,
+                        shape: [1, 1, 1, kvLen]
+                    )
+                } else {
+                    // Prefill: need full lower triangular mask
+                    let shape = [1, 1, kvLen, kvLen]
+                    let onesTensor = MLTensor(ones: shape, scalarType: Float16.self)
+                    causalMask = await onesTensor.bandPart(lowerBandCount: -1, upperBandCount: 0)
+                        .shapedArray(of: Float16.self)
+                }
+
                 inputDictionary["causalMask"] = MLFeatureValue(shapedArray: causalMask)
             }
             
@@ -133,7 +106,7 @@ extension LlamaSession where Self: _LlamaSession {
             guard let fixed_seq_len = shapeConstraint.enumeratedShapes.first(where: {
                 $0[1].intValue > tokens.count
             })?[1].intValue else {
-                fatalError("Could not find a shape large enough")
+                throw LlamaANEError.contextLengthExceeded(current: tokens.count, maximum: maxContextSize)
             }
             
             let maxTokens = min(tokens.count, fixed_seq_len)
@@ -169,7 +142,7 @@ extension LlamaSession where Self: _LlamaSession {
             inputDictionary["inputIds"] = MLFeatureValue(shapedArray: inputIds)
             inputDictionary["attentionMask"] = MLFeatureValue(shapedArray: attentionMask)
         }
-        return try! MLDictionaryFeatureProvider(dictionary: inputDictionary)
+        return try MLDictionaryFeatureProvider(dictionary: inputDictionary)
     }
 }
 
@@ -189,14 +162,16 @@ public actor GrammarSession<Grammar: JSONSchemaConvertible>: LlamaSession, _Llam
     var logger: Logger = .llamaSession
     var jsonSchemaStateTracker: JSONSchemaStateTracker
     let systemPrompt: String
-    
+    let chatTemplate: any ChatTemplate
+
     init(systemPrompt: String,
          requiresCausal: Bool,
          requiresAttention: Bool,
          config: GenerationConfig,
          model: MLModel,
          tokenizer: any Tokenizer,
-         contextSize: Int) async {
+         contextSize: Int,
+         chatTemplate: any ChatTemplate) async {
         self.systemPrompt = systemPrompt
         self.requiresCausal = requiresCausal
         self.requiresAttention = requiresAttention
@@ -204,7 +179,8 @@ public actor GrammarSession<Grammar: JSONSchemaConvertible>: LlamaSession, _Llam
         self.model = model
         self.tokenizer = tokenizer
         self.contextSize = contextSize
-        self.config.eosTokenId = tokenizer.eosTokenId//("<|eot_id|>", text: "")
+        self.chatTemplate = chatTemplate
+        self.config.eosTokenId = tokenizer.eosTokenId
         self.logger = .init(OSLog.disabled)
         if !model.modelDescription.stateDescriptionsByName.isEmpty {
             kvCache = model.makeState()
@@ -221,19 +197,20 @@ public actor GrammarSession<Grammar: JSONSchemaConvertible>: LlamaSession, _Llam
         let tokens = tokenizer.encode(text: prompt,
                                       addSpecialTokens: addSpecialTokens)
         outputBuffer.append(contentsOf: tokens)
-        var input: MLDictionaryFeatureProvider = await input(from: outputBuffer, totalBuffer: outputBuffer)
-        if (input["inputIds"]?.multiArrayValue?.count ?? 1) > contextSize {
-            print("!! CONTEXT LENGTH EXCEEDED !!")
+        var input: MLDictionaryFeatureProvider = try await input(from: outputBuffer, totalBuffer: outputBuffer)
+        let currentLength = input["inputIds"]?.multiArrayValue?.count ?? 1
+        if currentLength > contextSize {
+            logger.warning("Context length exceeded: \(currentLength) > \(self.contextSize)")
+            throw LlamaANEError.contextLengthExceeded(current: currentLength, maximum: contextSize)
         }
-//            var maxTokens = min(input["inputIds"]?.multiArrayValue?.count ?? 1, maxContextLength)
+
         var totalDecoded = ""
-        var isExpectedToolCall = false
-        
+
         // If this is the first iteration, we should run the prediction to generate
         // the correct internal state, but then skip the processing steps
         // for the first token
         let topK = config.topK
-        
+
         while outputBuffer.count < self.contextSize {
             var time = Date.now
             let output = try await asynchronousPredict(input: input)
@@ -241,7 +218,7 @@ public actor GrammarSession<Grammar: JSONSchemaConvertible>: LlamaSession, _Llam
             logger.debug("\(Thread.current) Prediction took \(elapsed)s")
             time = Date.now
             guard let logitsValue = output.featureValue(for: "logits")?.shapedArrayValue(of: Float16.self) else {
-                fatalError()
+                throw LlamaANEError.invalidLogitsOutput
             }
 
             var mlTensor =  MLTensor(logitsValue).cast(to: Float.self).flattened()
@@ -300,7 +277,7 @@ public actor GrammarSession<Grammar: JSONSchemaConvertible>: LlamaSession, _Llam
             jsonSchemaStateTracker.updateState(with: outputBuffer.last!, &outputBuffer)
             let nextToken = outputBuffer.last!
             time = Date.now
-            input = await self.input(from: [nextToken], totalBuffer: outputBuffer)
+            input = try await self.input(from: [nextToken], totalBuffer: outputBuffer)
             elapsed = Date.now.timeIntervalSince1970 - time.timeIntervalSince1970
             logger.debug("Next Input gen took \(elapsed)")
 //                maxTokens = min(input["inputIds"]?.multiArrayValue?.count ?? 1, self.maxContextLength)
@@ -329,27 +306,16 @@ public actor GrammarSession<Grammar: JSONSchemaConvertible>: LlamaSession, _Llam
         return totalDecoded
     }
     var hasShownInitialPrompt = false
-    
+
     public func infer(prompt: String) -> AsyncStream<String> {
-        var prompt = """
-        <|start_header_id|>user<|end_header_id|>
-        \(prompt)<|eot_id|>
-        <|start_header_id|>assistant<|end_header_id|>
-        """
+        var formattedPrompt = chatTemplate.formatUserMessage(prompt) + chatTemplate.formatAssistantPrefix()
         if !hasShownInitialPrompt {
-            prompt = """
-            <|begin_of_text|><|start_header_id|>system<|end_header_id|>
-            \(systemPrompt)
-            <|eot_id|>
-            """.appending(prompt)
+            formattedPrompt = chatTemplate.beginOfText + chatTemplate.formatSystemPrompt(systemPrompt) + formattedPrompt
             hasShownInitialPrompt = true
         }
         return AsyncStream { stream in
             Task {
-                // Maybe pad or truncate
-                
-                try await infer(prompt: prompt,
-                                stream: stream)
+                try await infer(prompt: formattedPrompt, stream: stream)
             }
         }
     }
