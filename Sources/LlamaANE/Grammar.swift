@@ -2,8 +2,6 @@ import Foundation
 import JSONSchema
 @preconcurrency import Tokenizers
 import CoreML
-import NaturalLanguage
-import Accelerate
 
 public enum GrammarError: Error, LocalizedError {
     case missingSchemaProperties
@@ -22,463 +20,465 @@ public enum GrammarError: Error, LocalizedError {
     }
 }
 
-private protocol Parser: Sendable {
-    mutating func updateState(with token: Int, _ totalDecoded: inout [Int])
-    func getValidTokens() -> Set<Int>
-    var isComplete: Bool { get }
-}
+// MARK: - Token Categories
+/// Pre-computed token categories for efficient filtering
+private struct TokenCategories: Sendable {
+    // Single character structural tokens
+    let quote: Int              // "
+    let colon: Int              // :
+    let comma: Int              // ,
+    let openBrace: Int          // {
+    let closeBrace: Int         // }
+    let openBracket: Int        // [
+    let closeBracket: Int       // ]
 
-// MARK: Int Parser
-private struct IntParser: Parser {
-    enum State {
-        case start
-        case inInt
-        case escape
-    }
-    
-    let tokenizer: Tokenizer
-    private let validTokens: Set<Int>
-    
-    init(tokenizer: Tokenizer, cachedDigitKeys: Set<Int>) {
-        self.tokenizer = tokenizer
-        var validTokens = cachedDigitKeys
-//        let digitTokens = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
-//        for token in digitTokens {
-//            validTokens.insert(tokenizer.tokensToIds[token]!)
-//        }
-        validTokens.insert(tokenizer.tokensToIds["-"]!)
-        validTokens.insert(tokenizer.tokensToIds[","]!)
-        self.validTokens = validTokens
-    }
-    
-    private var state = State.start
-    var isComplete: Bool = false
-    
-    mutating func updateState(with token: Int, _ totalDecoded: inout [Int]) {
-        let token = tokenizer.idsToTokens[token]!
-        switch state {
-        case .start:
-            state = .inInt
-        case .inInt:
-            if token == "\"" || token == "," {
-                isComplete = true
+    // Token sets by category
+    let pureDigits: Set<Int>           // Tokens that are only digits (0-9, 123, etc.)
+    let digitsWithComma: Set<Int>      // Pure digits OR end with comma (for number termination)
+    let stringContent: Set<Int>        // Safe inside strings (no unescaped quotes or structural chars that break parsing)
+    let quoteOnly: Set<Int>            // Just the quote token
+    let colonOnly: Set<Int>            // Just the colon token
+    let commaOnly: Set<Int>            // Just the comma token
+    let closeBraceOnly: Set<Int>       // Just the } token
+    let commaOrCloseBrace: Set<Int>    // , or }
+
+    init(tokenizer: Tokenizer) {
+        // Get single-char structural tokens
+        self.quote = tokenizer.tokensToIds["\""]!
+        self.colon = tokenizer.tokensToIds[":"]!
+        self.comma = tokenizer.tokensToIds[","]!
+        self.openBrace = tokenizer.tokensToIds["{"]!
+        self.closeBrace = tokenizer.tokensToIds["}"]!
+        self.openBracket = tokenizer.tokensToIds["["] ?? -1
+        self.closeBracket = tokenizer.tokensToIds["]"] ?? -1
+
+        // Build category sets
+        var pureDigits = Set<Int>()
+        var digitsWithComma = Set<Int>()
+        var stringContent = Set<Int>()
+
+        for (token, id) in tokenizer.tokensToIds {
+            // Pure digits: only contains 0-9
+            if token.allSatisfy({ $0.isNumber }) && !token.isEmpty {
+                pureDigits.insert(id)
+                digitsWithComma.insert(id)
             }
-        default: fatalError()
-        }
-    }
-    
-    func getValidTokens() -> Set<Int> {
-        return self.validTokens
-    }
-}
 
-private struct NumberParser: Parser {
-    enum State {
-        case start
-        case inInt
-        case overflow
-    }
-    
-    let tokenizer: Tokenizer
-    private var validTokens: Set<Int>
-    private let decimalIndex: Int
-    
-    init(tokenizer: Tokenizer, cachedDigitKeys: Set<Int>) {
-        self.tokenizer = tokenizer
-        var validTokens = cachedDigitKeys
-//        let digitTokens = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]
-//        for token in digitTokens {
-//            validTokens.insert(tokenizer.tokensToIds[token]!)
-//        }
-        validTokens.insert(tokenizer.tokensToIds["-"]!)
-        validTokens.insert(tokenizer.tokensToIds["Ġ-"]!)
-//        validTokens.insert(tokenizer.tokensToIds["-."]!)
-        self.decimalIndex = tokenizer.tokensToIds["."]!
-        validTokens.insert(decimalIndex)
-        validTokens.insert(tokenizer.tokensToIds[","]!)
-        self.validTokens = validTokens
-    }
-    
-    private var state = State.start
-    var isComplete: Bool = false
-    var inDecimal = false
-    
-    mutating func updateState(with token: Int, _ totalDecoded: inout [Int]) {
-        if token == decimalIndex {
-            // if a decimal is used, it is no longer valid
-            validTokens.remove(decimalIndex)
-            inDecimal = true
-        }
-
-        // remove negative symbols since they are disallowed after the first token
-        validTokens.remove(tokenizer.tokensToIds["-"]!)
-        validTokens.remove(tokenizer.tokensToIds["Ġ-"]!)
-        
-        
-        let token = tokenizer.idsToTokens[token]!
-        switch state {
-        case .start:
-            state = .inInt
-        case .inInt:
-            if token == "\"" || token == "," {
-                isComplete = true
+            // Digits ending with comma (like "123,")
+            if token.dropLast().allSatisfy({ $0.isNumber }) && token.last == "," && token.count > 1 {
+                digitsWithComma.insert(id)
             }
-        default: fatalError()
+
+            // String content: tokens valid inside a JSON string value
+            // We need to be careful about quotes:
+            // - Single quote `"` is excluded (we don't want model to choose it freely)
+            // - Tokens ENDING with quote (like `word"`) are ALLOWED - they naturally end strings
+            // - Tokens with quote elsewhere are excluded (would break parsing)
+            var isSafeForString = true
+
+            // Exclude the single quote token
+            if token == "\"" {
+                isSafeForString = false
+            }
+            // Tokens ending with quote are OK (they terminate the string naturally)
+            else if token.hasSuffix("\"") {
+                // Allow it - this is how strings end
+                isSafeForString = true
+            }
+            // Tokens with quote NOT at the end are problematic
+            else if token.contains("\"") {
+                isSafeForString = false
+            }
+
+            // Don't allow tokens with newlines (breaks JSON)
+            if token.contains("\n") || token.contains("\r") {
+                isSafeForString = false
+            }
+
+            // Don't allow backslash alone (escape handling is complex)
+            if token == "\\" {
+                isSafeForString = false
+            }
+
+            if isSafeForString {
+                stringContent.insert(id)
+            }
         }
-    }
-    
-    func getValidTokens() -> Set<Int> {
-        return self.validTokens
+
+        self.pureDigits = pureDigits
+        self.digitsWithComma = digitsWithComma
+        self.stringContent = stringContent
+        self.quoteOnly = Set([self.quote])
+        self.colonOnly = Set([self.colon])
+        self.commaOnly = Set([self.comma])
+        self.closeBraceOnly = Set([self.closeBrace])
+        self.commaOrCloseBrace = Set([self.comma, self.closeBrace])
     }
 }
 
-// MARK: StringParser
-private struct StringParser: Parser {
-    enum State {
-        case start
-        case inString
-        case escape
-    }
-    
-    let tokenizer: Tokenizer
-    let disallowedTokens: Set<Int>
-    init(tokenizer: Tokenizer, disallowedtokens: Set<Int> = .init()) {
-        self.tokenizer = tokenizer
-        self.disallowedTokens = disallowedtokens
-    }
-    private var state = State.start
-    var isComplete: Bool = false
-    
-    mutating func updateState(with token: Int, _ totalDecoded: inout [Int]) {
-        let token = tokenizer.idsToTokens[token]!
-        switch state {
-        case .start:
-            if token != "\"" {
-                state = .inString
-            }
-        case .inString:
-            if token == "\"" || token == "\"," || token.hasSuffix("\"") {
-                isComplete = true
-            }
-        default: fatalError()
-        }
-    }
-    
-    func getValidTokens() -> Set<Int> {
-        var validTokens = Set<Int>()
-        validTokens.formUnion(tokenizer.tokensToIds.values)
-        // Exclude unescaped quotes and backslashes
-        if let quoteID = tokenizer.tokensToIds["\""], let backslashID = tokenizer.tokensToIds["\\"] {
-            validTokens.remove(quoteID)
-            validTokens.remove(backslashID)
-            // To allow escaped quotes and backslashes, handle separately
-            // For simplicity, we can allow them and manage escaping in the state
-        }
-        validTokens.formSymmetricDifference(disallowedTokens)
-        return validTokens
-    }
+// MARK: - JSON Generation State Machine
+private enum JSONGenState: Sendable {
+    case expectingObjectStart                    // Want {
+    case expectingKeyStart                       // Want " to start a key
+    case inKey(parts: [String], partIndex: Int)  // Generating key tokens
+    case expectingKeyEnd                         // Want " to end key
+    case expectingColon                          // Want :
+    case expectingValueStart(type: String)       // Want value opening based on type
+    case inStringValue(charCount: Int)           // Generating string content
+    case inIntegerValue(hasDigit: Bool)          // Generating integer
+    case inNumberValue(hasDigit: Bool, hasDecimal: Bool) // Generating number
+    case expectingCommaOrEnd(hasMoreFields: Bool) // Want , or }
+    case expectingCloseBrace                     // Want }
+    case complete                                // Done
 }
 
-
-private extension String {
-    func splitCamelOrSnakeCase() -> [String] {
-        // Split snake_case
-        let snakeParts = self.split(separator: "_").map { String($0) }
-
-        // Handle camelCase
-        let camelParts = self.unicodeScalars.reduce(into: [""]) { result, scalar in
-            let character = Character(scalar)
-            if CharacterSet.uppercaseLetters.contains(scalar), !result.last!.isEmpty {
-                result.append(String(character))
-            } else {
-                result[result.count - 1].append(character)
-            }
-        }
-
-        // Determine which split is relevant (snake case has "_", camel case does not)
-        return self.contains("_") ? snakeParts : camelParts
-    }
-}
-
-// MARK: KeyParser
-private struct KeyParser: Parser {
-    enum State {
-        case start
-        case inString
-        case escape
-    }
-    var nextKeyPart: String?
-    let tokenizer: Tokenizer
-    var keyParts: [String]
-
-    init(key: String, tokenizer: Tokenizer) {
-        self.tokenizer = tokenizer
-        self.keyParts = tokenizer.tokenize(text: key)
-        self.nextKeyPart = self.keyParts.removeFirst()
-    }
-    
-    private var state = State.start
-    var isComplete: Bool = false
-    
-    func getValidTokens() -> Set<Int> {
-        switch state {
-        case .start:
-            Set([tokenizer.tokensToIds[self.nextKeyPart!]!])
-        case .inString:
-            if nextKeyPart != nil {
-                Set([tokenizer.tokensToIds[self.nextKeyPart!]!])
-            } else {
-                Set([tokenizer.tokensToIds["\""]!])
-            }
-        default: fatalError()
-        }
-    }
-    
-    mutating func updateState(with token: Int, _ totalDecoded: inout [Int]) {
-        let token = tokenizer.idsToTokens[token]!
-        switch state {
-        case .start:
-            if token != "\"" {
-                state = .inString
-            }
-            if !keyParts.isEmpty {
-                nextKeyPart = keyParts.removeFirst()
-            } else {
-                nextKeyPart = nil
-            }
-        case .inString:
-            if token == "\""  || token == "\"," {
-                isComplete = true
-            } else {
-                if keyParts.isEmpty {
-                    nextKeyPart = nil
-                } else {
-                    nextKeyPart = keyParts.removeFirst()
-                }
-            }
-        default: fatalError()
-        }
-    }
-}
-private struct ObjectParser: Parser {
-    enum State {
-        case start, key, value, colon, comma, end
-    }
-    private var state = State.start
-    private var parser: Parser?
-    var keyValuePairs: [(String, JSONSchema.Property)]
-    var nextKey: String?
-    var nextValue: JSONSchema.Property?
-    let tokenizer: Tokenizer
-    var isComplete = false
-    private let cachedDigitKeys: Set<Int>
-    
-    init(tokenizer: Tokenizer, keyValuePairs: [(String, JSONSchema.Property)],
-         cachedDigitKeys: Set<Int>) {
-        self.tokenizer = tokenizer
-        self.keyValuePairs = keyValuePairs
-        self.cachedDigitKeys = cachedDigitKeys
-    }
-    
-    mutating func updateState(with token: Int, _ totalDecoded: inout [Int]) {
-        let decoded = tokenizer.idsToTokens[token]!
-        if decoded == "}" {
-            isComplete = true
-        } else if decoded == "\"" && (state == .start || state == .comma) {
-            // startKey
-            if keyValuePairs.isEmpty {
-                state = .end
-            } else {
-                (nextKey, nextValue) = keyValuePairs.removeFirst()
-                parser = KeyParser(key: nextKey!, tokenizer: tokenizer)
-                state = .key
-            }
-        } else if state == .key {
-            if parser!.isComplete {
-                nextKey = nil
-                state = .colon
-            } else {
-                parser!.updateState(with: token, &totalDecoded)
-                if parser!.isComplete {
-                    state = .colon
-                }
-            }
-        } else if state == .colon && (decoded == ":" || decoded.contains(":")) {
-            state = .value
-            switch nextValue!.type {
-            case "string":
-                parser = StringParser(tokenizer: tokenizer)
-            case "integer":
-                parser = IntParser(tokenizer: tokenizer, cachedDigitKeys: cachedDigitKeys)
-            case "number":
-                parser = NumberParser(tokenizer: tokenizer, cachedDigitKeys: cachedDigitKeys)
-            default: fatalError()
-            }
-        } else if state == .value {
-            if parser!.isComplete {
-                state = .comma
-            } else {
-                parser!.updateState(with: token, &totalDecoded)
-                if parser!.isComplete {
-                    if decoded.hasSuffix(",") {
-                        if keyValuePairs.isEmpty { // TODO: Add token removal
-                            if totalDecoded.last == tokenizer.tokensToIds[","] {
-                                totalDecoded.removeLast()
-                            }
-                            if totalDecoded.last == tokenizer.tokensToIds["\","] {
-                                totalDecoded.removeLast()
-                                totalDecoded.append(tokenizer.tokensToIds["\""]!)
-                            }
-                            state = .end
-                        } else {
-                            state = .start
-                        }
-                    } else {
-                        state = .comma
-                    }
-                    if keyValuePairs.isEmpty { // TODO: Add token removal
-                        if totalDecoded.last == tokenizer.tokensToIds[","] {
-                            totalDecoded.removeLast()
-                        }
-                        if totalDecoded.last == tokenizer.tokensToIds["\","] {
-                            totalDecoded.removeLast()
-                            totalDecoded.append(tokenizer.tokensToIds["\""]!)
-                        }
-                        state = .end
-                    }
-                }
-            }
-        } else if state == .comma && decoded == "," {
-            state = .key
-            (nextKey, nextValue) = keyValuePairs.removeFirst()
-            parser = KeyParser(key: nextKey!, tokenizer: tokenizer)
-        }
-    }
-    
-    func getValidTokens() -> Set<Int> {
-        switch state {
-        case .start:
-            return Set([tokenizer.tokensToIds["\""]!])
-        case .key, .value:
-            return parser!.getValidTokens()
-        case .colon:
-            return Set([tokenizer.tokensToIds[":"]!])
-            
-        case .comma:
-            return Set([tokenizer.tokensToIds[","]!])
-        case .end:
-            return Set([tokenizer.tokensToIds["}"]!])
-        }
-    }
-}
-
+// MARK: - JSON Schema State Tracker (Redesigned)
 struct JSONSchemaStateTracker: Sendable {
-    enum State {
-        case root
-        case object
-        case array
-    }
-    
-    private var currentJSON: String = ""
-    private let schema: JSONSchemaConvertible.Type // Define or import your JSONSchema structure
+    private let schema: JSONSchemaConvertible.Type
     private let tokenizer: Tokenizer
-    private let openBracketIndex: Int
-    private var state = State.root
-    private var expectedKeysStack: [(String, JSONSchema.Property)] = []
-    private var requiredKeysStack: [Set<String>] = []
-    private var nextKey: String?
-    private var nextValue: JSONSchema.Property?
-    private var parser: Parser?
-    private let cachedDigitKeys: Set<Int>
-    var isComplete: Bool = false
-    
+    private let categories: TokenCategories
+    private var state: JSONGenState = .expectingObjectStart
+    private var fields: [(key: String, property: JSONSchema.Property)] = []
+    private var currentFieldIndex: Int = 0
+    private var currentJSON: String = ""
+
+    // Configuration - maxStringLength is a safety limit, not a target length
+    // It's only meant to prevent infinite loops when model refuses to end strings
+    private let maxStringLength: Int = 4000
+
+    var isComplete: Bool {
+        if case .complete = state { return true }
+        return false
+    }
+
     init(schema: JSONSchemaConvertible.Type, tokenizer: Tokenizer) {
         self.schema = schema
         self.tokenizer = tokenizer
-        openBracketIndex = tokenizer.tokensToIds["{"]!
-        
-//        cachedDigitKeys = Set([tokenizer.tokensToIds["0"]!,
-//        tokenizer.tokensToIds["1"]!,
-//        tokenizer.tokensToIds["2"]!,
-//        tokenizer.tokensToIds["3"]!,
-//        tokenizer.tokensToIds["4"]!,
-//        tokenizer.tokensToIds["5"]!,
-//        tokenizer.tokensToIds["6"]!,
-//        tokenizer.tokensToIds["7"]!,
-//        tokenizer.tokensToIds["8"]!,
-//        tokenizer.tokensToIds["9"]!])
-        let digitKeys = tokenizer.tokensToIds.compactMap({
-            if $0.key.contains(/^\d+$/) {
-                return $0.value
-            } else {
-                return nil
-            }
-        })
-        cachedDigitKeys = Set(digitKeys)
+        self.categories = TokenCategories(tokenizer: tokenizer)
+
+        // Extract fields from schema
+        if let properties = schema.properties {
+            self.fields = properties
+        }
     }
-    
+
+    // MARK: - Token Filtering
+
     func applyPenalty(_ tensor: MLTensor) async -> MLTensor {
         let validTokens = getValidTokens()
+
+        // Optimization: if only one valid token, create minimal tensor
         if validTokens.count == 1, let validToken = validTokens.first {
-            var shaped = MLShapedArray<Float>(repeating: 0, shape: [validToken + 1])
-//            let count = xShaped.count
+            let vocabSize = await tensor.shapedArray(of: Float.self).scalarCount
+            var shaped = MLShapedArray<Float>(repeating: -Float.greatestFiniteMagnitude, shape: [vocabSize])
             shaped[scalarAt: validToken] = Float.greatestFiniteMagnitude
             return MLTensor(shaped)
         }
+
+        // General case: penalize invalid tokens
         let xShaped = await tensor.shapedArray(of: Float.self)
         let disallowedIndices = xShaped.enumerated().compactMap {
             if !validTokens.contains($0.offset) {
                 return Int32($0.offset)
-            } else {
-                return nil
             }
+            return nil
         }
-        return tensor.replacing(atIndices: MLTensor(disallowedIndices, scalarType: Int32.self),
-                                with: -Float.greatestFiniteMagnitude,
-                                alongAxis: -1)
+
+        return tensor.replacing(
+            atIndices: MLTensor(disallowedIndices, scalarType: Int32.self),
+            with: -Float.greatestFiniteMagnitude,
+            alongAxis: -1
+        )
     }
-    
-    // Update the state based on the latest token
-    mutating func updateState(with token: Int, _ totalDecoded: inout [Int]) {
-        let decodedToken = tokenizer.decode(tokens: [token])
-        currentJSON += decodedToken
-        
-        if decodedToken == "{" && state == .root {
-            guard let properties = schema.properties else { fatalError() }
-            state = .object
-            parser = ObjectParser(tokenizer: tokenizer,
-                                  keyValuePairs: properties,
-                                  cachedDigitKeys: cachedDigitKeys)
-        } else {
-            parser!.updateState(with: token, &totalDecoded)
-            if parser!.isComplete {
-                state = .root
-            }
-        }
-    }
-    
-    // Determine valid tokens based on the current state and schema
+
     private func getValidTokens() -> Set<Int> {
-        var validTokens = Set<Int>()
-        
         switch state {
-        case .root:
-            // Typically expects an object or array
-            if self.currentJSON.isEmpty {
-                validTokens.insert(tokenizer.tokensToIds["{"] ?? -1)
-            } else {
-                validTokens.insert(tokenizer.eosTokenId!)
+        case .expectingObjectStart:
+            return Set([categories.openBrace])
+
+        case .expectingKeyStart:
+            return categories.quoteOnly
+
+        case .inKey(let parts, let partIndex):
+            // Return exact token for current key part
+            if partIndex < parts.count {
+                if let tokenId = tokenizer.tokensToIds[parts[partIndex]] {
+                    return Set([tokenId])
+                }
             }
-        case .object, .array:
-            return parser!.getValidTokens()
+            // Fallback: allow quote to end key
+            return categories.quoteOnly
+
+        case .expectingKeyEnd:
+            return categories.quoteOnly
+
+        case .expectingColon:
+            return categories.colonOnly
+
+        case .expectingValueStart(let type):
+            switch type {
+            case "string":
+                return categories.quoteOnly
+            case "integer", "number":
+                // Allow digits and optional negative sign
+                var valid = categories.pureDigits
+                if let minusId = tokenizer.tokensToIds["-"] {
+                    valid.insert(minusId)
+                }
+                return valid
+            case "boolean":
+                // Allow "true" or "false" starting tokens
+                var valid = Set<Int>()
+                if let t = tokenizer.tokensToIds["true"] { valid.insert(t) }
+                if let f = tokenizer.tokensToIds["false"] { valid.insert(f) }
+                // Also allow partial tokens
+                if let tr = tokenizer.tokensToIds["tr"] { valid.insert(tr) }
+                if let fa = tokenizer.tokensToIds["fa"] { valid.insert(fa) }
+                return valid
+            default:
+                // Unknown type - allow quote for string fallback
+                return categories.quoteOnly
+            }
+
+        case .inStringValue(let charCount):
+            // Force termination if string is too long
+            if charCount >= maxStringLength {
+                return categories.quoteOnly
+            }
+
+            var valid = categories.stringContent
+            // Add the single quote token so model can end strings cleanly
+            valid.insert(categories.quote)
+
+            // If this is the last field, exclude tokens that end strings with commas
+            // to prevent trailing commas in the JSON
+            let isLastField = currentFieldIndex >= fields.count - 1
+            if isLastField {
+                // Remove tokens that would end the string and add a trailing comma
+                // Examples: `","`, `",`, `word",`, `word","`
+                let tokensToRemove = tokenizer.tokensToIds.filter { (token, _) in
+                    // Token ends string AND has comma after the quote
+                    token.contains("\"") && (
+                        token == "\",\"" ||
+                        token == "\"," ||
+                        token.hasSuffix("\",") ||
+                        token.hasSuffix("\",\"")
+                    )
+                }.map { $0.value }
+                for tokenId in tokensToRemove {
+                    valid.remove(tokenId)
+                }
+            }
+            return valid
+
+        case .inIntegerValue:
+            // Allow digits or comma to end
+            return categories.digitsWithComma.union(categories.commaOrCloseBrace)
+
+        case .inNumberValue(_, let hasDecimal):
+            var valid = categories.digitsWithComma.union(categories.commaOrCloseBrace)
+            // Allow decimal point if not already used
+            if !hasDecimal, let dotId = tokenizer.tokensToIds["."] {
+                valid.insert(dotId)
+            }
+            return valid
+
+        case .expectingCommaOrEnd(let hasMoreFields):
+            if hasMoreFields {
+                return categories.commaOnly
+            } else {
+                return categories.commaOrCloseBrace
+            }
+
+        case .expectingCloseBrace:
+            return categories.closeBraceOnly
+
+        case .complete:
+            if let eosId = tokenizer.eosTokenId {
+                return Set([eosId])
+            }
+            return Set()
         }
-        return validTokens
     }
-    
-    // Helper method to extract the current key being processed
-    private func extractCurrentKey() -> String? {
-        // Implement logic to extract the current key from the context
-        // This might involve parsing the current JSON string or maintaining additional state
-        return nil // Placeholder: Replace with actual implementation
+
+    // MARK: - State Updates
+
+    mutating func updateState(with token: Int, _ totalDecoded: inout [Int]) {
+        guard let tokenStr = tokenizer.idsToTokens[token] else { return }
+        currentJSON += tokenizer.decode(tokens: [token])
+
+        switch state {
+        case .expectingObjectStart:
+            if tokenStr == "{" {
+                if currentFieldIndex < fields.count {
+                    let key = fields[currentFieldIndex].key
+                    let parts = tokenizer.tokenize(text: key)
+                    state = .expectingKeyStart
+                } else {
+                    state = .expectingCloseBrace
+                }
+            }
+
+        case .expectingKeyStart:
+            if tokenStr == "\"" {
+                let key = fields[currentFieldIndex].key
+                let parts = tokenizer.tokenize(text: key)
+                if parts.isEmpty {
+                    state = .expectingKeyEnd
+                } else {
+                    state = .inKey(parts: parts, partIndex: 0)
+                }
+            }
+
+        case .inKey(let parts, let partIndex):
+            let nextIndex = partIndex + 1
+            if nextIndex >= parts.count {
+                state = .expectingKeyEnd
+            } else {
+                state = .inKey(parts: parts, partIndex: nextIndex)
+            }
+
+        case .expectingKeyEnd:
+            if tokenStr == "\"" {
+                state = .expectingColon
+            } else if tokenStr.hasSuffix("\"") {
+                // Token ends with quote (e.g., key part + quote)
+                state = .expectingColon
+            } else if tokenStr == "\":" || tokenStr.hasSuffix("\":") {
+                // Token is quote-colon or ends with quote-colon - skip to value
+                let valueType = fields[currentFieldIndex].property.type ?? "string"
+                state = .expectingValueStart(type: valueType)
+            }
+
+        case .expectingColon:
+            if tokenStr == ":" {
+                let valueType = fields[currentFieldIndex].property.type ?? "string"
+                state = .expectingValueStart(type: valueType)
+            } else if tokenStr.hasPrefix(":") {
+                // Token starts with colon - it's a colon plus something
+                let valueType = fields[currentFieldIndex].property.type ?? "string"
+                state = .expectingValueStart(type: valueType)
+            }
+
+        case .expectingValueStart(let type):
+            switch type {
+            case "string":
+                if tokenStr == "\"" {
+                    state = .inStringValue(charCount: 0)
+                }
+            case "integer":
+                state = .inIntegerValue(hasDigit: tokenStr.contains(where: { $0.isNumber }))
+                // Check if this token ends the value
+                if tokenStr.hasSuffix(",") || tokenStr == "," {
+                    advanceToNextField(consumedComma: true)
+                } else if tokenStr == "}" {
+                    state = .complete
+                }
+            case "number":
+                let hasDecimal = tokenStr.contains(".")
+                state = .inNumberValue(hasDigit: tokenStr.contains(where: { $0.isNumber }), hasDecimal: hasDecimal)
+                if tokenStr.hasSuffix(",") || tokenStr == "," {
+                    advanceToNextField(consumedComma: true)
+                } else if tokenStr == "}" {
+                    state = .complete
+                }
+            default:
+                // Treat unknown as string
+                if tokenStr == "\"" {
+                    state = .inStringValue(charCount: 0)
+                }
+            }
+
+        case .inStringValue(let charCount):
+            if tokenStr == "\"" {
+                // String ended with single quote
+                advanceToNextField(consumedComma: false)
+            } else if tokenStr == "\",\"" {
+                // Token is `","` - ends string, has comma, AND starts next key quote
+                // This is a special compound token that spans two fields
+                advanceToNextField(consumedComma: true)
+                // The token also provided the opening quote for the next key
+                if currentFieldIndex < fields.count {
+                    let key = fields[currentFieldIndex].key
+                    let parts = tokenizer.tokenize(text: key)
+                    if parts.isEmpty {
+                        state = .expectingKeyEnd
+                    } else {
+                        state = .inKey(parts: parts, partIndex: 0)
+                    }
+                }
+            } else if tokenStr == "\"," {
+                // Token is `",` - ends string AND includes comma (no next quote)
+                advanceToNextField(consumedComma: true)
+            } else if tokenStr.hasSuffix("\"") {
+                // Token ends with quote (like `word"`) - ends string
+                advanceToNextField(consumedComma: false)
+            } else {
+                // Continue string, track length
+                let newCount = charCount + tokenStr.count
+                state = .inStringValue(charCount: newCount)
+            }
+
+        case .inIntegerValue:
+            if tokenStr == "," {
+                advanceToNextField(consumedComma: true)
+            } else if tokenStr == "}" {
+                state = .complete
+            } else if tokenStr.hasSuffix(",") {
+                advanceToNextField(consumedComma: true)
+            }
+            // Otherwise stay in integer state
+
+        case .inNumberValue(let hasDigit, let hasDecimal):
+            if tokenStr == "," {
+                advanceToNextField(consumedComma: true)
+            } else if tokenStr == "}" {
+                state = .complete
+            } else if tokenStr.hasSuffix(",") {
+                advanceToNextField(consumedComma: true)
+            } else {
+                // Update decimal tracking
+                let newHasDecimal = hasDecimal || tokenStr.contains(".")
+                state = .inNumberValue(hasDigit: true, hasDecimal: newHasDecimal)
+            }
+
+        case .expectingCommaOrEnd:
+            if tokenStr == "," {
+                // Don't call advanceToNextField - the index was already incremented
+                // when we entered this state. Just move to expecting the next key.
+                state = .expectingKeyStart
+            } else if tokenStr == "}" {
+                state = .complete
+            }
+
+        case .expectingCloseBrace:
+            if tokenStr == "}" {
+                state = .complete
+            }
+
+        case .complete:
+            break
+        }
+    }
+
+    private mutating func advanceToNextField(consumedComma: Bool) {
+        currentFieldIndex += 1
+
+        if currentFieldIndex >= fields.count {
+            // No more fields
+            if consumedComma {
+                // We consumed a comma but there are no more fields - need to close
+                state = .expectingCloseBrace
+            } else {
+                state = .expectingCommaOrEnd(hasMoreFields: false)
+            }
+        } else {
+            // More fields to process
+            if consumedComma {
+                state = .expectingKeyStart
+            } else {
+                state = .expectingCommaOrEnd(hasMoreFields: true)
+            }
+        }
     }
 }

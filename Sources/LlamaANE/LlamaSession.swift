@@ -223,6 +223,15 @@ public actor GrammarSession<Grammar: JSONSchemaConvertible>: LlamaSession, _Llam
 
             var mlTensor =  MLTensor(logitsValue).cast(to: Float.self).flattened()
             mlTensor = await jsonSchemaStateTracker.applyPenalty(mlTensor)
+
+            // Apply repetition penalty based on previously generated tokens
+            if config.repetitionPenalty != 1.0 {
+                mlTensor = await mlTensor.applyRepetitionPenalty(
+                    Float(config.repetitionPenalty),
+                    generatedTokenIds: outputBuffer
+                )
+            }
+
             if config.generationMode == .greedy {
                 let shaped = await mlTensor.argmax()
                     .shapedArray(of: Int32.self)

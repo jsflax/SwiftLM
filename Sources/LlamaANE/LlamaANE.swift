@@ -690,19 +690,15 @@ public extension LanguageModel {
         temperature: Double = 1.0,
         topK: Int = 0,
         topP: Double = 1.0,
-        repetitionPenalty: Double = 1.0,
+        repetitionPenalty: Double = 1.1,  // Slight repetition penalty to prevent loops
+        doSample: Bool = false,           // Greedy by default (faster), repetition penalty still applies
         isLogginEnabled: Bool = false) async throws -> GrammarSession<J> {
         var config = GenerationConfig(maxNewTokens: maxContextLength)
         config.topK = topK
         config.topP = topP
         config.repetitionPenalty = repetitionPenalty
         config.temperature = temperature
-        if config.temperature > 0 && config.temperature != 1 ||
-            config.topP < 1 || config.topK > 0 || config.repetitionPenalty != 1.0 {
-            config.doSample = true
-        } else {
-            config.doSample = false
-        }
+        config.doSample = doSample
 
         return await GrammarSession(systemPrompt: systemPrompt,
                                     requiresCausal: requiresCausal,

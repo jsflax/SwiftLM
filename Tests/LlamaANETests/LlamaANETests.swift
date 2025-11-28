@@ -94,7 +94,16 @@ struct LlamaANETests {
             systemPrompt: "You are a helpful assistant that responds in JSON format."
         )
 
-        let result: SimpleResponse = try await session.infer(prompt: "What is the capital of France?")
+        // First, stream the output to see what's being generated
+        let stream: AsyncStream<String> = await session.infer(prompt: "What is the capital of France?")
+        var rawOutput = ""
+        for await token in stream {
+            rawOutput += token
+            print(token, terminator: "")
+        }
+        print("\nRaw output: \(rawOutput)")
+
+        let result = try JSONDecoder().decode(SimpleResponse.self, from: rawOutput.data(using: .utf8)!)
         print("Grammar result: \(result)")
 
         #expect(!result.answer.isEmpty, "Grammar session should produce a valid response")
@@ -145,7 +154,7 @@ struct LlamaANETests {
         case qwenInt4 = "Qwen2.5-1.5B-Instruct_Int4.mlpackage"
     }
 
-    @Test("Grammar session performance with complex schema", .timeLimit(.minutes(2)), arguments: [TestModelKind.llamaInt4, TestModelKind.qwenInt4])
+    @Test("Grammar session performance with complex schema", .timeLimit(.minutes(2)), .serialized, arguments: [TestModelKind.qwenInt4, .llamaInt4])
     func testGrammarSessionPerformance(modelKind: TestModelKind) async throws {
         let modelPath = "\(testModelsPath)/\(modelKind.rawValue)"
         let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
