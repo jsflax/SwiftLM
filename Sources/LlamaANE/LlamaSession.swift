@@ -244,15 +244,11 @@ public actor Session {
             if config.generationMode == .greedy {
                 let shaped = await mlTensor.argmax().shapedArray(of: Int32.self)
                 nextToken = Int(shaped.scalars[0])
-            } else {
-                // Sampling path - but grammar constraints make this tricky.
-                // The grammar has already masked invalid tokens to -inf.
-                // We need to sample from valid tokens weighted by model probability.
-
-                var logits = await mlTensor.shapedArray(of: Float.self).scalars
+            } else if grammarTracker != nil {
+                // Grammar-constrained sampling: filter out -inf tokens, then sample
+                let logits = await mlTensor.shapedArray(of: Float.self).scalars
                 let minValidLogit = -Float.greatestFiniteMagnitude / 2
 
-                // First, find all valid tokens (not masked by grammar)
                 var validIndices: [Int] = []
                 var validLogits: [Float] = []
                 for (idx, logit) in logits.enumerated() {
@@ -262,35 +258,81 @@ public actor Session {
                     }
                 }
 
-                // If only one valid token, just use it (no sampling needed)
                 if validIndices.count <= 1 {
+                    // Only one valid token - no choice to make
                     nextToken = validIndices.first ?? 0
                 } else {
-                    // Apply topK to the VALID tokens only
-                    let topK = min(validLogits.count, Int(config.topK))
-                    if topK > 0 && topK < validLogits.count {
+                    // Apply temperature FIRST (before any filtering)
+                    let temperature = config.temperature
+                    if temperature != 1.0 && temperature > 0 {
+                        validLogits = validLogits.map { $0 / Float(temperature) }
+                    }
+
+                    // Apply topK if configured
+                    let topK = config.topK > 0 ? min(Int(config.topK), validLogits.count) : validLogits.count
+                    if topK < validLogits.count {
                         (validIndices, validLogits) = TopKLogitsWarper(k: topK).warp(indices: validIndices, logits: validLogits)
                     }
 
-                    let actualK = validLogits.count
-                    mlTensor = MLTensor(shape: [1, actualK], scalars: validLogits)
-                    var otherIndices = MLTensor(shape: [1, actualK], scalars: validIndices.map(Int32.init))
+                    // Apply topP filtering
+                    let topP = config.topP
+                    if topP < 1.0 {
+                        mlTensor = MLTensor(shape: [1, validLogits.count], scalars: validLogits)
+                        var tokenIndices = MLTensor(shape: [1, validLogits.count], scalars: validIndices.map(Int32.init))
+                        (mlTensor, tokenIndices) = await mlTensor.topP(Float16(topP), indices: tokenIndices)
 
-                    (mlTensor, otherIndices) = await mlTensor.topP(Float16(config.topP), indices: otherIndices)
-                    (mlTensor, otherIndices) = await mlTensor.penalizeRepetition(
-                        Float16(config.repetitionPenalty),
-                        atIndices: otherIndices
-                    )
+                        // Extract filtered results
+                        validLogits = await mlTensor.shapedArray(of: Float.self).scalars
+                        validIndices = await tokenIndices.shapedArray(of: Int32.self).scalars.map { Int($0) }
+                    }
 
-                    if mlTensor.rank == 0 {
-                        nextToken = await Int(otherIndices.shapedArray(of: Int32.self).scalar!)
+                    // Sample from the filtered distribution
+                    if validIndices.count == 1 {
+                        nextToken = validIndices[0]
                     } else {
-                        nextToken = await Math.sample(
-                            indexes: otherIndices,
-                            probs: mlTensor.softmax()
-                        )
+                        // Softmax and sample
+                        let maxLogit = validLogits.max() ?? 0
+                        let exps = validLogits.map { Foundation.exp($0 - maxLogit) }
+                        let expSum = exps.reduce(0, +)
+                        let probs = exps.map { $0 / expSum }
+                        nextToken = Math.sample(indexes: validIndices, probs: probs)
                     }
                 }
+            } else {
+                // Standard sampling pipeline using MLTensor:
+                // 1. Temperature scaling
+                // 2. Top-K filtering
+                // 3. Top-P (nucleus) filtering
+                // 4. Softmax to get probabilities
+                // 5. Sample from distribution
+
+                let temperature = config.temperature
+                let topK = config.topK > 0 ? Int(config.topK) : 40
+                let topP = config.topP
+
+                // Step 1: Apply temperature scaling
+                if temperature != 1.0 && temperature > 0 {
+                    mlTensor = mlTensor / Float(temperature)
+                }
+
+                // Step 2: Top-K filtering - keep only the K highest scoring tokens
+                var logits = await mlTensor.shapedArray(of: Float.self).scalars
+                var indices = Array(logits.indices)
+                let actualK = min(topK, logits.count)
+                (indices, logits) = TopKLogitsWarper(k: actualK).warp(indices: indices, logits: logits)
+
+                // Create 2D tensors [1, K] for proper axis handling
+                mlTensor = MLTensor(shape: [1, actualK], scalars: logits)
+                var tokenIndices = MLTensor(shape: [1, actualK], scalars: indices.map(Int32.init))
+
+                // Step 3: Top-P (nucleus) filtering
+                if topP < 1.0 {
+                    (mlTensor, tokenIndices) = await mlTensor.topP(Float16(topP), indices: tokenIndices)
+                }
+
+                // Step 4 & 5: Softmax and sample
+                let probs = mlTensor.softmax(alongAxis: -1)
+                nextToken = await Math.sample(indexes: tokenIndices, probs: probs)
             }
 
             outputBuffer.append(nextToken)

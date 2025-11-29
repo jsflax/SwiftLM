@@ -102,7 +102,7 @@ struct LlamaANETests {
 
     // MARK: - Qwen Model Test
 
-    @Test("Test Qwen 2.5 model", .timeLimit(.minutes(1)))
+    @Test("Test Qwen 2.5 model with sampling", .timeLimit(.minutes(2)))
     func testQwenModel() async throws {
         // Try FP16 model first (INT4 has CoreML execution issues on some systems)
         let modelPath = "\(testModelsPath)/Qwen2.5-1.5B-Instruct.mlpackage"
@@ -123,18 +123,67 @@ struct LlamaANETests {
         print("Model family: \(lm.modelConfig.modelFamily)")
         print("Context Length: \(lm.minContextLength) - \(lm.maxContextLength)")
 
-        // Create a session and run inference
-        let session = await lm.makeSession(systemPrompt: "You are a helpful assistant.")
-        let stream = await session.infer(prompt: "What is the capital of Japan?")
+        // Test 1: Greedy decoding (baseline)
+        print("\n--- Test 1: Greedy Decoding ---")
+        let greedySession = await lm.makeSession(
+            systemPrompt: "You are a helpful assistant.",
+            doSample: false
+        )
 
-        var output = ""
-        for await token in stream {
-            output += token
+        var greedyTokenCount = 0
+        let greedyStart = Date()
+        let greedyStream = await greedySession.infer(prompt: "What is the capital of Japan?")
+
+        var greedyOutput = ""
+        for await token in greedyStream {
+            greedyOutput += token
+            greedyTokenCount += 1
             print(token, terminator: "")
         }
+        let greedyElapsed = Date().timeIntervalSince(greedyStart)
+        let greedyTPS = Double(greedyTokenCount) / greedyElapsed
         print()
+        print("Greedy: \(greedyTokenCount) tokens in \(String(format: "%.2f", greedyElapsed))s (\(String(format: "%.1f", greedyTPS)) tok/s)")
 
-        #expect(!output.isEmpty, "Qwen model should generate some output")
+        // Test 2: Sampling with temperature=0.7, topK=40, topP=0.9
+        print("\n--- Test 2: Sampling (temp=0.7, topK=40, topP=0.9) ---")
+        let samplingSession = await lm.makeSession(
+            systemPrompt: "You are a helpful assistant.",
+            temperature: 0.7,
+            topK: 40,
+            topP: 0.9,
+            doSample: true
+        )
+
+        var samplingTokenCount = 0
+        let samplingStart = Date()
+        let samplingStream = await samplingSession.infer(prompt: "What is the capital of Japan?")
+
+        var samplingOutput = ""
+        for await token in samplingStream {
+            samplingOutput += token
+            samplingTokenCount += 1
+            print(token, terminator: "")
+        }
+        let samplingElapsed = Date().timeIntervalSince(samplingStart)
+        let samplingTPS = Double(samplingTokenCount) / samplingElapsed
+        print()
+        print("Sampling: \(samplingTokenCount) tokens in \(String(format: "%.2f", samplingElapsed))s (\(String(format: "%.1f", samplingTPS)) tok/s)")
+
+        // Compare performance
+        let speedRatio = greedyTPS / samplingTPS
+        print("\nPerformance: Greedy is \(String(format: "%.2f", speedRatio))x faster than sampling")
+
+        // Both outputs should be non-empty and coherent
+        #expect(!greedyOutput.isEmpty, "Greedy output should not be empty")
+        #expect(!samplingOutput.isEmpty, "Sampling output should not be empty")
+        #expect(greedyOutput.lowercased().contains("tokyo"), "Greedy output should mention Tokyo")
+        // Sampling may pick different cities due to randomness, just check it's about Japan
+        #expect(samplingOutput.lowercased().contains("tokyo") ||
+                samplingOutput.lowercased().contains("japan") ||
+                samplingOutput.lowercased().contains("osaka") ||
+                samplingOutput.lowercased().contains("kyoto"),
+                "Sampling output should mention Japanese cities")
     }
 
     // MARK: - Performance Test

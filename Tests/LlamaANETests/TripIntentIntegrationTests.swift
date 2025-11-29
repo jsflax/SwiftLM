@@ -122,6 +122,8 @@ extension MKCoordinateSpan {
 @JSONSchema struct TripInterests: Sendable {
     @SchemaGuide("Activities from message: food, surfing, urban exploration, temples, art, etc", .count(1...10))
     var interests: [String]
+    @SchemaGuide("You're reasoning for picking the interests based on the prompt.")
+    var reasoning: String
 }
 
 /// Simpler persona extraction
@@ -143,8 +145,10 @@ extension MKCoordinateSpan {
 
 /// Extract list of destinations
 @JSONSchema struct TripDestinations: Sendable {
-    @SchemaGuide("Cities to visit for a complete trip itinerary", .count(1...5))
+    @SchemaGuide("Cities to visit for a complete trip itinerary")
     var destinations: [TripDestination]
+    @SchemaGuide("You're reasoning for picking the cities and days.")
+    var reasoning: String
 }
 
 // MARK: - Test Models Enum
@@ -371,7 +375,7 @@ struct TripIntentIntegrationTests {
 
     // MARK: - Parallel Inference Tests
 
-    @Test("Parallel inference for trip intent", arguments: [TripTestModelKind.llama33bInt4])
+    @Test("Parallel inference for trip intent", arguments: [TripTestModelKind.qwen15bInt4])
     func testParallelTripIntent(modelKind: TripTestModelKind) async throws {
         let modelPath = "\(tripTestModelsPath)/\(modelKind.rawValue)"
         let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
@@ -396,7 +400,7 @@ struct TripIntentIntegrationTests {
         async let interestsTask = extractInterests(lm: lm, utterance: userUtterance)
         async let destinationsTask = extractDestinations(lm: lm, utterance: userUtterance)
 
-        let (basicInfo, interests, destinations) = await (basicInfoTask, interestsTask, destinationsTask)
+        let (basicInfo, interests, destinations) = try await (basicInfoTask, interestsTask, destinationsTask)
 
         let totalTime = Date().timeIntervalSince(startTime)
 
@@ -415,28 +419,23 @@ struct TripIntentIntegrationTests {
             print("❌ Interests: failed")
         }
 
-        if let dest = destinations {
-            print("✅ Destinations: \(dest.destinations.count) cities")
-            for d in dest.destinations {
-                print("   - \(d.name), \(d.country): \(d.days) days")
-            }
-        } else {
-            print("❌ Destinations: failed")
+        print("✅ Destinations: \(destinations.destinations.count) cities")
+        for d in destinations.destinations {
+            print("   - \(d.name), \(d.country): \(d.days) days")
         }
 
         // Validate results
         #expect(basicInfo != nil, "Should extract basic info")
         #expect(interests != nil, "Should extract interests")
-        #expect(destinations != nil, "Should extract destinations")
 
         if let int = interests {
             #expect(!int.interests.isEmpty, "Should have at least one interest")
         }
 
         // Assemble the final ParsedTripIntent from parallel results
-        if let basic = basicInfo, let int = interests, let dest = destinations {
+        if let basic = basicInfo, let int = interests {
             var dayIndex = 0
-            let parsedDestinations = dest.destinations.map { d -> ParsedTripIntent.Destination in
+            let parsedDestinations = destinations.destinations.map { d -> ParsedTripIntent.Destination in
                 // TODO: Use MapKit to look up coordinates for city name
                 // For now, use placeholder coordinates
                 let destination = ParsedTripIntent.Destination(
@@ -492,11 +491,11 @@ struct TripIntentIntegrationTests {
         return try? JSONDecoder().decode(TripBasicInfo.self, from: data)
     }
 
-    private func extractInterests(lm: LanguageModel, utterance: String) async -> TripInterests? {
+    private func extractInterests(lm: LanguageModel, utterance: String) async throws -> TripInterests? {
         // Chain-of-thought: First have model enumerate activities in a structured way
         // Using few-shot format to encourage the model to list all activities
         let cotSession = await lm.makeSession(systemPrompt: """
-            You extract activities from travel messages. List each activity on a new line with a dash.
+            You extract activities from travel messages. E.g.,:
 
             Message: "I want to eat sushi and visit temples"
             Activities:
@@ -508,65 +507,39 @@ struct TripIntentIntegrationTests {
             - snorkeling
             - relaxation
             - beach
-            """)
+            """,
+                                              doSample: true)
 
         // Step 1: Get CoT reasoning (unconstrained)
-        var reasoning = ""
-        let cotPrompt = "Message: \"\(utterance)\"\nActivities:"
-        let cotStream = await cotSession.infer(prompt: cotPrompt)
-        for await token in cotStream {
-            reasoning += token
-            // Stop after getting enough or hitting double newlines
-            if reasoning.count > 300 || (reasoning.count > 30 && reasoning.hasSuffix("\n\n")) { break }
-        }
-        print("[Interests CoT] '\(reasoning.trimmingCharacters(in: .whitespacesAndNewlines))'")
-
-        // If CoT produced nothing, try direct extraction
-        if reasoning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-            print("[Interests] CoT empty, using direct extraction")
-            let directSession = await lm.makeSession(systemPrompt: """
-                Extract activities/interests from the message. Output JSON with interests array.
-                """)
-            var output = ""
-            let stream: AsyncStream<String> = await directSession.infer(prompt: utterance, as: TripInterests.self)
-            for await token in stream { output += token }
-            print("[Interests] Direct output: \(output)")
-            guard let data = output.data(using: .utf8) else { return nil }
-            return try? JSONDecoder().decode(TripInterests.self, from: data)
-        }
-
-        // Step 2: Parse the activities directly from CoT output - no need for second LLM call!
-        // The CoT already produced a clean list, just split by newlines
-        let activities = reasoning
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .split(separator: "\n")
-            .map { line -> String in
-                // Remove leading dashes/bullets if present
-                var cleaned = line.trimmingCharacters(in: .whitespaces)
-                if cleaned.hasPrefix("-") { cleaned = String(cleaned.dropFirst()).trimmingCharacters(in: .whitespaces) }
-                if cleaned.hasPrefix("•") { cleaned = String(cleaned.dropFirst()).trimmingCharacters(in: .whitespaces) }
-                return cleaned
-            }
-            .filter { !$0.isEmpty }
-
-        print("[Interests] Extracted: \(activities)")
-        return TripInterests(interests: activities)
+        let interests = try await cotSession.infer(prompt: utterance, as: TripInterests.self)
+        print(interests)
+        return interests
     }
 
-    private func extractDestinations(lm: LanguageModel, utterance: String) async -> TripDestinations? {
-        // Use greedy - sampling with grammar constraints has unresolved issues
-        let session = await lm.makeSession(
-            systemPrompt: """
-                Extract cities to visit. For multi-week trips, suggest 2-3 cities.
-                Distribute days to fill the trip duration.
-                Output JSON only.
-                """
+    private func extractDestinations(lm: LanguageModel, utterance: String) async throws -> TripDestinations {
+        // Step 1: CoT - let model reason about destinations in plain English (greedy for reliability)
+        let cotSession = await lm.makeSession(
+            systemPrompt: "You are a travel planner. List the cities and days for this trip request. Example: Tokyo 5 days, Kyoto 3 days, Osaka 2 days. Days must sum to the trip duration.",
+//            doSample: true
         )
-        var output = ""
-        let stream: AsyncStream<String> = await session.infer(prompt: utterance, as: TripDestinations.self)
-        for await token in stream { output += token }
-        print("\n[Destinations] Output: \(output)")
-        guard let data = output.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(TripDestinations.self, from: data)
+
+//        var cotOutput = ""
+//        let cotStream = await cotSession.infer(prompt: utterance)
+//        for await token in cotStream { cotOutput += token }
+//        print("\n[Destinations CoT] '\(cotOutput)'")
+//
+//        // Step 2: Grammar-constrained generation using the CoT output
+//        let structuredSession = await lm.makeSession(
+//            systemPrompt: "Convert to JSON. Output only valid JSON.",
+//            doSample: false  // Greedy for structured output
+//        )
+
+        let destinations = try await cotSession.infer(
+            prompt: utterance,
+            as: TripDestinations.self
+        )
+
+        print("Reasoning for destinations: \(destinations.reasoning)")
+        return destinations
     }
 }

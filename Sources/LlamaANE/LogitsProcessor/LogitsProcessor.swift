@@ -50,45 +50,65 @@ extension MLTensor {
 //        let slicedProbsTensor = sortedLogitsTensor[0...cutoffIndex]
 //        return (slicedProbsTensor, slicedIndicesTensor)
 //    }
+    /// Nucleus (top-p) sampling filter.
+    ///
+    /// This function filters tokens to keep only those whose cumulative probability
+    /// is within the top-p threshold. It returns LOGITS (not probabilities) so the
+    /// caller can apply softmax once at the end for sampling.
+    ///
+    /// - Parameters:
+    ///   - p: The cumulative probability threshold (0.0-1.0)
+    ///   - indices: Token indices corresponding to the logits
+    /// - Returns: Filtered (logits, indices) tuple, sorted by probability descending
     func topP(_ p: Float16, indices: MLTensor) async -> (values: MLTensor, indices: MLTensor) {
-        // Step 2: Compute softmax probabilities
-        let softmaxProbs = self.softmax()
-        
-        // Step 3: Sort probabilities in descending order and get sorted indices
-        let sortedProbs = softmaxProbs.argsort(descendingOrder: true)
-        
-        // Step 4: Gather sorted probabilities and corresponding sorted indices
-        let sortedProbsTensor = softmaxProbs.gathering(atIndices: sortedProbs, alongAxis: -1)
-        let sortedIndicesTensor = indices.gathering(atIndices: sortedProbs, alongAxis: -1)
-        let sortedLogitsTensor = self.gathering(atIndices: sortedProbs, alongAxis: -1)
-        
-        // Step 5: Compute cumulative sum of sorted probabilities
-        let cumsumProbsTensor = sortedProbsTensor.cumulativeSum(alongAxis: -1)
-        
-        // Step 6: Compare cumulative sum with threshold p to create a condition tensor
-        let conditionTensor = cumsumProbsTensor .> p
-        
-        // Step 7: Convert condition tensor to shaped array of Int32 (1 for true, 0 for false)
-        let conditionArray = await conditionTensor.cast(to: Int32.self).shapedArray(of: Int32.self)
-        
-        // Step 8: Find the first index where the cumulative sum exceeds p
-        let conditionScalars = conditionArray.scalars
-        guard let cutoffIndex = conditionScalars.firstIndex(of: 1) else {
-            // If no cutoff index found, include all
-//            let allIndices = await sortedIndicesTensor.shapedArray(of: Int32.self)
-//            let allProbs = await sortedProbsTensor.shapedArray(of: Float16.self)
-            return (sortedProbsTensor, sortedIndicesTensor)
+        // For small tensors (post-topK), use fast array-based implementation
+        let logitsArray = await self.shapedArray(of: Float.self).scalars
+        let indicesArray = await indices.shapedArray(of: Int32.self).scalars
+
+        guard !logitsArray.isEmpty else {
+            return (self, indices)
         }
-        
-        // Step 9: Slice the sorted indices and probabilities up to the cutoff index
-        if sortedIndicesTensor.rank == 1 {
-            let slicedIndicesTensor = sortedIndicesTensor[0...cutoffIndex]
-            let slicedProbsTensor = sortedLogitsTensor[0...cutoffIndex]
-            return (slicedProbsTensor, slicedIndicesTensor)
+
+        // Compute softmax probabilities
+        let maxLogit = logitsArray.max() ?? 0
+        let exps = logitsArray.map { Foundation.exp($0 - maxLogit) }
+        let expSum = exps.reduce(0, +)
+        let probs = exps.map { $0 / expSum }
+
+        // Create indexed tuples and sort by probability descending
+        var indexed = zip(0..<logitsArray.count, zip(logitsArray, zip(indicesArray, probs)))
+            .map { ($0, $1.0, $1.1.0, $1.1.1) }  // (origIdx, logit, tokenIdx, prob)
+        indexed.sort { $0.3 > $1.3 }  // Sort by prob descending
+
+        // Find cutoff where cumulative probability exceeds p
+        var cumsum: Float = 0
+        var cutoff = indexed.count
+        for (i, (_, _, _, prob)) in indexed.enumerated() {
+            cumsum += prob
+            if cumsum > Float(p) {
+                cutoff = i + 1
+                break
+            }
+        }
+        cutoff = Swift.max(cutoff, 1)  // Keep at least 1 token
+
+        // Extract filtered results
+        let filtered = Array(indexed.prefix(cutoff))
+        let filteredLogits = filtered.map { $0.1 }
+        let filteredIndices = filtered.map { $0.2 }
+
+        // Return as tensors with same shape as input
+        let shape = self.shape
+        if shape.count == 1 {
+            return (
+                MLTensor(shape: [cutoff], scalars: filteredLogits),
+                MLTensor(shape: [cutoff], scalars: filteredIndices)
+            )
         } else {
-            let slicedIndicesTensor = sortedIndicesTensor[..., 0...cutoffIndex]
-            let slicedProbsTensor = sortedLogitsTensor[..., 0...cutoffIndex]
-            return (slicedProbsTensor, slicedIndicesTensor)
+            return (
+                MLTensor(shape: [1, cutoff], scalars: filteredLogits),
+                MLTensor(shape: [1, cutoff], scalars: filteredIndices)
+            )
         }
     }
     
