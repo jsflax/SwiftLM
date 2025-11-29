@@ -301,7 +301,15 @@ public protocol LanguageModelProtocol: AnyObject {
     var temperature: Float { get set}
 }
 
+public typealias _JSONSchemaConvertible = JSONSchemaConvertible
+public typealias _JSONSchema = JSONSchema
+public typealias _SchemaProperty = SchemaProperty
+
 public final class LanguageModel: @unchecked Sendable, LanguageModelProtocol {
+    public typealias JSONSchemaConvertible = _JSONSchemaConvertible
+    public typealias JSONSchema = _JSONSchema
+    public typealias SchemaProperty = _SchemaProperty
+    
     public let model: MLModel
     public let modelConfig: ModelConfiguration
 
@@ -658,41 +666,29 @@ public extension LanguageModel {
         }
     }
 
-    public func makeSession(systemPrompt: String = """
-                    You are an AI Assistant.
-                    """,
-                     tools: (any Llama32Tools)? = nil,
-                     temperature: Double = 1.0,
-                     topK: Int = 0,
-                     topP: Double = 1.0,
-                     repetitionPenalty: Double = 1.0,
-                     isLogginEnabled: Bool = false) async throws -> Session {
-        var config = GenerationConfig(maxNewTokens: maxContextLength)
-        config.topK = topK
-        config.topP = topP
-        config.repetitionPenalty = repetitionPenalty
-        config.temperature = temperature
-        if config.temperature > 0 && config.temperature != 1 ||
-            config.topP < 1 || config.topK > 0 || config.repetitionPenalty != 1.0 {
-            config.doSample = true
-        } else {
-            config.doSample = false
-        }
-        
-        return try await Session(model: model, systemPrompt: systemPrompt, requiresAttention: requiresAttention, requiresCausal: requiresCausal, inputIdsKey: Self.inputIdsKey, tokenizer: tokenizer, contextSize: maxContextLength, maxContextLength: maxContextLength, config: config, tools: tools, chatTemplate: chatTemplate)
-    }
-
-    public func makeSession<J: JSONSchemaConvertible>(_ grammarType: J.Type,
-        systemPrompt: String = """
-                    You are an AI Assistant.
-                    """,
+    /// Create a new session for inference.
+    ///
+    /// The session supports both free-form text generation and JSON-constrained generation.
+    /// - Parameters:
+    ///   - systemPrompt: The system prompt to use for the session
+    ///   - tools: Optional tools for function calling
+    ///   - temperature: Sampling temperature (1.0 = no change)
+    ///   - topK: Top-K sampling parameter (0 = disabled)
+    ///   - topP: Top-P (nucleus) sampling parameter (1.0 = disabled)
+    ///   - repetitionPenalty: Penalty for repeated tokens (1.0 = no penalty, 1.1 recommended for grammar)
+    ///   - doSample: Whether to use sampling (false = greedy decoding)
+    ///   - logging: Whether to enable logging
+    /// - Returns: A new Session actor
+    public func makeSession(
+        systemPrompt: String = "You are an AI Assistant.",
         tools: (any Llama32Tools)? = nil,
         temperature: Double = 1.0,
         topK: Int = 0,
         topP: Double = 1.0,
-        repetitionPenalty: Double = 1.1,  // Slight repetition penalty to prevent loops
-        doSample: Bool = false,           // Greedy by default (faster), repetition penalty still applies
-        isLogginEnabled: Bool = false) async throws -> GrammarSession<J> {
+        repetitionPenalty: Double = 1.1,
+        doSample: Bool = false,
+        logging: Bool = false
+    ) async -> Session {
         var config = GenerationConfig(maxNewTokens: maxContextLength)
         config.topK = topK
         config.topP = topP
@@ -700,258 +696,29 @@ public extension LanguageModel {
         config.temperature = temperature
         config.doSample = doSample
 
-        return await GrammarSession(systemPrompt: systemPrompt,
-                                    requiresCausal: requiresCausal,
-                                    requiresAttention: requiresAttention,
-                                    config: config,
-                                    model: model,
-                                    tokenizer: tokenizer,
-                                    contextSize: maxContextLength,
-                                    chatTemplate: chatTemplate)
+        return await Session(
+            model: model,
+            tokenizer: tokenizer,
+            systemPrompt: systemPrompt,
+            contextSize: maxContextLength,
+            config: config,
+            chatTemplate: chatTemplate,
+            tools: tools,
+            logging: logging
+        )
     }
 
-    public func oneShot(prompt: String) async throws -> String {
-        let stream = try await Session.oneShot(model: model, systemPrompt: prompt, requiresAttention: requiresAttention, requiresCausal: requiresCausal, inputIdsKey: Self.inputIdsKey, tokenizer: tokenizer, contextSize: maxContextLength, maxContextLength: maxContextLength, config: config, tools: tools, chatTemplate: chatTemplate)
-        return await stream.reduce("", +)
+    /// One-shot inference without maintaining session state.
+    public func oneShot(prompt: String, input: String) async throws -> String {
+        let session = await makeSession(systemPrompt: prompt)
+        return await session.infer(prompt: input).reduce("", +)
     }
     
-    // MARK: Session
-    actor Session {
-        let model: MLModel
-        let requiresAttention: Bool
-        let requiresCausal: Bool
-        let inputIdsKey: String
-        let kvCache: MLState?
-        let tokenizer: Tokenizer
-        let contextSize: Int
-        let maxContextLength: Int
-        let tools: (any Llama32Tools)?
-        let chatTemplate: any ChatTemplate
-        var config: GenerationConfig
-        var logger: Logger = .llamaSession
-        public let systemPrompt: String
-        var hasShownInitialPrompt: Bool = false
-
-        init(model: MLModel, systemPrompt: String, requiresAttention: Bool, requiresCausal: Bool, inputIdsKey: String, tokenizer: Tokenizer, contextSize: Int, maxContextLength: Int,
-             config: GenerationConfig,
-             tools: (any Llama32Tools)?,
-             chatTemplate: any ChatTemplate,
-             flush: Bool = true,
-             logging: Bool = false) async throws {
-            self.model = model
-            self.requiresAttention = requiresAttention
-            self.requiresCausal = requiresCausal
-            self.inputIdsKey = inputIdsKey
-            self.chatTemplate = chatTemplate
-            self.config = config
-            self.config.eosTokenId = tokenizer.eosTokenId
-            if !logging {
-                self.logger = .init(OSLog.disabled)
-            }
-            if !model.modelDescription.stateDescriptionsByName.isEmpty {
-                kvCache = model.makeState()
-            } else {
-                kvCache = nil
-            }
-            self.systemPrompt = systemPrompt
-            self.tokenizer = tokenizer
-            self.contextSize = contextSize
-            self.maxContextLength = maxContextLength
-            self.tools = tools
-        }
-        
-        
-        
-        fileprivate static func oneShot(model: MLModel, systemPrompt: String, requiresAttention: Bool,
-                                        requiresCausal: Bool, inputIdsKey: String,
-                                        tokenizer: Tokenizer,
-                                        contextSize: Int, maxContextLength: Int,
-                                        config: GenerationConfig,
-                                        tools: (any Llama32Tools)?,
-                                        chatTemplate: any ChatTemplate) async throws -> AsyncStream<String> {
-            let session = try await Session(model: model, systemPrompt: systemPrompt, requiresAttention: requiresAttention, requiresCausal: requiresCausal, inputIdsKey: inputIdsKey, tokenizer: tokenizer, contextSize: contextSize, maxContextLength: maxContextLength, config: config, tools: tools, chatTemplate: chatTemplate, flush: false)
-
-            return AsyncStream { stream in
-                Task {
-                    let prompt = chatTemplate.beginOfText + chatTemplate.formatSystemPrompt(systemPrompt) + chatTemplate.formatAssistantPrefix()
-                    try await session.infer(prompt: prompt, stream: stream)
-                }
-            }
-        }
-        
-        private func synchronousPredict(input: MLDictionaryFeatureProvider) throws -> any MLFeatureProvider {
-            do {
-                if let kvCache {
-                    return try self.model.prediction(from: input, using: kvCache)
-                } else {
-                    return try self.model.prediction(from: input)
-                }
-            } catch {
-                throw LlamaANEError.predictionFailed(underlying: error)
-            }
-        }
-
-        private func asynchronousPredict(input: MLDictionaryFeatureProvider) async throws -> any MLFeatureProvider {
-            do {
-                if let kvCache {
-                    return try await self.model.prediction(from: input, using: kvCache)
-                } else {
-                    return try await self.model.prediction(from: input)
-                }
-            } catch {
-                throw LlamaANEError.predictionFailed(underlying: error)
-            }
-        }
-        
-        var outputBuffer: [Int] = []
-        
-        @discardableResult private func infer(prompt: String,
-                                              stream: AsyncStream<String>.Continuation? = nil) async throws -> String {
-            let addSpecialTokens = outputBuffer.isEmpty
-            let tokens = tokenizer.encode(text: prompt,
-                                          addSpecialTokens: addSpecialTokens)
-            outputBuffer.append(contentsOf: tokens)
-            var input: MLDictionaryFeatureProvider = try await input(from: outputBuffer, totalBuffer: outputBuffer)
-            let currentLength = input["inputIds"]?.multiArrayValue?.count ?? 1
-            if currentLength > maxContextLength {
-                logger.warning("Context length exceeded: \(currentLength) > \(self.maxContextLength)")
-                throw LlamaANEError.contextLengthExceeded(current: currentLength, maximum: maxContextLength)
-            }
-
-            var totalDecoded = ""
-            var isExpectedToolCall = false
-
-            while outputBuffer.count < self.contextSize {
-                var time = Date.now
-                let output = try await asynchronousPredict(input: input)
-                var elapsed = Date.now.timeIntervalSince1970 - time.timeIntervalSince1970
-                logger.debug("\(Thread.current) Prediction took \(elapsed)s")
-                time = Date.now
-                guard let logitsValue = output.featureValue(for: "logits")?.shapedArrayValue(of: Float16.self) else {
-                    throw LlamaANEError.invalidLogitsOutput
-                }
-
-                var mlTensor =  MLTensor(logitsValue).cast(to: Float.self)
-                
-                if config.generationMode == .greedy {
-                    let shaped = await mlTensor.argmax(alongAxis: 2)
-                        .shapedArray(of: Int32.self)
-                    let nextToken = Int(shaped[0, shaped.shape[1] - 1].scalar!)
-                    outputBuffer.append(nextToken)
-                    if nextToken == config.eosTokenId {
-                        logger.debug("Found end of service token.")
-                        break
-                    }
-                } else {
-//                    let (indices, logits) = logitsProcessor.callAsFunction(await mlTensor.cast(to: Float.self).shapedArray(of: Float.self).scalars)
-//                    let tokenID = Math.sample(indexes: indices, probs: logits)
-//                    mlTensor = mlTensor.cast(to: Float.self)
-                    // MARK: Apply temperature
-//                    mlTensor = mlTensor / Float(config.temperature)
-                    // Get topK
-//                    var otherIndices = MLTensor(await mlTensor.shapedArray(of: Float16.self).indices.map(Int32.init),
-                    var otherIndices: MLTensor
-                    if mlTensor.shape[1] > 1 {
-                        var logits = await mlTensor.shapedArray(of: Float.self).scalars
-                        var indices = Array(logits.indices)
-                        //                    (logits, indices) = customTopK(array: logits, K: config.topK)
-                        (indices, logits) = TopKLogitsWarper(k: config.topK).warp(indices: indices, logits: logits)
-                        //                    var (mlTensor, otherIndices) = mlTensor.topK(Int(config.topK))
-                        //                    var logits = await mlTensor.shapedArray(of: Float.self).scalars
-                        //                    (mlTensor, otherIndices) = mlTensor.flattened().topK(Int(config.topK))
-                        mlTensor = MLTensor(shape: [1, config.topK], scalars: logits)
-                        otherIndices = MLTensor(shape: [1, config.topK], scalars: indices.map(Int32.init))
-                    } else {
-                        (mlTensor, otherIndices) = mlTensor.topK(Int(config.topK))
-                    }
-                    (mlTensor, otherIndices) = await mlTensor.topP(Float16(config.topP), indices: otherIndices)
-                    (mlTensor, otherIndices) = await mlTensor.penalizeRepetition(Float16(config.repetitionPenalty),
-                                                                                 atIndices: otherIndices)
-                    
-                    let otherPossibleTokenId = await Math.sample(
-                        indexes: otherIndices,
-                        probs: mlTensor.softmax()
-                    )
-                    
-                    outputBuffer.append(otherPossibleTokenId)
-                    if otherPossibleTokenId == config.eosTokenId {
-                        logger.debug("Found end of service token.")
-                        break
-                    }
-                }
-                let nextToken = outputBuffer.last!
-                time = Date.now
-                input = try await self.input(from: [nextToken], totalBuffer: outputBuffer)
-                elapsed = Date.now.timeIntervalSince1970 - time.timeIntervalSince1970
-                logger.debug("Next Input gen took \(elapsed)")
-//                maxTokens = min(input["inputIds"]?.multiArrayValue?.count ?? 1, self.maxContextLength)
-                let decoded = tokenizer.decode(tokens: [nextToken])
-//                print("Decoded: \(decoded)", nextToken)
-//                guard !isExpectedToolCall else {
-//                    totalDecoded += decoded
-//                    continue
-//                }
-                if tools != nil && decoded.starts(with: "[") {
-                    // we have entered a possible function call
-                    totalDecoded += decoded
-                    isExpectedToolCall = true
-                } else {
-                    if totalDecoded.isEmpty && decoded.filter(\.isNewline).count > 0 {
-                        // do nothing
-                    } else {
-                        totalDecoded += decoded
-                        stream?.yield(decoded)
-                    }
-                }
-            }
-            
-            if outputBuffer.count >= self.contextSize {
-                logger.warning("Context size exceeded")
-            }
-            if let tools {
-                var responses: [FunctionResponse] = []
-                let functionCalls = tools.parseFunctionCalls(totalDecoded)
-                
-                if !functionCalls.isEmpty {
-                    for call in functionCalls {
-                        do {
-                            responses.append(
-                                FunctionResponse(result: try await tools.callTool(call),
-                                                 functionCall: call)
-                            )
-                        } catch {}
-                    }
-                    
-                    try await infer(prompt: """
-                <|start_header_id|>user<|end_header_id|>
-                
-                \(responses.map({
-                    """
-                    The response for \($0.functionCall.name) is: \($0.result)
-                    Please report the result for the user and do not call the function again.
-                    """
-                }).joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines))<|eot_id|><|start_header_id|>assistant<|end_header_id|>
-                """, stream: stream)
-                }
-            }
-            
-            stream?.finish()
-            
-            return totalDecoded
-        }
-        
-        public func infer(prompt: String) -> AsyncStream<String> {
-            var formattedPrompt = chatTemplate.formatUserMessage(prompt) + chatTemplate.formatAssistantPrefix()
-            if !hasShownInitialPrompt {
-                formattedPrompt = chatTemplate.beginOfText + chatTemplate.formatSystemPrompt(systemPrompt) + formattedPrompt
-                hasShownInitialPrompt = true
-            }
-            return AsyncStream { stream in
-                Task {
-                    try await infer(prompt: formattedPrompt, stream: stream)
-                }
-            }
-        }
+    public func oneShot<Output: JSONSchemaConvertible & Sendable>(prompt: String,
+                                                       input: String,
+                                                       output: Output.Type) async throws -> Output {
+        let session = await makeSession(systemPrompt: prompt)
+        return try await session.infer(prompt: input, as: output)
     }
 }
 

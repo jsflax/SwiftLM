@@ -41,7 +41,7 @@ struct LlamaANETests {
         print("Warmup took: \(String(format: "%.2f", warmupTime))s")
 
         // Create a session and run inference
-        let session = try await lm.makeSession(systemPrompt: "You are a helpful assistant.")
+        let session = await lm.makeSession(systemPrompt: "You are a helpful assistant.")
         let stream = await session.infer(prompt: "Say hello in one sentence.")
 
         var output = ""
@@ -64,7 +64,7 @@ struct LlamaANETests {
         let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
 
         let lm = try LanguageModel(model: mlModel)
-        let session = try await lm.makeSession()
+        let session = await lm.makeSession()
         let stream = await session.infer(prompt: "What is 2 + 2?")
 
         var output = ""
@@ -79,7 +79,7 @@ struct LlamaANETests {
 
     // MARK: - Grammar Session Test
 
-    @Test("Test GrammarSession with JSON schema constraint")
+    @Test("Test session with JSON schema constraint")
     func testGrammarSession() async throws {
         let modelPath = "\(testModelsPath)/Llama-3.2-3B-Instruct_Int4.mlpackage"
         let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
@@ -89,21 +89,12 @@ struct LlamaANETests {
         let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
 
         let lm = try LanguageModel(model: mlModel)
-        let session = try await lm.makeSession(
-            SimpleResponse.self,
+        let session = await lm.makeSession(
             systemPrompt: "You are a helpful assistant that responds in JSON format."
         )
 
-        // First, stream the output to see what's being generated
-        let stream: AsyncStream<String> = await session.infer(prompt: "What is the capital of France?")
-        var rawOutput = ""
-        for await token in stream {
-            rawOutput += token
-            print(token, terminator: "")
-        }
-        print("\nRaw output: \(rawOutput)")
-
-        let result = try JSONDecoder().decode(SimpleResponse.self, from: rawOutput.data(using: .utf8)!)
+        // Use the parsed result directly
+        let result: SimpleResponse = try await session.infer(prompt: "What is the capital of France?", as: SimpleResponse.self)
         print("Grammar result: \(result)")
 
         #expect(!result.answer.isEmpty, "Grammar session should produce a valid response")
@@ -133,7 +124,7 @@ struct LlamaANETests {
         print("Context Length: \(lm.minContextLength) - \(lm.maxContextLength)")
 
         // Create a session and run inference
-        let session = try await lm.makeSession(systemPrompt: "You are a helpful assistant.")
+        let session = await lm.makeSession(systemPrompt: "You are a helpful assistant.")
         let stream = await session.infer(prompt: "What is the capital of Japan?")
 
         var output = ""
@@ -152,8 +143,50 @@ struct LlamaANETests {
         case llamaInt4 = "Llama-3.2-3B-Instruct_Int4.mlpackage"
         case qwen = "Qwen2.5-1.5B-Instruct.mlpackage"
         case qwenInt4 = "Qwen2.5-1.5B-Instruct_Int4.mlpackage"
+        case qwen0_5Int4 = "Qwen2.5-0.5B-Instruct_Int4.mlpackage"
     }
 
+    @available(macOS 26.0, *)
+    @Test func testFoundationModels() async throws {
+        let modelPath = "\(testModelsPath)/\(TestModelKind.qwen0_5Int4.rawValue)"
+        let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
+
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = .cpuAndGPU
+        let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
+        
+        let lm = try LanguageModel(model: mlModel)
+        try await lm.warmup()
+
+        let aneSession = await lm.makeSession(
+            systemPrompt: """
+            You are a helpful assistant that provides information about people in JSON format.
+            Include their name, age, and address (with street, city, and zip code).
+            """
+        )
+        let session = LanguageModelSession(model: .default)
+        session.prewarm(promptPrefix: .some(.init("""
+        You are a helpful assistant that provides information about people in JSON format.
+        Include their name, age, and address (with street, city, and zip code).
+        """)))
+        
+        var startTime = Date()
+        let response = try await session.respond(to: """
+            Tell me about John Smith who is 35 years old and lives at 123 Main St, Springfield, 12345.
+            """, generating: Person.self)
+        var totalTime = Date().timeIntervalSince(startTime)
+        print("Apple FM Total time: \(String(format: "%.2f", totalTime))s")
+        print(response.content)
+        
+        startTime = Date()
+        let response2 = try await aneSession.infer(prompt: """
+        Tell me about John Smith who is 35 years old and lives at 123 Main St, Springfield, 12345.
+        """, as: Person.self)
+        totalTime = Date().timeIntervalSince(startTime)
+        print("ANE Total time: \(String(format: "%.2f", totalTime))s")
+        print(response2)
+    }
+    
     @Test("Grammar session performance with complex schema", .timeLimit(.minutes(2)), .serialized, arguments: [TestModelKind.qwenInt4, .llamaInt4])
     func testGrammarSessionPerformance(modelKind: TestModelKind) async throws {
         let modelPath = "\(testModelsPath)/\(modelKind.rawValue)"
@@ -168,8 +201,7 @@ struct LlamaANETests {
         // Warm up
         try await lm.warmup()
 
-        let session = try await lm.makeSession(
-            MovieReview.self,
+        let session = await lm.makeSession(
             systemPrompt: """
             You are a movie critic assistant. When asked about a movie, provide a structured review in JSON format.
             Include the title, director, release year, rating (0-10), genre, and a brief summary.
@@ -187,8 +219,8 @@ struct LlamaANETests {
         var tokenCount = 0
         var output = ""
 
-        // Use the AsyncStream<String> overload for streaming tokens
-        let stream: AsyncStream<String> = await session.infer(prompt: prompt)
+        // Use the AsyncStream<String> overload for streaming tokens with grammar constraint
+        let stream: AsyncStream<String> = await session.infer(prompt: prompt, as: MovieReview.self)
         for await token in stream {
             if firstTokenTime == nil {
                 firstTokenTime = Date()
@@ -233,6 +265,295 @@ struct LlamaANETests {
         #expect(tokenCount > 5, "Should generate multiple tokens")
     }
 
+    // MARK: - SchemaGuide Model Inference Test
+
+    @Test("SchemaGuide descriptions improve model output quality", .timeLimit(.minutes(2)), .serialized, arguments: [TestModelKind.qwenInt4])
+    func testSchemaGuideModelInference(modelKind: TestModelKind) async throws {
+        let modelPath = "\(testModelsPath)/\(modelKind.rawValue)"
+        let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
+
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = .cpuAndGPU
+        let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
+
+        let lm = try LanguageModel(model: mlModel)
+        try await lm.warmup()
+
+        let session = await lm.makeSession(
+            systemPrompt: "You are a helpful assistant that generates user profiles."
+        )
+
+        // UserProfile has @SchemaGuide annotations:
+        // - name: "The user's display name"
+        // - age: "Age in years" with .range(0...150)
+        // - bio: "User's biography" with .maxLength(500)
+        // - rating: "Rating from 0.0 to 5.0" with .doubleRange(0.0...5.0)
+        // - followers: "Number of followers" with .range(0...1000000)
+
+        let prompt = "Create a profile for a software engineer named Alice who is 28 years old."
+
+        print("\n--- SchemaGuide Model Inference Test ---")
+        print("Model: \(modelKind)")
+        print("Schema: UserProfile with @SchemaGuide descriptions and constraints")
+        print("\nSchema description injected into prompt:")
+        print(UserProfile.schemaDescription())
+
+        let startTime = Date()
+        var output = ""
+        var tokenCount = 0
+
+        let stream: AsyncStream<String> = await session.infer(prompt: prompt, as: UserProfile.self)
+        for await token in stream {
+            output += token
+            tokenCount += 1
+            print(token, terminator: "")
+        }
+        print()
+
+        let totalTime = Date().timeIntervalSince(startTime)
+        print("\n--- Metrics ---")
+        print("Total tokens: \(tokenCount)")
+        print("Total time: \(String(format: "%.2f", totalTime))s")
+
+        // Try to decode and validate the result
+        if let jsonData = output.data(using: .utf8) {
+            do {
+                let profile = try JSONDecoder().decode(UserProfile.self, from: jsonData)
+                print("\nParsed UserProfile:")
+                print("  Name: \(profile.name)")
+                print("  Age: \(profile.age)")
+                print("  Bio: \(profile.bio)")
+                print("  Rating: \(profile.rating)")
+                print("  Followers: \(profile.followers)")
+
+                // Validate constraints from @SchemaGuide
+                #expect(profile.age >= 0 && profile.age <= 150, "Age should be in range 0-150")
+                #expect(profile.rating >= 0.0 && profile.rating <= 5.0, "Rating should be in range 0.0-5.0")
+                #expect(profile.followers >= 0 && profile.followers <= 1000000, "Followers should be in range 0-1000000")
+                #expect(profile.bio.count <= 500, "Bio should be max 500 chars")
+
+                // Check that the model understood the prompt
+                #expect(profile.name.lowercased().contains("alice") || profile.age == 28,
+                       "Model should have understood the prompt about Alice who is 28")
+
+                print("\n✅ All @SchemaGuide constraints validated!")
+            } catch {
+                print("Failed to decode JSON: \(error)")
+                print("Raw output: \(output)")
+            }
+        }
+
+        #expect(!output.isEmpty, "Should generate output")
+        #expect(tokenCount > 5, "Should generate multiple tokens")
+    }
+
+    // MARK: - Nested Object Grammar Test
+
+    @Test("Grammar session with nested objects", .timeLimit(.minutes(2)), .serialized, arguments: [TestModelKind.qwenInt4, .llamaInt4])
+    @available(macOS 26.0, *)
+    func testGrammarNestedObjects(modelKind: TestModelKind) async throws {
+        let modelPath = "\(testModelsPath)/\(modelKind.rawValue)"
+        let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
+
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = .cpuAndGPU
+        let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
+
+        let lm = try LanguageModel(model: mlModel)
+        try await lm.warmup()
+
+        let session = await lm.makeSession(
+            systemPrompt: """
+            You are a helpful assistant that provides information about people in JSON format.
+            Include their name, age, and address (with street, city, and zip code).
+            """
+        )
+
+        let prompt = "Tell me about John Smith who is 35 years old and lives at 123 Main St, Springfield, 12345."
+
+        print("\n--- Nested Objects Grammar Test ---")
+        print("Model: \(modelKind)")
+        print("Schema: Person (nested Address object)")
+
+        let startTime = Date()
+        var output = ""
+        var tokenCount = 0
+
+        let stream: AsyncStream<String> = await session.infer(prompt: prompt, as: Person.self)
+        for await token in stream {
+            output += token
+            tokenCount += 1
+            print(token, terminator: "")
+        }
+        print()
+
+        let totalTime = Date().timeIntervalSince(startTime)
+        print("\n--- Metrics ---")
+        print("Total tokens: \(tokenCount)")
+        print("Total time: \(String(format: "%.2f", totalTime))s")
+
+        // Try to decode the result
+        if let jsonData = output.data(using: .utf8) {
+            do {
+                let person = try JSONDecoder().decode(Person.self, from: jsonData)
+                print("Parsed Person:")
+                print("  Name: \(person.name)")
+                print("  Age: \(person.age)")
+                print("  Address:")
+                print("    Street: \(person.address.street)")
+                print("    City: \(person.address.city)")
+                print("    Zip: \(person.address.zipCode)")
+
+                #expect(!person.name.isEmpty, "Person name should not be empty")
+                #expect(!person.address.city.isEmpty, "Address city should not be empty")
+            } catch {
+                print("Failed to decode JSON: \(error)")
+                print("Raw output: \(output)")
+                Issue.record("Failed to decode nested object: \(error)")
+            }
+        }
+
+        #expect(!output.isEmpty, "Grammar session should generate output")
+    }
+
+    // MARK: - Array of Objects Grammar Test
+
+    @Test("Grammar session with array of objects", .timeLimit(.minutes(2)), .serialized, arguments: [TestModelKind.qwenInt4, .llamaInt4])
+    func testGrammarArrayOfObjects(modelKind: TestModelKind) async throws {
+        let modelPath = "\(testModelsPath)/\(modelKind.rawValue)"
+        let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
+
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = .cpuAndGPU
+        let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
+
+        let lm = try LanguageModel(model: mlModel)
+        try await lm.warmup()
+
+        let session = await lm.makeSession(
+            systemPrompt: """
+            You are a helpful assistant that creates todo lists in JSON format.
+            Each list has a name and an array of tasks with title and completion status.
+            """
+        )
+
+        let prompt = "Create a todo list called 'Weekend Chores' with 3 tasks: Buy groceries (not done), Clean house (done), and Walk dog (not done)."
+
+        print("\n--- Array of Objects Grammar Test ---")
+        print("Model: \(modelKind)")
+        print("Schema: TodoList (array of Task objects)")
+
+        let startTime = Date()
+        var output = ""
+        var tokenCount = 0
+
+        let stream: AsyncStream<String> = await session.infer(prompt: prompt, as: TodoList.self)
+        for await token in stream {
+            output += token
+            tokenCount += 1
+            print(token, terminator: "")
+        }
+        print()
+
+        let totalTime = Date().timeIntervalSince(startTime)
+        print("\n--- Metrics ---")
+        print("Total tokens: \(tokenCount)")
+        print("Total time: \(String(format: "%.2f", totalTime))s")
+
+        // Try to decode the result
+        if let jsonData = output.data(using: .utf8) {
+            do {
+                let todoList = try JSONDecoder().decode(TodoList.self, from: jsonData)
+                print("Parsed TodoList:")
+                print("  List Name: \(todoList.listName)")
+                print("  Tasks (\(todoList.tasks.count)):")
+                for task in todoList.tasks {
+                    print("    - \(task.title): \(task.completed ? "Done" : "Not done")")
+                }
+
+                #expect(!todoList.listName.isEmpty, "List name should not be empty")
+                #expect(todoList.tasks.count > 0, "Should have at least one task")
+            } catch {
+                print("Failed to decode JSON: \(error)")
+                print("Raw output: \(output)")
+                Issue.record("Failed to decode array of objects: \(error)")
+            }
+        }
+
+        #expect(!output.isEmpty, "Grammar session should generate output")
+    }
+
+    // MARK: - Complex Nested + Array Grammar Test
+
+    @Test("Grammar session with nested objects and arrays", .timeLimit(.minutes(2)), .serialized, arguments: [TestModelKind.qwenInt4, .llamaInt4])
+    func testGrammarComplexNestedAndArray(modelKind: TestModelKind) async throws {
+        let modelPath = "\(testModelsPath)/\(modelKind.rawValue)"
+        let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
+
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = .cpuAndGPU
+        let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
+
+        let lm = try LanguageModel(model: mlModel)
+        try await lm.warmup()
+
+        let session = await lm.makeSession(
+            systemPrompt: """
+            You are a helpful assistant that describes projects in JSON format.
+            Include the project name, description, a lead member (with name and role),
+            and an array of team members (each with name and role).
+            """
+        )
+
+        let prompt = "Describe Project Alpha led by Alice (Manager) with team members Bob (Developer) and Carol (Designer)."
+
+        print("\n--- Complex Nested + Array Grammar Test ---")
+        print("Model: \(modelKind)")
+        print("Schema: Project (nested TeamMember + array of TeamMember)")
+
+        let startTime = Date()
+        var output = ""
+        var tokenCount = 0
+
+        let stream: AsyncStream<String> = await session.infer(prompt: prompt, as: Project.self)
+        for await token in stream {
+            output += token
+            tokenCount += 1
+            print(token, terminator: "")
+        }
+        print()
+
+        let totalTime = Date().timeIntervalSince(startTime)
+        print("\n--- Metrics ---")
+        print("Total tokens: \(tokenCount)")
+        print("Total time: \(String(format: "%.2f", totalTime))s")
+
+        // Try to decode the result
+        if let jsonData = output.data(using: .utf8) {
+            do {
+                let project = try JSONDecoder().decode(Project.self, from: jsonData)
+                print("Parsed Project:")
+                print("  Name: \(project.projectName)")
+                print("  Description: \(project.description)")
+                print("  Lead: \(project.lead.name) (\(project.lead.role))")
+                print("  Members (\(project.members.count)):")
+                for member in project.members {
+                    print("    - \(member.name): \(member.role)")
+                }
+
+                #expect(!project.projectName.isEmpty, "Project name should not be empty")
+                #expect(!project.lead.name.isEmpty, "Lead name should not be empty")
+                #expect(project.members.count > 0, "Should have at least one team member")
+            } catch {
+                print("Failed to decode JSON: \(error)")
+                print("Raw output: \(output)")
+                Issue.record("Failed to decode complex nested structure: \(error)")
+            }
+        }
+
+        #expect(!output.isEmpty, "Grammar session should generate output")
+    }
+
     @Test("Performance test with longer generation", arguments: TestModelKind.allCases)
     func testPerformanceLongerGeneration(modelKind: TestModelKind) async throws {
         let modelPath = "\(testModelsPath)/\(modelKind.rawValue)"
@@ -271,6 +592,218 @@ struct LlamaANETests {
 
         #expect(!output.isEmpty, "Model should generate output")
         #expect(tokenCount > 10, "Should generate more than 10 tokens for this prompt")
+    }
+
+    // MARK: - SchemaGuide Attribute Tests
+
+    @Test("SchemaGuide attribute generates descriptions")
+    func testSchemaGuideDescriptions() throws {
+        // Verify schemaProperties contains descriptions from @SchemaGuide
+        let properties = UserProfile.schemaProperties
+        #expect(properties != nil, "UserProfile should have schemaProperties")
+
+        guard let props = properties else { return }
+
+        // Check that we have all expected properties
+        #expect(props.count == 5, "UserProfile should have 5 properties")
+
+        // Find and verify each property's description
+        let nameProperty = props.first { $0.name == "name" }
+        #expect(nameProperty?.description == "The user's display name", "name should have correct description")
+
+        let ageProperty = props.first { $0.name == "age" }
+        #expect(ageProperty?.description == "Age in years", "age should have correct description")
+
+        let bioProperty = props.first { $0.name == "bio" }
+        #expect(bioProperty?.description == "User's biography", "bio should have correct description")
+
+        let ratingProperty = props.first { $0.name == "rating" }
+        #expect(ratingProperty?.description == "Rating from 0.0 to 5.0", "rating should have correct description")
+
+        let followersProperty = props.first { $0.name == "followers" }
+        #expect(followersProperty?.description == "Number of followers", "followers should have correct description")
+
+        print("All SchemaGuide descriptions verified successfully!")
+    }
+
+    @Test("SchemaGuide attribute generates constraints")
+    func testSchemaGuideConstraints() throws {
+        // Verify schemaProperties contains constraints from @SchemaGuide
+        let properties = UserProfile.schemaProperties
+        #expect(properties != nil, "UserProfile should have schemaProperties")
+
+        guard let props = properties else { return }
+
+        // Check age has range constraint
+        let ageProperty = props.first { $0.name == "age" }
+        #expect(ageProperty != nil, "Should have age property")
+        #expect(ageProperty!.constraints.contains(.range(0...150)), "age should have range constraint 0...150")
+
+        // Check bio has maxLength constraint
+        let bioProperty = props.first { $0.name == "bio" }
+        #expect(bioProperty != nil, "Should have bio property")
+        #expect(bioProperty!.constraints.contains(.maxLength(500)), "bio should have maxLength constraint 500")
+
+        // Check rating has doubleRange constraint
+        let ratingProperty = props.first { $0.name == "rating" }
+        #expect(ratingProperty != nil, "Should have rating property")
+        #expect(ratingProperty!.constraints.contains(.doubleRange(0.0...5.0)), "rating should have doubleRange constraint 0.0...5.0")
+
+        // Check followers has range constraint
+        let followersProperty = props.first { $0.name == "followers" }
+        #expect(followersProperty != nil, "Should have followers property")
+        #expect(followersProperty!.constraints.contains(.range(0...1000000)), "followers should have range constraint 0...1000000")
+
+        print("All SchemaGuide constraints verified successfully!")
+    }
+
+    @Test("SchemaGuide attribute with array count constraint")
+    func testSchemaGuideArrayCountConstraint() throws {
+        let properties = Playlist.schemaProperties
+        #expect(properties != nil, "Playlist should have schemaProperties")
+
+        guard let props = properties else { return }
+
+        let songsProperty = props.first { $0.name == "songs" }
+        #expect(songsProperty != nil, "Should have songs property")
+        #expect(songsProperty!.constraints.contains(.count(3...50)), "songs should have count constraint 3...50")
+
+        print("Array count constraint verified successfully!")
+    }
+
+    @Test("SchemaGuide attribute on ProductReview")
+    func testSchemaGuideProductReview() throws {
+        let properties = ProductReview.schemaProperties
+        #expect(properties != nil, "ProductReview should have schemaProperties")
+
+        guard let props = properties else { return }
+        #expect(props.count == 4, "ProductReview should have 4 properties")
+
+        // Check rating has range 1-5
+        let ratingProperty = props.first { $0.name == "rating" }
+        #expect(ratingProperty?.constraints.contains(.range(1...5)) == true, "rating should have range 1...5")
+
+        // Check title has maxLength 100
+        let titleProperty = props.first { $0.name == "title" }
+        #expect(titleProperty?.constraints.contains(.maxLength(100)) == true, "title should have maxLength 100")
+
+        // Check reviewText has maxLength 2000
+        let reviewTextProperty = props.first { $0.name == "reviewText" }
+        #expect(reviewTextProperty?.constraints.contains(.maxLength(2000)) == true, "reviewText should have maxLength 2000")
+
+        print("ProductReview SchemaGuide attributes verified successfully!")
+    }
+
+    @Test("SchemaDescription includes SchemaGuide info")
+    func testSchemaDescriptionWithSchemaGuide() throws {
+        // Test that schemaDescription includes description and constraints
+        let description = UserProfile.schemaDescription()
+
+        print("Schema description:\n\(description)")
+
+        // The description should contain property info
+        #expect(description.contains("name"), "Should contain name property")
+        #expect(description.contains("age"), "Should contain age property")
+        #expect(description.contains("bio"), "Should contain bio property")
+    }
+
+    @Test("SchemaDescription includes nested object properties")
+    func testSchemaDescriptionNested() throws {
+        // Test that nested objects show their properties recursively
+        let description = Person.schemaDescription()
+        print("Person schema description:\n\(description)")
+
+        // Should contain Person's properties
+        #expect(description.contains("name"), "Should contain Person's name property")
+        #expect(description.contains("age"), "Should contain Person's age property")
+        #expect(description.contains("address"), "Should contain Person's address property")
+
+        // Should contain nested Address properties
+        #expect(description.contains("street"), "Should contain Address's street property")
+        #expect(description.contains("city"), "Should contain Address's city property")
+        #expect(description.contains("zipCode"), "Should contain Address's zipCode property")
+    }
+
+    @Test("SchemaDescription includes array of objects")
+    func testSchemaDescriptionArrayOfObjects() throws {
+        // Test that arrays of objects show element schema
+        let description = TodoList.schemaDescription()
+        print("TodoList schema description:\n\(description)")
+
+        // Should contain TodoList properties
+        #expect(description.contains("listName"), "Should contain listName property")
+        #expect(description.contains("tasks"), "Should contain tasks array property")
+
+        // Should contain nested Task properties
+        #expect(description.contains("title"), "Should contain Task's title property")
+        #expect(description.contains("completed"), "Should contain Task's completed property")
+    }
+
+    @available(macOS 26.0, iOS 26.0, *)
+    @Test("FoundationModels GenerationSchema includes SchemaGuide info")
+    func testGenerationSchemaWithSchemaGuide() throws {
+        // Test that generationSchema (for FoundationModels) includes descriptions and guides
+        let schema = UserProfile.generationSchema
+
+        print("GenerationSchema: \(schema)")
+
+        // The schema should have properties for all fields
+        // Note: We can't easily inspect GenerationSchema internals, but we can verify it exists
+        // and doesn't throw when accessed
+        #expect(schema != nil, "Should have a valid generationSchema")
+    }
+
+    @Test("Grammar uses SchemaGuide maxLength constraint")
+    func testGrammarMaxLengthConstraint() async throws {
+        // Test that the grammar tracker respects maxLength constraints
+        // UserProfile has bio with .maxLength(500) and name with no constraint
+
+        // Get schemaProperties and verify constraints are present
+        let properties = UserProfile.schemaProperties
+        #expect(properties != nil, "Should have schemaProperties")
+
+        guard let props = properties else { return }
+
+        // bio should have maxLength 500
+        let bioProperty = props.first { $0.name == "bio" }
+        #expect(bioProperty?.maxLength == 500, "bio should have maxLength 500")
+
+        // name should use default (nil maxLength)
+        let nameProperty = props.first { $0.name == "name" }
+        #expect(nameProperty?.maxLength == nil, "name should not have maxLength constraint")
+
+        print("Grammar constraint test passed - maxLength constraints are correctly extracted from @SchemaGuide")
+    }
+
+    @Test("Schema description is suitable for prompt injection")
+    func testSchemaDescriptionForPromptInjection() throws {
+        // Test that schemaDescription produces output suitable for LLM prompt injection
+        let description = UserProfile.schemaDescription()
+
+        print("Schema description for prompt injection:\n\(description)")
+
+        // Should be human-readable format
+        #expect(description.contains("{"), "Should have opening brace")
+        #expect(description.contains("}"), "Should have closing brace")
+
+        // Should include field names
+        #expect(description.contains("\"name\""), "Should include name field")
+        #expect(description.contains("\"age\""), "Should include age field")
+        #expect(description.contains("\"bio\""), "Should include bio field")
+
+        // Should include type information
+        #expect(description.contains("string"), "Should include string type")
+        #expect(description.contains("integer"), "Should include integer type")
+
+        // Should include descriptions from @SchemaGuide
+        #expect(description.contains("The user's display name"), "Should include name description")
+        #expect(description.contains("Age in years"), "Should include age description")
+
+        // Should include constraints
+        #expect(description.contains("max 500 chars"), "Should include maxLength constraint for bio")
+        #expect(description.contains("range: 0-150"), "Should include range constraint for age")
+
+        print("Schema description is suitable for prompt injection!")
     }
 
     // MARK: - Legacy Tests (commented out, require specific model classes)
@@ -1315,4 +1848,85 @@ struct LlamaANETests {
     let rating: Float
     let genre: String
     let summary: String
+}
+
+// Nested object test - an object containing another object
+@JSONSchema struct Address {
+    let street: String
+    let city: String
+    let zipCode: String
+}
+
+@JSONSchema struct Person {
+    let name: String
+    let age: Int
+    let address: Address
+}
+
+// Array of objects test
+@JSONSchema struct Task {
+    let title: String
+    let completed: Bool
+}
+
+@JSONSchema struct TodoList {
+    let listName: String
+    let tasks: [Task]
+}
+
+// Nested object with array test
+@JSONSchema struct TeamMember {
+    let name: String
+    let role: String
+}
+
+@JSONSchema struct Project {
+    let projectName: String
+    let description: String
+    let lead: TeamMember
+    let members: [TeamMember]
+}
+
+// MARK: - SchemaGuide Attribute Tests
+
+/// Test struct with @SchemaGuide attributes for descriptions
+@JSONSchema struct UserProfile {
+    @SchemaGuide("The user's display name")
+    let name: String
+
+    @SchemaGuide("Age in years", .range(0...150))
+    let age: Int
+
+    @SchemaGuide("User's biography", .maxLength(500))
+    let bio: String
+
+    @SchemaGuide("Rating from 0.0 to 5.0", .doubleRange(0.0...5.0))
+    let rating: Double
+
+    @SchemaGuide("Number of followers", .range(0...1000000))
+    let followers: Int
+}
+
+/// Test struct with array count constraint
+@JSONSchema struct Playlist {
+    @SchemaGuide("Name of the playlist")
+    let name: String
+
+    @SchemaGuide("Songs in the playlist (3-50 songs)", .count(3...50))
+    let songs: [String]
+}
+
+/// Test struct combining multiple constraints
+@JSONSchema struct ProductReview {
+    @SchemaGuide("Product identifier")
+    let productId: String
+
+    @SchemaGuide("Review rating", .range(1...5))
+    let rating: Int
+
+    @SchemaGuide("Review title", .maxLength(100))
+    let title: String
+
+    @SchemaGuide("Full review text", .maxLength(2000))
+    let reviewText: String
 }

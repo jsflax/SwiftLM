@@ -47,12 +47,14 @@ def get_model_wrapper(architecture: str):
     from modeling_llama import StatefulLlamaForCausalLM
     from modeling_mistral import StatefulMistralForCausalLM
     from modeling_qwen import StatefulQwen2ForCausalLM
+    from modeling_qwen3 import StatefulQwen3ForCausalLM
     from modeling_deepseek import StatefulDeepseekV3ForCausalLM
 
     wrappers = {
         "LlamaForCausalLM": StatefulLlamaForCausalLM,
         "MistralForCausalLM": StatefulMistralForCausalLM,
         "Qwen2ForCausalLM": StatefulQwen2ForCausalLM,
+        "Qwen3ForCausalLM": StatefulQwen3ForCausalLM,
         "DeepseekV3ForCausalLM": StatefulDeepseekV3ForCausalLM,
     }
 
