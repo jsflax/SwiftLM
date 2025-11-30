@@ -13,6 +13,11 @@ private struct MemberView {
     var isComputed: Bool
     var guideDescription: String?
     var guideConstraints: [String] = []  // Raw constraint expressions like ".maxLength(50)"
+
+    /// Whether this property has .skip constraint and should be excluded from generation
+    var shouldSkip: Bool {
+        guideConstraints.contains(".skip")
+    }
 }
 
 /// Extract the parent type path from the lexical context (excluding the current type being expanded)
@@ -347,9 +352,12 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
                 """
             ]
         }
-        // Generate GenerationSchema.Property entries for Generable
+        // Filter out skipped members for generation schema
+        let generatedMembers = qualifiedMembers.filter { !$0.shouldSkip }
+
+        // Generate GenerationSchema.Property entries for Generable (only non-skipped)
         // Include description and guides from @SchemaGuide attributes
-        let generationSchemaProperties = qualifiedMembers.map { member -> String in
+        let generationSchemaProperties = generatedMembers.map { member -> String in
             var args = "name: \"\(member.name)\""
 
             // Add description if present
@@ -390,15 +398,25 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
             return ".init(\(args))"
         }.joined(separator: ",\n                ")
 
-        // Generate init from GeneratedContent
-        let initFromGeneratedContent = qualifiedMembers.map {
-            """
-            self.\($0.name) = try content.value(forProperty: "\($0.name)")
-            """
+        // Generate init from GeneratedContent (handle skipped members with defaults)
+        let initFromGeneratedContent = qualifiedMembers.map { member -> String in
+            if member.shouldSkip {
+                // Use default value for skipped properties
+                if let assignment = member.assignment {
+                    return "self.\(member.name) = \(assignment)"
+                } else if member.isOptional {
+                    return "self.\(member.name) = nil"
+                } else {
+                    // No default available - use type's init()
+                    return "self.\(member.name) = \(member.type)()"
+                }
+            } else {
+                return "self.\(member.name) = try content.value(forProperty: \"\(member.name)\")"
+            }
         }.joined(separator: "\n            ")
 
-        // Generate generatedContent property
-        let generatedContentProperties = qualifiedMembers.map {
+        // Generate generatedContent property (only include non-skipped)
+        let generatedContentProperties = generatedMembers.map {
             """
             "\($0.name)": \($0.name)
             """
@@ -413,10 +431,19 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
             """
             public init(from decoder: Swift.Decoder) throws {
                 let container = try decoder.container(keyedBy: CodingKeys.self)
-                \(raw: qualifiedMembers.map {
-                    """
-                    self.\($0.name) = try \($0.type).decode(from: container, forKey: .\($0.name))
-                    """
+                \(raw: qualifiedMembers.map { member -> String in
+                    if member.shouldSkip {
+                        // Skipped properties: decode if present, otherwise use default
+                        if let assignment = member.assignment {
+                            return "self.\(member.name) = try container.decodeIfPresent(\(member.type).self, forKey: .\(member.name)) ?? \(assignment)"
+                        } else if member.isOptional {
+                            return "self.\(member.name) = try container.decodeIfPresent(\(member.type).self, forKey: .\(member.name))"
+                        } else {
+                            return "self.\(member.name) = try container.decodeIfPresent(\(member.type).self, forKey: .\(member.name)) ?? \(member.type)()"
+                        }
+                    } else {
+                        return "self.\(member.name) = try \(member.type).decode(from: container, forKey: .\(member.name))"
+                    }
                 }.joined(separator: "\n"))
             }
             """,
@@ -453,13 +480,24 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
                 guard let json = json as? [String: Any] else {
                     throw JSONDecodingError.invalidType
                 }
-                \(raw: qualifiedMembers.map {
-                    """
-                    guard let value = json["\($0.name)"] else {
-                        throw JSONDecodingError.missingRequiredProperty("\($0.name)")
+                \(raw: qualifiedMembers.map { member -> String in
+                    if member.shouldSkip {
+                        // Use default value for skipped properties
+                        if let assignment = member.assignment {
+                            return "self.\(member.name) = \(assignment)"
+                        } else if member.isOptional {
+                            return "self.\(member.name) = nil"
+                        } else {
+                            return "self.\(member.name) = \(member.type)()"
+                        }
+                    } else {
+                        return """
+                        guard let value = json["\(member.name)"] else {
+                            throw JSONDecodingError.missingRequiredProperty("\(member.name)")
+                        }
+                        self.\(member.name) = try \(member.type)(from: value)
+                        """
                     }
-                    self.\($0.name) = try \($0.type)(from: value)
-                    """
                 }.joined(separator: "\n"))
             }
             """,
@@ -543,14 +581,18 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
         if declaration is EnumDeclSyntax {
             inheritedTypes.append(InheritedTypeSyntax(type: TypeSyntax(", CaseIterable")))
         }
-        let properties = qualifiedMembers.map {
+
+        // Filter out skipped members for schema/grammar generation
+        let generatableMembers = qualifiedMembers.filter { !$0.shouldSkip }
+
+        let properties = generatableMembers.map {
             """
             "\($0.name)": \($0.type).jsonSchema
             """
         }
         if !(declaration is EnumDeclSyntax) {
-            // Generate schemaProperties with metatype references, descriptions, and constraints
-            let schemaPropertiesCode = qualifiedMembers.map { member -> String in
+            // Generate schemaProperties with metatype references, descriptions, and constraints (only non-skipped)
+            let schemaPropertiesCode = generatableMembers.map { member -> String in
                 var args = "\"\(member.name)\", \(member.type).self"
                 if let desc = member.guideDescription {
                     args += ", description: \"\(desc)\""
@@ -583,7 +625,7 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
                         ]
                     }
                     public static var properties: [(String, _GrammarJSONSchema.Property)]? {
-                        [\(raw: qualifiedMembers.map {
+                        [\(raw: generatableMembers.map {
                             """
                             ("\($0.name)", _GrammarJSONSchema.Property(type: \($0.type).type, items: \($0.type).items, description: ""))
                             """
