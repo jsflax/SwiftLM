@@ -159,6 +159,10 @@ enum TripTestModelKind: String, CaseIterable {
     case qwen3_06bInt4 = "Qwen3-0.6B_Int4.mlpackage"
     case llama31bInt4 = "Llama-3.2-1B-Instruct_Int4.mlpackage"
     case llama33bInt4 = "Llama-3.2-3B-Instruct_Int4.mlpackage"
+    case qwenTripIntentFinetuned = "Qwen-Trip-Intent-Finetuned_Int4.mlpackage"
+    case qwenTripIntentProd = "Qwen-Trip-Intent-Prod_Int4.mlpackage"
+    case qwenTripCombined = "Qwen-Trip-Combined_Int4.mlpackage"
+    case qwen05bTripCombined = "Qwen-0.5B-Trip-Combined_Int4.mlpackage"
 }
 
 // MARK: - Integration Tests
@@ -232,7 +236,7 @@ struct TripIntentIntegrationTests {
         mlConfig.computeUnits = .cpuAndGPU
         let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
 
-        let lm = try LanguageModel(model: mlModel)
+        let lm = try CoreMLLanguageModel(model: mlModel)
         try await lm.warmup()
 
         let systemPrompt = """
@@ -337,7 +341,7 @@ struct TripIntentIntegrationTests {
         mlConfig.computeUnits = .cpuAndGPU
         let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
 
-        let lm = try LanguageModel(model: mlModel)
+        let lm = try CoreMLLanguageModel(model: mlModel)
         try await lm.warmup()
 
         let session = await lm.makeSession(
@@ -375,7 +379,8 @@ struct TripIntentIntegrationTests {
 
     // MARK: - Parallel Inference Tests
 
-    @Test("Parallel inference for trip intent", arguments: [TripTestModelKind.qwen15bInt4])
+    @available(macOS 26.0, *)
+    @Test("Parallel inference for trip intent", arguments: [TripTestModelKind.qwenTripCombined])
     func testParallelTripIntent(modelKind: TripTestModelKind) async throws {
         let modelPath = "\(tripTestModelsPath)/\(modelKind.rawValue)"
         let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
@@ -384,9 +389,10 @@ struct TripIntentIntegrationTests {
         mlConfig.computeUnits = .cpuAndGPU
         let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
 
-        let lm = try LanguageModel(model: mlModel)
-        try await lm.warmup()
+//        let lm = try CoreMLLanguageModel(model: mlModel)
+//        try await lm.warmup()
 
+        let lm = try FoundationLanguageModel(model: .default)
         let userUtterance = "I wanna go to Japan for 2 weeks, eat great food, urban explore, and surf."
 
         print("\n--- Parallel Trip Intent Test ---")
@@ -398,9 +404,8 @@ struct TripIntentIntegrationTests {
         // Run parallel inferences using TaskGroup
         async let basicInfoTask = extractBasicInfo(lm: lm, utterance: userUtterance)
         async let interestsTask = extractInterests(lm: lm, utterance: userUtterance)
-        async let destinationsTask = extractDestinations(lm: lm, utterance: userUtterance)
-
-        let (basicInfo, interests, destinations) = try await (basicInfoTask, interestsTask, destinationsTask)
+        let (basicInfo, interests) = try await (basicInfoTask, interestsTask)
+        let destinations = try await extractDestinationsIterative(lm: lm, tripInfo: basicInfo!, originLocation: "New York, USA", roundTrip: true)
 
         let totalTime = Date().timeIntervalSince(startTime)
 
@@ -435,9 +440,20 @@ struct TripIntentIntegrationTests {
         // Assemble the final ParsedTripIntent from parallel results
         if let basic = basicInfo, let int = interests {
             var dayIndex = 0
-            let parsedDestinations = destinations.destinations.map { d -> ParsedTripIntent.Destination in
+            var parsedDestinations: [ParsedTripIntent.Destination] = []
+            for d in destinations.destinations {
                 // TODO: Use MapKit to look up coordinates for city name
                 // For now, use placeholder coordinates
+                let placemarks = try? await CLGeocoder().geocodeAddressString("\(d.name), \(d.country)")
+                let region = placemarks?.first?.location.map {
+                    MKCoordinateRegion(
+                        center: $0.coordinate,
+                        span: .example
+                    )
+                } ?? MKCoordinateRegion(
+                    center: CLLocationCoordinate2D(latitude: 0, longitude: 0),
+                    span: .example
+                )
                 let destination = ParsedTripIntent.Destination(
                     name: d.name,
                     country: d.country,
@@ -445,13 +461,10 @@ struct TripIntentIntegrationTests {
                     priority: 1,
                     destinationDays: d.days,
                     destinationStartDayIndex: dayIndex,
-                    coordinateRegion: MKCoordinateRegion(
-                        center: CLLocationCoordinate2D(latitude: 0, longitude: 0),
-                        span: .example
-                    )
+                    coordinateRegion: region
                 )
                 dayIndex += d.days
-                return destination
+                parsedDestinations.append(destination)
             }
 
             let finalIntent = ParsedTripIntent(
@@ -481,65 +494,300 @@ struct TripIntentIntegrationTests {
     }
 
     // Helper functions for parallel extraction
-    private func extractBasicInfo(lm: LanguageModel, utterance: String) async -> TripBasicInfo? {
-        let session = await lm.makeSession(systemPrompt: "Extract trip name and duration. Output JSON only.")
-        var output = ""
-        let stream: AsyncStream<String> = await session.infer(prompt: utterance, as: TripBasicInfo.self)
-        for await token in stream { output += token }
-        print("\n[BasicInfo] Output: \(output)")
-        guard let data = output.data(using: .utf8) else { return nil }
-        return try? JSONDecoder().decode(TripBasicInfo.self, from: data)
+    private func extractBasicInfo(lm: some LanguageModel, utterance: String) async throws -> TripBasicInfo? {
+        let session = await lm.startConversation(systemPrompt: "Extract trip name and duration. Output JSON only.")
+        let tripBasicInfo: TripBasicInfo = try await session.continue(input: utterance, expecting: TripBasicInfo.self)
+        return tripBasicInfo
     }
 
-    private func extractInterests(lm: LanguageModel, utterance: String) async throws -> TripInterests? {
-        // Chain-of-thought: First have model enumerate activities in a structured way
-        // Using few-shot format to encourage the model to list all activities
-        let cotSession = await lm.makeSession(systemPrompt: """
-            You extract activities from travel messages. E.g.,:
-
-            Message: "I want to eat sushi and visit temples"
-            Activities:
-            - eating sushi
-            - visiting temples
-
-            Message: "beach vacation with snorkeling and relaxation"
-            Activities:
-            - snorkeling
-            - relaxation
-            - beach
+    private func extractInterests(lm: some LanguageModel, utterance: String) async throws -> TripInterests? {
+        // Use plain text extraction first to avoid single-element array issue
+        let session = await lm.startConversation(
+            systemPrompt: """
+            List ALL activities from the message. 
+            
+            Utterance:
             """,
-                                              doSample: true)
-
-        // Step 1: Get CoT reasoning (unconstrained)
-        let interests = try await cotSession.infer(prompt: utterance, as: TripInterests.self)
-        print(interests)
-        return interests
-    }
-
-    private func extractDestinations(lm: LanguageModel, utterance: String) async throws -> TripDestinations {
-        // Step 1: CoT - let model reason about destinations in plain English (greedy for reliability)
-        let cotSession = await lm.makeSession(
-            systemPrompt: "You are a travel planner. List the cities and days for this trip request. Example: Tokyo 5 days, Kyoto 3 days, Osaka 2 days. Days must sum to the trip duration.",
 //            doSample: true
         )
 
-//        var cotOutput = ""
-//        let cotStream = await cotSession.infer(prompt: utterance)
-//        for await token in cotStream { cotOutput += token }
-//        print("\n[Destinations CoT] '\(cotOutput)'")
-//
-//        // Step 2: Grammar-constrained generation using the CoT output
-//        let structuredSession = await lm.makeSession(
-//            systemPrompt: "Convert to JSON. Output only valid JSON.",
-//            doSample: false  // Greedy for structured output
-//        )
+        let interests = try await session.continue(input: utterance, expecting: TripInterests.self)
 
-        let destinations = try await cotSession.infer(
-            prompt: utterance,
-            as: TripDestinations.self
+        print("Extracted interests: \(interests)")
+        return interests
+    }
+
+    private func extractDestinations(lm: some LanguageModel, tripInfo: TripBasicInfo) async throws -> TripDestinations {
+        // Iterative extraction: get one destination at a time until days are exhausted
+        // This avoids the single-element array problem with grammar-constrained generation
+        let session = await lm.startConversation(
+            systemPrompt: """
+            You are a travel planner for \(tripInfo.name). Suggest multiple cities to visit.
+            Pick popular destinations that fit the trip style (\(tripInfo.travelStyle)).
+            
+            """,
+//            doSample: true  // Greedy for consistent results
         )
 
-        print("Reasoning for destinations: \(destinations.reasoning)")
+        var daysRemaining = tripInfo.durationDays
+        var destinations: TripDestinations = try await session.continue(input: """
+        The trip is \(tripInfo.durationDays) days long. You MUST fill up the entire \(tripInfo.durationDays) days with destinations, but not exceed \(tripInfo.durationDays) days.
+        Allocate reasonable days (3-5 for major cities, 2-3 for smaller ones).    
+        """, expecting: TripDestinations.self)
+        print(destinations)
         return destinations
     }
+    
+    private func extractDestinationsIterative(
+        lm: some LanguageModel,
+        tripInfo: TripBasicInfo,
+        originLocation: String,
+        roundTrip: Bool = false,
+    ) async throws -> TripDestinations {
+        // Iterative extraction: get one destination at a time until days are exhausted
+        // This avoids the single-element array problem with grammar-constrained generation
+        let session = await lm.startConversation(
+            systemPrompt: """
+            You are a travel planner for \(tripInfo.name). Suggest ONE city to visit.
+            Pick popular destinations that fit the trip style (\(tripInfo.travelStyle)).
+            Allocate reasonable days (3-5 for major cities, 2-3 for smaller ones).
+            
+            Origin location: \(originLocation). Consider whether or not the user has to fly from here.
+            """,
+//            temperature: 0.6,
+//            doSample: true,
+        )
+
+        var daysRemaining = tripInfo.durationDays
+        var destinations: [TripDestination] = []
+        var visitedCities: [String] = []
+
+        while daysRemaining > 0 {
+            // Build context about what's already been planned
+            let contextPrompt: String
+            if visitedCities.isEmpty {
+                contextPrompt = "First destination. \(daysRemaining) days total."
+            } else {
+                contextPrompt = "Already visiting: \(visitedCities.joined(separator: ", ")). \(daysRemaining) days left."
+            }
+
+            let destination = try await session.continue(
+                input: contextPrompt,
+                expecting: TripDestination.self
+            )
+
+            // Clamp days to remaining (in case model overshoots)
+            var adjustedDestination = destination
+            if destination.days > daysRemaining {
+                adjustedDestination = TripDestination(
+                    name: destination.name,
+                    country: destination.country,
+                    days: daysRemaining
+                )
+            }
+
+            print("  → \(adjustedDestination.name), \(adjustedDestination.country): \(adjustedDestination.days) days")
+            destinations.append(adjustedDestination)
+            visitedCities.append(adjustedDestination.name)
+            daysRemaining -= adjustedDestination.days
+        }
+
+        return TripDestinations(destinations: destinations, reasoning: "Iterative extraction")
+    }
+
+    // MARK: - Fine-tuned Model Tests
+
+    @Test("Fine-tuned model intent parsing")
+    func testFinetunedModelIntentParsing() async throws {
+        let modelPath = "\(tripTestModelsPath)/\(TripTestModelKind.qwen05bTripCombined.rawValue)"
+        let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
+
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = .cpuAndGPU
+        let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
+
+        let lm = try CoreMLLanguageModel(model: mlModel)
+        try await lm.warmup()
+
+        // System prompt matching the fine-tuning data format
+        let systemPrompt = """
+        You are a travel planner AI. Parse the user's travel request and extract trip intent as JSON.
+        Rules:
+        - "2 weeks" = 14 days, "1 week" = 7 days
+        - Infer interests from activities mentioned (food, urban exploration, surfing, temples, etc.)
+        - Pick appropriate travel persona (bohemian, bougie, classic, outdoorsy, nightOwl, familyFriendly)
+        - Use guideTags from: Foodie, Art & Culture, Nightlife, Outdoors, Family
+        - Provide reasonable coordinates for each destination
+        """
+
+        let session = await lm.makeSession(systemPrompt: systemPrompt)
+
+        let testCases = [
+            "I want to visit Japan for 2 weeks. I love food and want to explore cities.",
+            "Planning a romantic trip to Paris and Rome for 10 days",
+            "Family vacation to Hawaii - beaches and snorkeling for a week",
+        ]
+
+        for utterance in testCases {
+            print("\n--- Fine-tuned Model Test ---")
+            print("Utterance: \(utterance)")
+
+            let input = TripIntentInput(utterance: utterance, localeHint: "en-US")
+            let inputJSON = try JSONEncoder().encode(input)
+            let inputStr = String(data: inputJSON, encoding: .utf8)!
+
+            let startTime = Date()
+            var output = ""
+            var tokenCount = 0
+
+            print("\n--- Output ---")
+            let stream: AsyncStream<String> = await session.infer(prompt: inputStr, as: ParsedTripIntent.self)
+            for await token in stream {
+                output += token
+                tokenCount += 1
+                print(token, terminator: "")
+            }
+            print()
+
+            let totalTime = Date().timeIntervalSince(startTime)
+            print("\n--- Metrics ---")
+            print("Tokens: \(tokenCount), Time: \(String(format: "%.2f", totalTime))s, Speed: \(String(format: "%.1f", Double(tokenCount) / totalTime)) tok/s")
+
+            // Try to decode
+            if let data = output.data(using: .utf8) {
+                do {
+                    let intent = try JSONDecoder().decode(ParsedTripIntent.self, from: data)
+                    print("✅ Decoded: \(intent.name)")
+                    print("   Duration: \(intent.durationDays ?? 0) days")
+                    print("   Destinations: \(intent.destinations.map { $0.name }.joined(separator: ", "))")
+                    print("   Interests: \(intent.interests.joined(separator: ", "))")
+                } catch {
+                    print("❌ Decode error: \(error)")
+                    print("Raw: \(output)")
+                }
+            }
+        }
+    }
+
+    @Test("Compare fine-tuned vs base model")
+    func testCompareFinetunedVsBase() async throws {
+        // Load both models
+        let basePath = "\(tripTestModelsPath)/\(TripTestModelKind.qwen15bInt4.rawValue)"
+        let finetunedPath = "\(tripTestModelsPath)/\(TripTestModelKind.qwenTripIntentProd.rawValue)"
+
+        let baseCompiled = try await MLModel.compileModel(at: URL(fileURLWithPath: basePath))
+        let finetunedCompiled = try await MLModel.compileModel(at: URL(fileURLWithPath: finetunedPath))
+
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = .cpuAndGPU
+
+        let baseModel = try MLModel(contentsOf: baseCompiled, configuration: mlConfig)
+        let finetunedModel = try MLModel(contentsOf: finetunedCompiled, configuration: mlConfig)
+
+        let baseLM = try CoreMLLanguageModel(model: baseModel)
+        let finetunedLM = try CoreMLLanguageModel(model: finetunedModel)
+
+        try await baseLM.warmup()
+        try await finetunedLM.warmup()
+
+        let systemPrompt = """
+        Parse the user's travel request and extract trip intent as JSON.
+        """
+
+        let utterance = "I wanna go to Japan for 2 weeks, eat great food, urban explore, and surf."
+
+        print("\n=== Base Model (Qwen 1.5B) ===")
+        let baseSession = await baseLM.makeSession(systemPrompt: systemPrompt)
+        var baseOutput = ""
+        var baseTokens = 0
+        let baseStart = Date()
+        let baseStream: AsyncStream<String> = await baseSession.infer(prompt: utterance, as: SimpleTripIntent.self)
+        for await token in baseStream {
+            baseOutput += token
+            baseTokens += 1
+            print(token, terminator: "")
+        }
+        let baseTime = Date().timeIntervalSince(baseStart)
+        print("\n[Base: \(baseTokens) tokens, \(String(format: "%.2f", baseTime))s]")
+
+        print("\n=== Fine-tuned Model ===")
+        let ftSession = await finetunedLM.makeSession(systemPrompt: systemPrompt)
+        var ftOutput = ""
+        var ftTokens = 0
+        let ftStart = Date()
+        let ftStream: AsyncStream<String> = await ftSession.infer(prompt: utterance, as: SimpleTripIntent.self)
+        for await token in ftStream {
+            ftOutput += token
+            ftTokens += 1
+            print(token, terminator: "")
+        }
+        let ftTime = Date().timeIntervalSince(ftStart)
+        print("\n[Fine-tuned: \(ftTokens) tokens, \(String(format: "%.2f", ftTime))s]")
+
+        // Compare decoding success
+        print("\n=== Comparison ===")
+        var baseSuccess = false
+        var ftSuccess = false
+
+        if let data = baseOutput.data(using: .utf8) {
+            if let _ = try? JSONDecoder().decode(SimpleTripIntent.self, from: data) {
+                baseSuccess = true
+                print("Base model: ✅ Valid JSON")
+            } else {
+                print("Base model: ❌ Invalid JSON")
+            }
+        }
+
+        if let data = ftOutput.data(using: .utf8) {
+            if let intent = try? JSONDecoder().decode(SimpleTripIntent.self, from: data) {
+                ftSuccess = true
+                print("Fine-tuned:  ✅ Valid JSON - \(intent.name)")
+            } else {
+                print("Fine-tuned:  ❌ Invalid JSON")
+            }
+        }
+
+        print("\nBase speed: \(String(format: "%.1f", Double(baseTokens) / baseTime)) tok/s")
+        print("Fine-tuned speed: \(String(format: "%.1f", Double(ftTokens) / ftTime)) tok/s")
+    }
+    
+    @Test
+    func testTransport() async throws {
+        let finetunedPath = "\(tripTestModelsPath)/\(TripTestModelKind.qwenTripIntentProd.rawValue)"
+        let finetunedCompiled = try await MLModel.compileModel(at: URL(fileURLWithPath: finetunedPath))
+
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = .cpuAndGPU
+
+        let finetunedModel = try MLModel(contentsOf: finetunedCompiled, configuration: mlConfig)
+        
+        let finetunedLM = try CoreMLLanguageModel(model: finetunedModel)
+        try await finetunedLM.warmup()
+        
+        let start = Date()
+        print("Start: \(start)")
+        let session = await finetunedLM.makeSession(systemPrompt: """
+        Choose the most sensible transport mode to get from the origin location to the destination location.
+        Consider distance, rail system, and mode feasability.
+        """)
+        
+        let mode = try await session.infer(input: TransportDeciderInput(fromCity: "Tokyo",
+                                                                        toCity: "Osaka"),
+                                           as: TransportDeciderOutput.self)
+        let ftTime = Date().timeIntervalSince(start)
+        print("Total inference time: \(String(format: "%.2f", ftTime))s")
+        print(mode.transportMode)
+    }
+
+}
+
+@JSONSchema struct TransportDeciderInput {
+    let fromCity: String
+    let toCity: String
+}
+@JSONSchema enum TransportMode: String, Codable {
+    case plane, train, automobile
+}
+@JSONSchema struct TransportDeciderOutput {
+    let transportMode: TransportMode
 }

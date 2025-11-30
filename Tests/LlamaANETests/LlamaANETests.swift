@@ -27,7 +27,7 @@ struct LlamaANETests {
         mlConfig.computeUnits = .cpuAndGPU
         let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
 
-        let lm = try LanguageModel(model: mlModel)
+        let lm = try CoreMLLanguageModel(model: mlModel)
 
         // Verify model loaded
         print("Model loaded: \(lm.modelName ?? "unknown")")
@@ -63,7 +63,7 @@ struct LlamaANETests {
         mlConfig.computeUnits = .cpuAndGPU
         let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
 
-        let lm = try LanguageModel(model: mlModel)
+        let lm = try CoreMLLanguageModel(model: mlModel)
         let session = await lm.makeSession()
         let stream = await session.infer(prompt: "What is 2 + 2?")
 
@@ -88,7 +88,7 @@ struct LlamaANETests {
         mlConfig.computeUnits = .cpuAndGPU
         let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
 
-        let lm = try LanguageModel(model: mlModel)
+        let lm = try CoreMLLanguageModel(model: mlModel)
         let session = await lm.makeSession(
             systemPrompt: "You are a helpful assistant that responds in JSON format."
         )
@@ -114,8 +114,8 @@ struct LlamaANETests {
         mlConfig.computeUnits = .cpuAndGPU  // Qwen requires GPU; produces NaN on CPU-only (root cause unknown)
         let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
 
-        // Create LanguageModel - tokenizer is auto-selected based on model metadata
-        let lm = try LanguageModel(model: mlModel)
+        // Create CoreMLLanguageModel - tokenizer is auto-selected based on model metadata
+        let lm = try CoreMLLanguageModel(model: mlModel)
 
         // Verify model loaded
         print("Model loaded: \(lm.modelName ?? "unknown")")
@@ -204,7 +204,7 @@ struct LlamaANETests {
         mlConfig.computeUnits = .cpuAndGPU
         let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
         
-        let lm = try LanguageModel(model: mlModel)
+        let lm = try CoreMLLanguageModel(model: mlModel)
         try await lm.warmup()
 
         let aneSession = await lm.makeSession(
@@ -245,7 +245,7 @@ struct LlamaANETests {
         mlConfig.computeUnits = .cpuAndGPU
         let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
 
-        let lm = try LanguageModel(model: mlModel)
+        let lm = try CoreMLLanguageModel(model: mlModel)
 
         // Warm up
         try await lm.warmup()
@@ -325,7 +325,7 @@ struct LlamaANETests {
         mlConfig.computeUnits = .cpuAndGPU
         let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
 
-        let lm = try LanguageModel(model: mlModel)
+        let lm = try CoreMLLanguageModel(model: mlModel)
         try await lm.warmup()
 
         let session = await lm.makeSession(
@@ -408,7 +408,7 @@ struct LlamaANETests {
         mlConfig.computeUnits = .cpuAndGPU
         let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
 
-        let lm = try LanguageModel(model: mlModel)
+        let lm = try CoreMLLanguageModel(model: mlModel)
         try await lm.warmup()
 
         let session = await lm.makeSession(
@@ -476,7 +476,7 @@ struct LlamaANETests {
         mlConfig.computeUnits = .cpuAndGPU
         let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
 
-        let lm = try LanguageModel(model: mlModel)
+        let lm = try CoreMLLanguageModel(model: mlModel)
         try await lm.warmup()
 
         let session = await lm.makeSession(
@@ -543,7 +543,7 @@ struct LlamaANETests {
         mlConfig.computeUnits = .cpuAndGPU
         let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
 
-        let lm = try LanguageModel(model: mlModel)
+        let lm = try CoreMLLanguageModel(model: mlModel)
         try await lm.warmup()
 
         let session = await lm.makeSession(
@@ -612,7 +612,7 @@ struct LlamaANETests {
         mlConfig.computeUnits = .cpuAndGPU
         let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
 
-        let lm = try LanguageModel(model: mlModel)
+        let lm = try CoreMLLanguageModel(model: mlModel)
         let session = try await lm.makeSession(systemPrompt: "You are a helpful assistant.")
 
         let prompt = "Explain in 3-4 sentences why the sky is blue."
@@ -1201,7 +1201,7 @@ struct LlamaANETests {
 
     /*
     @Test func testGreedy() async throws {
-        let lm = try LlamaANE.LanguageModel(model: Llama_3_2_3B_Instruct_uncensored().model)
+        let lm = try LlamaANE.CoreMLLanguageModel(model: Llama_3_2_3B_Instruct_uncensored().model)
         let session = try await lm.makeSession()
         let stream = try await session.infer(prompt: "How are you today?")
         for await token in stream {
@@ -1307,7 +1307,7 @@ struct LlamaANETests {
     // Uncomment when you have the appropriate models available.
 
     @Test func testSampling() async throws {
-        let lm = try LlamaANE.LanguageModel(model: Llama_3_2_3B_Instruct_uncensored().model
+        let lm = try LlamaANE.CoreMLLanguageModel(model: Llama_3_2_3B_Instruct_uncensored().model
                                             ,
                                             temperature: 1.2,
                                             topK: 50,
@@ -1333,7 +1333,7 @@ struct LlamaANETests {
     }
     
     @Test func testSummarizing() async throws {
-        let lm = try LlamaANE.LanguageModel(model: Llama_3_2_3B_Instruct_uncensored_Int4().model
+        let lm = try LlamaANE.CoreMLLanguageModel(model: Llama_3_2_3B_Instruct_uncensored_Int4().model
 //                                            ,
 //                                            temperature: 1.2,
 //                                            topK: 50,
@@ -1428,7 +1428,7 @@ struct LlamaANETests {
     }
     
     @Test func testSentimentOnly() async throws {
-        let lm = try LlamaANE.LanguageModel(model: Llama_3_2_3B_Instruct_uncensored_Int4().model
+        let lm = try LlamaANE.CoreMLLanguageModel(model: Llama_3_2_3B_Instruct_uncensored_Int4().model
 //                                            ,
 //                                            temperature: 1.2,
 //                                            topK: 50,
@@ -1519,7 +1519,7 @@ struct LlamaANETests {
 
     
     @Test func testGrammar() async throws {
-        let lm = try LlamaANE.LanguageModel(model: Llama_3_2_3B_Instruct_uncensored_Int4().model
+        let lm = try LlamaANE.CoreMLLanguageModel(model: Llama_3_2_3B_Instruct_uncensored_Int4().model
 //                                            ,
 //                                            temperature: 1.2,
 //                                            topK: 50,
@@ -1540,7 +1540,7 @@ struct LlamaANETests {
     }
     
     @Test func testGrammar_Sentiment() async throws {
-        let lm = try LlamaANE.LanguageModel(model: Llama_3_2_3B_Instruct_uncensored_Int4().model
+        let lm = try LlamaANE.CoreMLLanguageModel(model: Llama_3_2_3B_Instruct_uncensored_Int4().model
 //                                            ,
 //                                            temperature: 1.2,
 //                                            topK: 50,
@@ -1614,7 +1614,7 @@ struct LlamaANETests {
     }
     
     @Test func testGrammar_ApplyWeightsAndRelevancy() async throws {
-        let lm = try LlamaANE.LanguageModel(model: Llama_3_2_1B_Instruct_Int4().model
+        let lm = try LlamaANE.CoreMLLanguageModel(model: Llama_3_2_1B_Instruct_Int4().model
 //                                            ,
 //                                            temperature: 1.2,
 //                                            topK: 50,
@@ -1798,7 +1798,7 @@ struct LlamaANETests {
     
     @Test func testGrammar_NegativeNumber() async throws {
         try await JSONDecoder().decode(Int.self, from: "-5".data(using: .utf8)!)
-        let lm = try LlamaANE.LanguageModel(model: Llama_3_2_1B_Instruct_Int4().model
+        let lm = try LlamaANE.CoreMLLanguageModel(model: Llama_3_2_1B_Instruct_Int4().model
 //                                            ,
 //                                            temperature: 1.2,
 //                                            topK: 50,
@@ -1827,7 +1827,7 @@ struct LlamaANETests {
     }
     
     @Test func testGrammar_EscapedString() async throws {
-        let lm = try LlamaANE.LanguageModel(model: Llama_3_2_1B_Instruct_Int4().model
+        let lm = try LlamaANE.CoreMLLanguageModel(model: Llama_3_2_1B_Instruct_Int4().model
 //                                            ,
 //                                            temperature: 1.2,
 //                                            topK: 50,
@@ -1845,7 +1845,7 @@ struct LlamaANETests {
     }
 
     @Test func testLlamaTools() async throws {
-        let lm = try LanguageModel(model: Llama_3_2_3B_Instruct_uncensored().model)
+        let lm = try CoreMLLanguageModel(model: Llama_3_2_3B_Instruct_uncensored().model)
         lm.makeSession(systemPrompt: "", tools: MyTools(), temperature: 1.0, topK: 0, topP: 1.0, repetitionPenalty: 1.0, isLogginEnabled: false)
     }
     */ // End of commented-out tests requiring specific model classes

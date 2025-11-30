@@ -117,7 +117,12 @@ public actor Session {
         guard let data = jsonString.data(using: .utf8) else {
             throw LlamaANEError.invalidLogitsOutput
         }
-        return try JSONDecoder().decode(T.self, from: data)
+        do {
+            return try JSONDecoder().decode(T.self, from: data)
+        } catch {
+            print("❌", "JSON Decoding Error for: \(String(data: data, encoding: .utf8) ?? "??")")
+            throw error
+        }
     }
 
     /// Generate response from JSON-encodable input (streaming)
@@ -226,9 +231,9 @@ public actor Session {
             // Flatten tensor for processing
             var mlTensor = MLTensor(logitsValue).cast(to: Float.self).flattened()
 
-            // Apply grammar constraints if active
+            // Apply grammar constraints if active (GPU operation, no await needed)
             if let tracker = grammarTracker {
-                mlTensor = await tracker.applyPenalty(mlTensor)
+                mlTensor = tracker.applyPenalty(mlTensor)
             }
 
             // Apply repetition penalty
@@ -239,13 +244,16 @@ public actor Session {
                 )
             }
 
-            // Token selection
+            // Token selection - GPU-native pipeline
             let nextToken: Int
             if config.generationMode == .greedy {
+                // Greedy: just take argmax (GPU operation)
                 let shaped = await mlTensor.argmax().shapedArray(of: Int32.self)
-                nextToken = Int(shaped.scalars[0])
+                // argmax returns a scalar tensor (shape []), access via .scalar
+                nextToken = Int(shaped.scalar!)
             } else if grammarTracker != nil {
-                // Grammar-constrained sampling: filter out -inf tokens, then sample
+                // Grammar-constrained sampling: filter to valid tokens first, then sample
+                // Must pull to CPU since grammar already applied -inf to invalid tokens
                 let logits = await mlTensor.shapedArray(of: Float.self).scalars
                 let minValidLogit = -Float.greatestFiniteMagnitude / 2
 
@@ -259,80 +267,90 @@ public actor Session {
                 }
 
                 if validIndices.count <= 1 {
-                    // Only one valid token - no choice to make
                     nextToken = validIndices.first ?? 0
                 } else {
-                    // Apply temperature FIRST (before any filtering)
+                    // Apply temperature
                     let temperature = config.temperature
                     if temperature != 1.0 && temperature > 0 {
                         validLogits = validLogits.map { $0 / Float(temperature) }
                     }
 
-                    // Apply topK if configured
+                    // Apply topK if needed (usually few valid tokens so often skipped)
                     let topK = config.topK > 0 ? min(Int(config.topK), validLogits.count) : validLogits.count
                     if topK < validLogits.count {
                         (validIndices, validLogits) = TopKLogitsWarper(k: topK).warp(indices: validIndices, logits: validLogits)
                     }
 
-                    // Apply topP filtering
+                    // Apply topP
                     let topP = config.topP
-                    if topP < 1.0 {
-                        mlTensor = MLTensor(shape: [1, validLogits.count], scalars: validLogits)
-                        var tokenIndices = MLTensor(shape: [1, validLogits.count], scalars: validIndices.map(Int32.init))
-                        (mlTensor, tokenIndices) = await mlTensor.topP(Float16(topP), indices: tokenIndices)
-
-                        // Extract filtered results
-                        validLogits = await mlTensor.shapedArray(of: Float.self).scalars
-                        validIndices = await tokenIndices.shapedArray(of: Int32.self).scalars.map { Int($0) }
-                    }
-
-                    // Sample from the filtered distribution
-                    if validIndices.count == 1 {
-                        nextToken = validIndices[0]
-                    } else {
-                        // Softmax and sample
+                    if topP < 1.0 && validLogits.count > 1 {
+                        // Softmax
                         let maxLogit = validLogits.max() ?? 0
                         let exps = validLogits.map { Foundation.exp($0 - maxLogit) }
                         let expSum = exps.reduce(0, +)
                         let probs = exps.map { $0 / expSum }
-                        nextToken = Math.sample(indexes: validIndices, probs: probs)
+
+                        // Sort by probability descending
+                        var indexed = zip(validIndices, zip(validLogits, probs)).map { ($0, $1.0, $1.1) }
+                        indexed.sort { $0.2 > $1.2 }
+
+                        // Find cutoff
+                        var cumsum: Float = 0
+                        var cutoff = indexed.count
+                        for (i, (_, _, prob)) in indexed.enumerated() {
+                            cumsum += prob
+                            if cumsum > Float(topP) {
+                                cutoff = i + 1
+                                break
+                            }
+                        }
+                        cutoff = max(cutoff, 1)
+
+                        validIndices = indexed.prefix(cutoff).map { $0.0 }
+                        validLogits = indexed.prefix(cutoff).map { $0.1 }
                     }
+
+                    // Sample from filtered distribution
+                    let maxLogit = validLogits.max() ?? 0
+                    let exps = validLogits.map { Foundation.exp($0 - maxLogit) }
+                    let expSum = exps.reduce(0, +)
+                    let probs = exps.map { $0 / expSum }
+                    nextToken = Math.sample(indexes: validIndices, probs: probs)
                 }
             } else {
-                // Standard sampling pipeline using MLTensor:
-                // 1. Temperature scaling
-                // 2. Top-K filtering
-                // 3. Top-P (nucleus) filtering
-                // 4. Softmax to get probabilities
-                // 5. Sample from distribution
-
+                // Standard sampling pipeline using GPU-native operations
                 let temperature = config.temperature
                 let topK = config.topK > 0 ? Int(config.topK) : 40
                 let topP = config.topP
 
-                // Step 1: Apply temperature scaling
+                // Step 1: Temperature scaling (GPU)
                 if temperature != 1.0 && temperature > 0 {
                     mlTensor = mlTensor / Float(temperature)
                 }
 
-                // Step 2: Top-K filtering - keep only the K highest scoring tokens
-                var logits = await mlTensor.shapedArray(of: Float.self).scalars
-                var indices = Array(logits.indices)
-                let actualK = min(topK, logits.count)
-                (indices, logits) = TopKLogitsWarper(k: actualK).warp(indices: indices, logits: logits)
+                // Step 2: Top-K via argsort + gathering (GPU)
+                let sortedIndices = mlTensor.argsort(descendingOrder: true)
+                let topKIndices = sortedIndices[0..<topK]
+                let topKLogits = mlTensor.gathering(atIndices: topKIndices, alongAxis: -1)
 
-                // Create 2D tensors [1, K] for proper axis handling
-                mlTensor = MLTensor(shape: [1, actualK], scalars: logits)
-                var tokenIndices = MLTensor(shape: [1, actualK], scalars: indices.map(Int32.init))
-
-                // Step 3: Top-P (nucleus) filtering
+                // Step 3: Top-P (nucleus) filtering (GPU)
+                var filteredLogits = topKLogits
+                let filteredIndices = topKIndices
                 if topP < 1.0 {
-                    (mlTensor, tokenIndices) = await mlTensor.topP(Float16(topP), indices: tokenIndices)
+                    let probs = topKLogits.softmax(alongAxis: -1)
+                    let cumsum = probs.cumulativeSum(alongAxis: -1)
+                    let excludeMask = cumsum .> Float(topP)
+                    filteredLogits = topKLogits.replacing(
+                        with: MLTensor(repeating: -Float.greatestFiniteMagnitude, shape: topKLogits.shape),
+                        where: excludeMask
+                    )
                 }
 
-                // Step 4 & 5: Softmax and sample
-                let probs = mlTensor.softmax(alongAxis: -1)
-                nextToken = await Math.sample(indexes: tokenIndices, probs: probs)
+                // Step 4: Final softmax (GPU)
+                let finalProbs = filteredLogits.softmax(alongAxis: -1)
+
+                // Step 5: Sample (requires CPU for random selection)
+                nextToken = await Math.sample(indexes: filteredIndices, probs: finalProbs)
             }
 
             outputBuffer.append(nextToken)

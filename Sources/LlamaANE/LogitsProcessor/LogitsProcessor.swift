@@ -138,29 +138,28 @@ extension MLTensor {
             return self
         }
 
-        // Get unique token IDs
+        // Get unique token IDs and vocab size from tensor shape
         let uniqueTokenIds = Array(Set(generatedTokenIds))
-        let vocabSize = await self.shapedArray(of: Float.self).scalarCount
-
-        // Create a penalty mask tensor (1.0 for non-repeated tokens, penalty factor for repeated)
-        // For positive logits: divide by penalty (use 1/penalty)
-        // For negative logits: multiply by penalty
-        // We'll create two masks and apply them based on sign
-
-        var penaltyMask = [Float](repeating: 1.0, count: vocabSize)
         let logitsArray = await self.shapedArray(of: Float.self)
+        let vocabSize = logitsArray.scalarCount
+
+        // Build multiplier array on CPU, apply on GPU
+        // For positive logits at repeated positions: multiply by 1/penalty
+        // For negative logits at repeated positions: multiply by penalty
+        var multipliers = [Float](repeating: 1.0, count: vocabSize)
 
         for tokenId in uniqueTokenIds {
             guard tokenId >= 0 && tokenId < vocabSize else { continue }
             let logit = logitsArray[scalarAt: tokenId]
             if logit > 0 {
-                penaltyMask[tokenId] = 1.0 / penalty
+                multipliers[tokenId] = 1.0 / penalty
             } else if logit < 0 {
-                penaltyMask[tokenId] = penalty
+                multipliers[tokenId] = penalty
             }
         }
 
-        let penaltyTensor = MLTensor(shape: [vocabSize], scalars: penaltyMask)
-        return self * penaltyTensor
+        // Single GPU multiply operation
+        let multiplierTensor = MLTensor(shape: [vocabSize], scalars: multipliers)
+        return self * multiplierTensor
     }
 }

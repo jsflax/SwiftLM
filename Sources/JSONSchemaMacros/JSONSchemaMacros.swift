@@ -236,7 +236,7 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
 
         let propertiesCode = properties.map { prop in
             """
-            ("\(prop.name)", LanguageModel.JSONSchema.Property(type: \(prop.type).jsonSchema["type"] as! String, items: \(prop.type).jsonSchema["items"] as? LanguageModel.JSONSchema.Items, description: ""))
+            ("\(prop.name)", _GrammarJSONSchema.Property(type: \(prop.type).jsonSchema["type"] as! String, items: \(prop.type).jsonSchema["items"] as? _GrammarJSONSchema.Items, description: ""))
             """
         }.joined(separator: ",\n")
 
@@ -255,10 +255,10 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
         // Generate the extension
         return [
             """
-            extension \(raw: targetType): JSONSchemaConvertible {
+            extension \(raw: targetType): _GrammarJSONSchemaConvertible {
                 public static var type: String { "object" }
                 
-                public static var properties: [(String, LanguageModel.JSONSchema.Property)]? {
+                public static var properties: [(String, _GrammarJSONSchema.Property)]? {
                     [\(raw: propertiesCode)]
                 }
                 
@@ -539,7 +539,7 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
         }
 
         var inheritedTypes: [InheritedTypeSyntax] = []
-        inheritedTypes.append(InheritedTypeSyntax(type: TypeSyntax("LanguageModel.JSONSchemaConvertible")))
+        inheritedTypes.append(InheritedTypeSyntax(type: TypeSyntax("_GrammarJSONSchemaConvertible")))
         if declaration is EnumDeclSyntax {
             inheritedTypes.append(InheritedTypeSyntax(type: TypeSyntax(", CaseIterable")))
         }
@@ -559,7 +559,7 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
                     let constraints = member.guideConstraints.joined(separator: ", ")
                     args += ", constraints: [\(constraints)]"
                 }
-                return "LanguageModel.SchemaProperty(\(args))"
+                return "_GrammarSchemaProperty(\(args))"
             }.joined(separator: ",\n                        ")
 
             // JSONSchemaConvertible extension
@@ -571,7 +571,7 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
                     public static var type: String {
                         "object"
                     }
-                    public static var schemaProperties: [LanguageModel.SchemaProperty]? {
+                    public static var schemaProperties: [_GrammarSchemaProperty]? {
                         [\(raw: schemaPropertiesCode)]
                     }
                     public static var jsonSchema: [String: Any] {
@@ -582,10 +582,10 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
                             ]
                         ]
                     }
-                    public static var properties: [(String, LanguageModel.JSONSchema.Property)]? {
+                    public static var properties: [(String, _GrammarJSONSchema.Property)]? {
                         [\(raw: qualifiedMembers.map {
                             """
-                            ("\($0.name)", LanguageModel.JSONSchema.Property(type: \($0.type).type, items: \($0.type).items, description: ""))
+                            ("\($0.name)", _GrammarJSONSchema.Property(type: \($0.type).type, items: \($0.type).items, description: ""))
                             """
                         }.joined(separator: ","))]
                     }
@@ -616,7 +616,7 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
                         }
                     }
 
-                    public static var properties: [(String, LanguageModel.JSONSchema.Property)]? {
+                    public static var properties: [(String, _GrammarJSONSchema.Property)]? {
                         nil
                     }
                 }
@@ -714,7 +714,7 @@ struct JSONSchemaBridgeMacro: ExtensionMacro {
         // Generate the properties array code
         let propertiesCode = properties.map { prop in
             """
-            ("\(prop.name)", JSONSchema.Property(type: \(prop.type).jsonSchema["type"] as! String, items: \(prop.type).jsonSchema["items"] as? JSONSchema.Items, description: ""))
+            ("\(prop.name)", _GrammarJSONSchema.Property(type: \(prop.type).jsonSchema["type"] as! String, items: \(prop.type).jsonSchema["items"] as? _GrammarJSONSchema.Items, description: ""))
             """
         }.joined(separator: ",\n            ")
 
@@ -740,7 +740,7 @@ struct JSONSchemaBridgeMacro: ExtensionMacro {
         // Generate the extension on the TARGET type (not the marker struct)
         let extensionDecl = try ExtensionDeclSyntax(
             """
-            extension \(raw: targetType): JSONSchemaConvertible {
+            extension \(raw: targetType): _GrammarJSONSchemaConvertible {
                 public static var type: String { "object" }
 
                 public static var properties: [(String, JSONSchema.Property)]? {

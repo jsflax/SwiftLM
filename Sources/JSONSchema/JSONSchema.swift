@@ -31,6 +31,16 @@ public enum GuideConstraint: Sendable, Equatable {
 /// The LLM won't generate a value - the default will be used instead
 /// Similar to Apple's GenerationID
 public struct GenerationID: Codable, Sendable, Hashable, JSONSchemaConvertible {
+    @available(macOS 26.0, *)
+    public static var generationSchema: GenerationSchema {
+        .init(type: String.self, properties: [])
+    }
+    
+    @available(macOS 26.0, *)
+    public init(_ content: GeneratedContent) throws {
+        fatalError()
+    }
+    
     public let value: String
 
     public init() {
@@ -325,7 +335,16 @@ public protocol JSONSchemaConvertible: Codable {
     /// Decode from a keyed container
     static func decode<K: CodingKey>(from container: KeyedDecodingContainer<K>,
                                      forKey key: K) throws -> Self
+    
+    @available(iOS 26.0, macOS 26.0, *)
+    static var generationSchema: FoundationModels.GenerationSchema { get }
+    @available(iOS 26.0, macOS 26.0, *)
+    init(_ content: FoundationModels.GeneratedContent) throws
 }
+
+public typealias _GrammarJSONSchemaConvertible = JSONSchemaConvertible
+public typealias _GrammarJSONSchema = JSONSchema
+public typealias _GrammarSchemaProperty = SchemaProperty
 
 extension RawRepresentable where Self : CaseIterable, RawValue : JSONSchemaConvertible, Self: Codable {
     public static var type: String {
@@ -445,6 +464,16 @@ extension String : JSONSchemaConvertible {
     }
 }
 extension UUID : JSONSchemaConvertible {
+    @available(macOS 26.0, *)
+    public static var generationSchema: GenerationSchema {
+        .init(type: String.self, properties: [])
+    }
+    
+    @available(macOS 26.0, *)
+    public init(_ content: GeneratedContent) throws {
+        fatalError()
+    }
+    
     public init(from json: Any) throws {
         guard let json = json as? String else {
             throw JSONDecodingError.invalidType
@@ -467,6 +496,16 @@ extension UUID : JSONSchemaConvertible {
     }
 }
 extension URL : JSONSchemaConvertible {
+    @available(macOS 26.0, *)
+    public static var generationSchema: GenerationSchema {
+        .init(type: String.self, properties: [])
+    }
+    
+    @available(macOS 26.0, *)
+    public init(_ content: GeneratedContent) throws {
+        fatalError()
+    }
+    
     public init(from json: Any) throws {
         guard let json = json as? String else {
             throw JSONDecodingError.invalidType
@@ -686,6 +725,16 @@ extension Array : JSONSchemaConvertible where Element : JSONSchemaConvertible {
             "items": Element.jsonSchema
         ]
     }
+    
+    @available(macOS 26.0, *)
+    public static var generationSchema: GenerationSchema {
+        fatalError()
+    }
+    
+    @available(macOS 26.0, *)
+    public init(_ content: GeneratedContent) throws {
+        fatalError()
+    }
 }
 
 // MARK: - Dictionary Support
@@ -735,6 +784,18 @@ extension Dictionary: JSONSchemaConvertible where Key: JSONSchemaKey, Value: JSO
 
     /// The value type for dictionary entries
     public static var valueType: (any JSONSchemaConvertible.Type)? { Value.self }
+    
+    
+    @available(macOS 26.0, *)
+    public static var generationSchema: GenerationSchema {
+        fatalError()
+    }
+    
+    @available(macOS 26.0, *)
+    public init(_ content: GeneratedContent) throws {
+        fatalError()
+    }
+    
 }
 
 extension Optional : JSONSchemaConvertible where Wrapped : JSONSchemaConvertible {
@@ -753,6 +814,17 @@ extension Optional : JSONSchemaConvertible where Wrapped : JSONSchemaConvertible
     }
     public static var schemaProperties: [SchemaProperty]? { Wrapped.schemaProperties }
     public static var elementType: (any JSONSchemaConvertible.Type)? { Wrapped.elementType }
+    
+    
+    @available(macOS 26.0, *)
+    public static var generationSchema: GenerationSchema {
+        fatalError()
+    }
+    
+    @available(macOS 26.0, *)
+    public init(_ content: GeneratedContent) throws {
+        fatalError()
+    }
 }
 
 #if canImport(MapKit)
@@ -1159,3 +1231,15 @@ extension Dictionary: Generable where Key: RawRepresentable & CaseIterable, Key.
         return GenerationSchema(type: Self.self, properties: properties)
     }
 }
+
+#if canImport(OpenAI)
+import protocol OpenAI.JSONSchemaConvertible
+
+extension _OpenAI {
+    public typealias JSONSchemaConvertible = OpenAI.JSONSchemaConvertible
+}
+
+public typealias OpenAIJSONSchemaConvertible = _OpenAI.JSONSchemaConvertible
+#else
+@_marker protocol OpenAIJSONSchemaConvertible {}
+#endif

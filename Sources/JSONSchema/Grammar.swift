@@ -98,3 +98,10 @@ public class SchemaConverter {
         return rules.map { (name, rule) in "\(name) ::= \(rule)" }.joined(separator: "\n") + "\n"
     }
 }
+
+
+#if canImport(OpenAI)
+import class OpenAI.OpenAI
+
+public typealias _OpenAI = OpenAI
+#endif

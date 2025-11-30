@@ -349,3 +349,9 @@ extension Test.Clock.Instant {
 #endif
   }
 }
+
+func measure(_ block: () async throws -> Void) async throws -> Duration {
+    try await Test.Clock().measure {
+        try await block()
+    }
+}

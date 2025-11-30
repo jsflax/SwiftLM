@@ -92,6 +92,10 @@ private struct TokenCategories: Sendable {
                 let beforeQuote = String(token.dropLast())
                 if beforeQuote.contains(where: { "{}[],".contains($0) }) {
                     isSafeForString = false
+                } else if beforeQuote.contains("\"") {
+                    // Exclude tokens with quote before the final quote (like `""` or `word""`)
+                    // These would result in an extra quote in the output
+                    isSafeForString = false
                 } else {
                     // Safe - this is how strings end naturally (like `word"`)
                     isSafeForString = true
@@ -164,8 +168,8 @@ private enum JSONGenState: @unchecked Sendable {
     case expectingValueStart(valueType: any JSONSchemaConvertible.Type)    // Want value opening based on type
     case inStringValue(charCount: Int, maxLength: Int)  // Generating string content with max length
     case inEnumValue(validValues: [String], currentValue: String)  // Generating enum value (constrained string)
-    case inIntegerValue(hasDigit: Bool)          // Generating integer
-    case inNumberValue(hasDigit: Bool, hasDecimal: Bool) // Generating number
+    case inIntegerValue(hasDigit: Bool, digitCount: Int)          // Generating integer with digit tracking
+    case inNumberValue(hasDigit: Bool, hasDecimal: Bool, digitCount: Int) // Generating number with digit tracking
     case inBooleanValue(partial: String)         // Generating boolean
     case expectingCommaOrEnd(hasMoreFields: Bool) // Want , or }
     case expectingCloseBrace                     // Want }
@@ -195,6 +199,7 @@ struct JSONSchemaStateTracker: Sendable {
     private let schema: JSONSchemaConvertible.Type
     private let tokenizer: Tokenizer
     private let categories: TokenCategories
+    private let vocabSize: Int
     private var state: JSONGenState = .expectingObjectStart
     private var fields: [SchemaProperty] = []
     private var currentFieldIndex: Int = 0
@@ -214,6 +219,11 @@ struct JSONSchemaStateTracker: Sendable {
     // This can be overridden per-field using @SchemaGuide(.maxLength(n))
     private let defaultMaxStringLength: Int = 200
 
+    // Max number of digits for numeric values (prevents infinite digit loops)
+    // 15 digits covers: latitude/longitude (~10 decimals), large integers, reasonable floats
+    // For coordinates like 35.7756661, this allows plenty of precision
+    private let maxNumberDigits: Int = 15
+
     /// Get the max string length for the current field, using constraint if available
     private var currentMaxStringLength: Int {
         currentField?.maxLength ?? defaultMaxStringLength
@@ -228,6 +238,7 @@ struct JSONSchemaStateTracker: Sendable {
         self.schema = schema
         self.tokenizer = tokenizer
         self.categories = TokenCategories(tokenizer: tokenizer)
+        self.vocabSize = tokenizer.tokensToIds.count
 
         // Extract fields from schema using new schemaProperties
         if let properties = schema.schemaProperties {
@@ -248,17 +259,13 @@ struct JSONSchemaStateTracker: Sendable {
 
     // MARK: - Token Filtering
 
-    func applyPenalty(_ tensor: MLTensor) async -> MLTensor {
+    func applyPenalty(_ tensor: MLTensor) -> MLTensor {
         let validTokens = getValidTokens()
 
         if Self.debugEnabled {
             let validTokenStrs = validTokens.compactMap { tokenizer.idsToTokens[$0] }.prefix(10)
             debugLog("State: \(state) -> Valid tokens (\(validTokens.count)): \(validTokenStrs)...")
         }
-
-        // Get shaped array once - avoid double await
-        let xShaped = await tensor.shapedArray(of: Float.self)
-        let vocabSize = xShaped.scalarCount
 
         // Optimization: if only one valid token, create minimal tensor
         if validTokens.count == 1, let validToken = validTokens.first {
@@ -267,19 +274,9 @@ struct JSONSchemaStateTracker: Sendable {
             return MLTensor(shaped)
         }
 
-        // Optimization: if valid tokens > 50% of vocab, penalize invalid instead
-        // Otherwise, build list of disallowed indices
-        let disallowedIndices: [Int32]
-        if validTokens.count > vocabSize / 2 {
-            // Fewer invalid tokens - iterate valid set
-            disallowedIndices = (0..<vocabSize).compactMap { idx in
-                validTokens.contains(idx) ? nil : Int32(idx)
-            }
-        } else {
-            // Fewer valid tokens - iterate vocab range
-            disallowedIndices = (0..<vocabSize).compactMap { idx in
-                validTokens.contains(idx) ? nil : Int32(idx)
-            }
+        // Build list of disallowed indices (all tokens not in validTokens)
+        let disallowedIndices: [Int32] = (0..<vocabSize).compactMap { idx in
+            validTokens.contains(idx) ? nil : Int32(idx)
         }
 
         return tensor.replacing(
@@ -431,7 +428,15 @@ struct JSONSchemaStateTracker: Sendable {
                 return valid
             }
 
-        case .inIntegerValue:
+        case .inIntegerValue(_, let digitCount):
+            // If we've reached max digits, only allow terminators (comma, close brace)
+            if digitCount >= maxNumberDigits {
+                var valid = categories.commaOnly
+                if isLastFieldInCurrentContext {
+                    valid.insert(categories.closeBrace)
+                }
+                return valid
+            }
             // Allow digits, comma to continue, and close brace only if last field
             var valid = categories.digitsWithComma
             valid.insert(categories.comma)
@@ -441,7 +446,15 @@ struct JSONSchemaStateTracker: Sendable {
             }
             return valid
 
-        case .inNumberValue(_, let hasDecimal):
+        case .inNumberValue(_, let hasDecimal, let digitCount):
+            // If we've reached max digits, only allow terminators (comma, close brace)
+            if digitCount >= maxNumberDigits {
+                var valid = categories.commaOnly
+                if isLastFieldInCurrentContext {
+                    valid.insert(categories.closeBrace)
+                }
+                return valid
+            }
             var valid = categories.digitsWithComma
             valid.insert(categories.comma)
             // Only allow close brace if this is the last field
@@ -679,7 +692,8 @@ struct JSONSchemaStateTracker: Sendable {
                     }
                 }
             case "integer":
-                state = .inIntegerValue(hasDigit: tokenStr.contains(where: { $0.isNumber }))
+                let digitCount = tokenStr.filter { $0.isNumber }.count
+                state = .inIntegerValue(hasDigit: digitCount > 0, digitCount: digitCount)
                 // Check if this token ends the value
                 if tokenStr.hasSuffix(",") || tokenStr == "," {
                     advanceToNextField(consumedComma: true)
@@ -688,7 +702,8 @@ struct JSONSchemaStateTracker: Sendable {
                 }
             case "number":
                 let hasDecimal = tokenStr.contains(".")
-                state = .inNumberValue(hasDigit: tokenStr.contains(where: { $0.isNumber }), hasDecimal: hasDecimal)
+                let digitCount = tokenStr.filter { $0.isNumber }.count
+                state = .inNumberValue(hasDigit: digitCount > 0, hasDecimal: hasDecimal, digitCount: digitCount)
                 if tokenStr.hasSuffix(",") || tokenStr == "," {
                     advanceToNextField(consumedComma: true)
                 } else if tokenStr == "}" {
@@ -803,17 +818,7 @@ struct JSONSchemaStateTracker: Sendable {
                 state = .inEnumValue(validValues: validValues, currentValue: newValue)
             }
 
-        case .inIntegerValue:
-            if tokenStr == "," {
-                advanceToNextField(consumedComma: true)
-            } else if tokenStr == "}" {
-                finishCurrentObject()
-            } else if tokenStr.hasSuffix(",") {
-                advanceToNextField(consumedComma: true)
-            }
-            // Otherwise stay in integer state
-
-        case .inNumberValue(let hasDigit, let hasDecimal):
+        case .inIntegerValue(_, let digitCount):
             if tokenStr == "," {
                 advanceToNextField(consumedComma: true)
             } else if tokenStr == "}" {
@@ -821,9 +826,23 @@ struct JSONSchemaStateTracker: Sendable {
             } else if tokenStr.hasSuffix(",") {
                 advanceToNextField(consumedComma: true)
             } else {
-                // Update decimal tracking
+                // Update digit count
+                let newDigits = tokenStr.filter { $0.isNumber }.count
+                state = .inIntegerValue(hasDigit: true, digitCount: digitCount + newDigits)
+            }
+
+        case .inNumberValue(_, let hasDecimal, let digitCount):
+            if tokenStr == "," {
+                advanceToNextField(consumedComma: true)
+            } else if tokenStr == "}" {
+                finishCurrentObject()
+            } else if tokenStr.hasSuffix(",") {
+                advanceToNextField(consumedComma: true)
+            } else {
+                // Update decimal and digit tracking
                 let newHasDecimal = hasDecimal || tokenStr.contains(".")
-                state = .inNumberValue(hasDigit: true, hasDecimal: newHasDecimal)
+                let newDigits = tokenStr.filter { $0.isNumber }.count
+                state = .inNumberValue(hasDigit: true, hasDecimal: newHasDecimal, digitCount: digitCount + newDigits)
             }
 
         case .inBooleanValue(let partial):
@@ -892,10 +911,11 @@ struct JSONSchemaStateTracker: Sendable {
                 currentArrayMinCount = minCount
                 currentArrayMaxCount = maxCount
                 currentArrayElementType = elementType
+                let digitCount = tokenStr.filter { $0.isNumber }.count
                 if typeName == "integer" {
-                    state = .inIntegerValue(hasDigit: tokenStr.contains(where: { $0.isNumber }))
+                    state = .inIntegerValue(hasDigit: digitCount > 0, digitCount: digitCount)
                 } else {
-                    state = .inNumberValue(hasDigit: tokenStr.contains(where: { $0.isNumber }), hasDecimal: tokenStr.contains("."))
+                    state = .inNumberValue(hasDigit: digitCount > 0, hasDecimal: tokenStr.contains("."), digitCount: digitCount)
                 }
             }
 
@@ -927,10 +947,11 @@ struct JSONSchemaStateTracker: Sendable {
                 currentArrayMinCount = minCount
                 currentArrayMaxCount = maxCount
                 currentArrayElementType = elementType
+                let digitCount = tokenStr.filter { $0.isNumber }.count
                 if typeName == "integer" {
-                    state = .inIntegerValue(hasDigit: tokenStr.contains(where: { $0.isNumber }))
+                    state = .inIntegerValue(hasDigit: digitCount > 0, digitCount: digitCount)
                 } else {
-                    state = .inNumberValue(hasDigit: tokenStr.contains(where: { $0.isNumber }), hasDecimal: tokenStr.contains("."))
+                    state = .inNumberValue(hasDigit: digitCount > 0, hasDecimal: tokenStr.contains("."), digitCount: digitCount)
                 }
             }
 
