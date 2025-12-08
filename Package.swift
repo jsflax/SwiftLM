@@ -5,7 +5,7 @@ import PackageDescription
 import CompilerPluginSupport
 
 let package = Package(
-    name: "LlamaANE",
+    name: "SwiftLM",
     platforms: [
         .macOS(.v15),
         .iOS(.v18),
@@ -15,15 +15,16 @@ let package = Package(
     products: [
         // Products define the executables and libraries a package produces, making them visible to other packages.
         .library(
-            name: "LlamaANE",
-            targets: ["LlamaANE"]),
+            name: "SwiftLM",
+            targets: ["SwiftLM"]),
         .executable(
-            name: "LlamaANEMain",
+            name: "swift-lm",
             targets: ["Main"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-syntax.git", branch: "main"),
-        .package(path: "../swift-transformers")
+        .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
+        .package(url: "https://github.com/jsflax/swift-transformers.git", branch: "main")
     ],
     targets: [
         .macro(
@@ -54,7 +55,7 @@ let package = Package(
 //            path: "JSONSchema"
         ),
         .target(
-            name: "LlamaANE",
+            name: "SwiftLM",
             dependencies: [
                 .product(name: "Transformers", package: "swift-transformers"),
                 "JSONSchema",
@@ -64,15 +65,19 @@ let package = Package(
             cSettings: [.define("ACCELERATE_NEW_LAPACK")],
             linkerSettings: [.linkedFramework("Accelerate")]),
         .testTarget(
-            name: "LlamaANETests",
-            dependencies: ["LlamaANE"],
+            name: "SwiftLMTests",
+            dependencies: ["SwiftLM"],
             linkerSettings: [
                 .linkedFramework("XCTest"),
                 .linkedFramework("Testing")]
         ),
         .executableTarget(
             name: "Main",
-            dependencies: ["LlamaANE"]
+            dependencies: [
+                "SwiftLM",
+                .product(name: "ArgumentParser", package: "swift-argument-parser")
+            ],
+            resources: [.copy("Resources/swiftlm-export")]
         ),
     ]
 )
