@@ -31,12 +31,12 @@ public enum GuideConstraint: Sendable, Equatable {
 /// The LLM won't generate a value - the default will be used instead
 /// Similar to Apple's GenerationID
 public struct GenerationID: Codable, Sendable, Hashable, JSONSchemaConvertible {
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     public static var generationSchema: GenerationSchema {
         .init(type: String.self, properties: [])
     }
     
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     public init(_ content: GeneratedContent) throws {
         fatalError()
     }
@@ -54,7 +54,7 @@ public struct GenerationID: Codable, Sendable, Hashable, JSONSchemaConvertible {
     // JSONSchemaConvertible conformance - but marked as skip
     public static var type: String { "string" }
     public static var shouldSkipGeneration: Bool { true }
-    public static var properties: [(String, JSONSchema.Property)]? { nil }
+    public static var _swiftLMJsonSchemaProperties: [(String, JSONSchema.Property)]? { nil }
     public static var jsonSchema: [String: Any] { ["type": "string"] }
 
     public init(from json: Any) throws {
@@ -327,7 +327,7 @@ public protocol JSONSchemaConvertible: Codable {
     static var jsonSchema: [String: Any] { get }
 
     /// Legacy properties (for compatibility, will be deprecated)
-    static var properties: [(String, JSONSchema.Property)]? { get }
+    static var _swiftLMJsonSchemaProperties: [(String, JSONSchema.Property)]? { get }
 
     /// Initialize from a JSON value
     init(from json: Any) throws
@@ -350,7 +350,7 @@ extension RawRepresentable where Self : CaseIterable, RawValue : JSONSchemaConve
     public static var type: String {
         RawValue.type
     }
-    public static var properties: [String: JSONSchema.Property]? { nil }
+    public static var _swiftLMJsonSchemaProperties: [String: JSONSchema.Property]? { nil }
     public init(from json: Any) throws {
         guard let json = json as? RawValue else {
             throw JSONDecodingError.invalidType
@@ -452,7 +452,7 @@ extension String : JSONSchemaConvertible {
         self = json
     }
     
-    public static var properties: [(String, JSONSchema.Property)]? {
+    public static var _swiftLMJsonSchemaProperties: [(String, JSONSchema.Property)]? {
         nil
     }
     
@@ -464,12 +464,12 @@ extension String : JSONSchemaConvertible {
     }
 }
 extension UUID : JSONSchemaConvertible {
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     public static var generationSchema: GenerationSchema {
         .init(type: String.self, properties: [])
     }
     
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     public init(_ content: GeneratedContent) throws {
         fatalError()
     }
@@ -484,7 +484,7 @@ extension UUID : JSONSchemaConvertible {
         self = json
     }
     
-    public static var properties: [(String, JSONSchema.Property)]? {
+    public static var _swiftLMJsonSchemaProperties: [(String, JSONSchema.Property)]? {
         nil
     }
     
@@ -496,16 +496,6 @@ extension UUID : JSONSchemaConvertible {
     }
 }
 extension URL : JSONSchemaConvertible {
-    @available(macOS 26.0, *)
-    public static var generationSchema: GenerationSchema {
-        .init(type: String.self, properties: [])
-    }
-    
-    @available(macOS 26.0, *)
-    public init(_ content: GeneratedContent) throws {
-        fatalError()
-    }
-    
     public init(from json: Any) throws {
         guard let json = json as? String else {
             throw JSONDecodingError.invalidType
@@ -516,7 +506,7 @@ extension URL : JSONSchemaConvertible {
         self = json
     }
     
-    public static var properties: [(String, JSONSchema.Property)]? {
+    public static var _swiftLMJsonSchemaProperties: [(String, JSONSchema.Property)]? {
         nil
     }
     
@@ -534,7 +524,7 @@ extension Int : JSONSchemaConvertible {
         }
         self = json
     }
-    public static var properties: [(String, JSONSchema.Property)]? {
+    public static var _swiftLMJsonSchemaProperties: [(String, JSONSchema.Property)]? {
         nil
     }
 
@@ -558,7 +548,7 @@ extension Double : JSONSchemaConvertible {
         throw JSONDecodingError.invalidType
         
     }
-    public static var properties: [(String, JSONSchema.Property)]? {
+    public static var _swiftLMJsonSchemaProperties: [(String, JSONSchema.Property)]? {
         nil
     }
     
@@ -584,7 +574,7 @@ extension Float : JSONSchemaConvertible {
         throw JSONDecodingError.invalidType
         
     }
-    public static var properties: [(String, JSONSchema.Property)]? {
+    public static var _swiftLMJsonSchemaProperties: [(String, JSONSchema.Property)]? {
         nil
     }
     
@@ -604,7 +594,7 @@ extension Bool : JSONSchemaConvertible {
         }
         self = json
     }
-    public static var properties: [(String, JSONSchema.Property)]? {
+    public static var _swiftLMJsonSchemaProperties: [(String, JSONSchema.Property)]? {
         nil
     }
     
@@ -628,7 +618,7 @@ extension Date : JSONSchemaConvertible {
         }
         self = json
     }
-    public static var properties: [(String, JSONSchema.Property)]? { nil }
+    public static var _swiftLMJsonSchemaProperties: [(String, JSONSchema.Property)]? { nil }
     public static var type: String { "string" }
 
     public static var jsonSchema: [String: Any] {
@@ -671,7 +661,7 @@ extension DateInterval: JSONSchemaConvertible {
         ]
     }
 
-    public static var properties: [(String, JSONSchema.Property)]? {
+    public static var _swiftLMJsonSchemaProperties: [(String, JSONSchema.Property)]? {
         [
             ("start", JSONSchema.Property(type: "string", items: nil, description: "Start date")),
             ("end", JSONSchema.Property(type: "string", items: nil, description: "End date"))
@@ -714,11 +704,11 @@ extension Array : JSONSchemaConvertible where Element : JSONSchemaConvertible {
 
     // Legacy
     public static var items: JSONSchema.Items? {
-        JSONSchema.Items(type: Element.type, enum: Element.enum, properties: Element.properties?.reduce(into: [:], {
+        JSONSchema.Items(type: Element.type, enum: Element.enum, properties: Element._swiftLMJsonSchemaProperties?.reduce(into: [:], {
             $0[$1.0] = $1.1
         }))
     }
-    public static var properties: [(String, JSONSchema.Property)]? { nil }
+    public static var _swiftLMJsonSchemaProperties: [(String, JSONSchema.Property)]? { nil }
     public static var jsonSchema: [String : Any] {
         [
             "type": "array",
@@ -726,12 +716,12 @@ extension Array : JSONSchemaConvertible where Element : JSONSchemaConvertible {
         ]
     }
     
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     public static var generationSchema: GenerationSchema {
         fatalError()
     }
     
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     public init(_ content: GeneratedContent) throws {
         fatalError()
     }
@@ -773,7 +763,7 @@ extension Dictionary: JSONSchemaConvertible where Key: JSONSchemaKey, Value: JSO
     /// For dictionaries, we don't have fixed properties - it's a dynamic object
     public static var schemaProperties: [SchemaProperty]? { nil }
 
-    public static var properties: [(String, JSONSchema.Property)]? { nil }
+    public static var _swiftLMJsonSchemaProperties: [(String, JSONSchema.Property)]? { nil }
 
     public static var jsonSchema: [String: Any] {
         [
@@ -786,12 +776,12 @@ extension Dictionary: JSONSchemaConvertible where Key: JSONSchemaKey, Value: JSO
     public static var valueType: (any JSONSchemaConvertible.Type)? { Value.self }
     
     
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     public static var generationSchema: GenerationSchema {
         fatalError()
     }
     
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     public init(_ content: GeneratedContent) throws {
         fatalError()
     }
@@ -808,7 +798,7 @@ extension Optional : JSONSchemaConvertible where Wrapped : JSONSchemaConvertible
     }
 
     public static var type: String { Wrapped.type }
-    public static var properties: [(String, JSONSchema.Property)]? { Wrapped.properties }
+    public static var _swiftLMJsonSchemaProperties: [(String, JSONSchema.Property)]? { Wrapped._swiftLMJsonSchemaProperties }
     public static var jsonSchema: [String : Any] {
         Wrapped.jsonSchema
     }
@@ -816,12 +806,12 @@ extension Optional : JSONSchemaConvertible where Wrapped : JSONSchemaConvertible
     public static var elementType: (any JSONSchemaConvertible.Type)? { Wrapped.elementType }
     
     
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     public static var generationSchema: GenerationSchema {
         fatalError()
     }
     
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     public init(_ content: GeneratedContent) throws {
         fatalError()
     }
@@ -841,7 +831,7 @@ extension CLLocationCoordinate2D: JSONSchemaConvertible {
         ]
     }
 
-    public static var properties: [(String, JSONSchema.Property)]? {
+    public static var _swiftLMJsonSchemaProperties: [(String, JSONSchema.Property)]? {
         [
             ("latitude", JSONSchema.Property(type: "number", items: nil, description: "Latitude in degrees")),
             ("longitude", JSONSchema.Property(type: "number", items: nil, description: "Longitude in degrees"))
@@ -901,7 +891,7 @@ extension MKCoordinateSpan: JSONSchemaConvertible {
         ]
     }
 
-    public static var properties: [(String, JSONSchema.Property)]? {
+    public static var _swiftLMJsonSchemaProperties: [(String, JSONSchema.Property)]? {
         [
             ("latitudeDelta", JSONSchema.Property(type: "number", items: nil, description: "Latitude span in degrees")),
             ("longitudeDelta", JSONSchema.Property(type: "number", items: nil, description: "Longitude span in degrees"))
@@ -961,7 +951,7 @@ extension MKCoordinateRegion: JSONSchemaConvertible {
         ]
     }
 
-    public static var properties: [(String, JSONSchema.Property)]? {
+    public static var _swiftLMJsonSchemaProperties: [(String, JSONSchema.Property)]? {
         [
             ("center", JSONSchema.Property(type: "object", items: nil, description: "Center coordinate of the region")),
             ("span", JSONSchema.Property(type: "object", items: nil, description: "Span of the region in degrees"))
@@ -1011,6 +1001,71 @@ extension MKCoordinateRegion: JSONSchemaConvertible {
     }
 }
 
+extension MKPointOfInterestCategory: @retroactive CaseIterable {
+    public static var allCases: [MKPointOfInterestCategory] {
+        var cases: [MKPointOfInterestCategory] = [
+            // macOS 10.15+
+            .airport, .amusementPark, .aquarium, .atm, .bakery, .bank, .beach,
+            .brewery, .cafe, .campground, .carRental, .evCharger, .fireStation,
+            .fitnessCenter, .foodMarket, .gasStation, .hospital, .hotel,
+            .laundry, .library, .marina, .movieTheater, .museum, .nationalPark,
+            .nightlife, .park, .parking, .pharmacy, .police, .postOffice,
+            .publicTransport, .restaurant, .restroom, .school, .stadium, .store,
+            .theater, .university, .winery, .zoo
+        ]
+        // macOS 15.0+ categories
+        if #available(macOS 15.0, iOS 18.0, *) {
+            cases.append(contentsOf: [
+                .animalService, .automotiveRepair, .baseball, .basketball, .beauty,
+                .bowling, .castle, .conventionCenter, .distillery, .fairground,
+                .fishing, .fortress, .golf, .goKart, .hiking, .kayaking, .landmark,
+                .mailbox, .miniGolf, .musicVenue, .nationalMonument, .planetarium,
+                .rockClimbing, .rvPark, .skatePark, .skating, .skiing, .soccer,
+                .spa, .surfing, .swimming, .tennis, .volleyball
+            ])
+        }
+        return cases
+    }
+    
+    public var description: String {
+        // rawValue is prefixed with MKPOICategory, so find the index of the y and split the string
+        guard let firstIndex = self.rawValue.firstIndex(of: "y") else {
+            return self.rawValue
+        }
+        return String(self.rawValue[self.rawValue.index(after: firstIndex)..<self.rawValue.endIndex])
+    }
+}
+
+extension MKPointOfInterestCategory: @retroactive Decodable {
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        let rawValue = try container.decode(String.self)
+        self = MKPointOfInterestCategory(rawValue: rawValue)
+    }
+}
+
+extension MKPointOfInterestCategory: @retroactive Encodable, CustomReflectable {
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.singleValueContainer()
+        try container.encode(self.rawValue)
+    }
+    
+    public var customMirror: Mirror {
+        Mirror(self, children: [], displayStyle: .enum)
+    }
+}
+extension MKPointOfInterestCategory: JSONSchemaKey {}
+
+#if canImport(OpenAI)
+import protocol OpenAI.JSONSchemaEnumConvertible
+
+extension MKPointOfInterestCategory: @retroactive OpenAI.JSONSchemaEnumConvertible {
+    public var caseNames: [String] {
+        Self.allCases.map(\.rawValue)
+    }
+}
+
+#endif
 // MARK: - FoundationModels Generable Support
 #if canImport(FoundationModels)
 import FoundationModels
@@ -1113,6 +1168,22 @@ extension Date: Generable {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd"
         return GeneratedContent(formatter.string(from: self))
+    }
+}
+
+@available(iOS 26.0, macOS 26.0, *)
+extension URL: Generable {
+    public static var generationSchema: GenerationSchema {
+        // Date is represented as a string in ISO format
+        GenerationSchema(type: Self.self, properties: [])
+    }
+
+    public init(_ content: GeneratedContent) throws {
+        self = URL(string: try content.value())!
+    }
+
+    public var generatedContent: GeneratedContent {
+        return GeneratedContent(self.path())
     }
 }
 

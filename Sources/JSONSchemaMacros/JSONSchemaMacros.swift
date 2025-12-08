@@ -263,7 +263,7 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
             extension \(raw: targetType): _GrammarJSONSchemaConvertible {
                 public static var type: String { "object" }
                 
-                public static var properties: [(String, _GrammarJSONSchema.Property)]? {
+                public static var _swiftLMJsonSchemaProperties: [(String, _GrammarJSONSchema.Property)]? {
                     [\(raw: propertiesCode)]
                 }
                 
@@ -434,12 +434,14 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
                 \(raw: qualifiedMembers.map { member -> String in
                     if member.shouldSkip {
                         // Skipped properties: decode if present, otherwise use default
+                        // For optional types, strip the ? since decodeIfPresent already returns Optional
+                        let decodeType = member.isOptional ? String(member.type.dropLast()) : member.type
                         if let assignment = member.assignment {
-                            return "self.\(member.name) = try container.decodeIfPresent(\(member.type).self, forKey: .\(member.name)) ?? \(assignment)"
+                            return "self.\(member.name) = try container.decodeIfPresent(\(decodeType).self, forKey: .\(member.name)) ?? \(assignment)"
                         } else if member.isOptional {
-                            return "self.\(member.name) = try container.decodeIfPresent(\(member.type).self, forKey: .\(member.name))"
+                            return "self.\(member.name) = try container.decodeIfPresent(\(decodeType).self, forKey: .\(member.name))"
                         } else {
-                            return "self.\(member.name) = try container.decodeIfPresent(\(member.type).self, forKey: .\(member.name)) ?? \(member.type)()"
+                            return "self.\(member.name) = try container.decodeIfPresent(\(decodeType).self, forKey: .\(member.name)) ?? \(member.type)()"
                         }
                     } else {
                         return "self.\(member.name) = try \(member.type).decode(from: container, forKey: .\(member.name))"
@@ -624,7 +626,7 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
                             ]
                         ]
                     }
-                    public static var properties: [(String, _GrammarJSONSchema.Property)]? {
+                    public static var _swiftLMJsonSchemaProperties: [(String, _GrammarJSONSchema.Property)]? {
                         [\(raw: generatableMembers.map {
                             """
                             ("\($0.name)", _GrammarJSONSchema.Property(type: \($0.type).type, items: \($0.type).items, description: ""))
@@ -658,7 +660,7 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
                         }
                     }
 
-                    public static var properties: [(String, _GrammarJSONSchema.Property)]? {
+                    public static var _swiftLMJsonSchemaProperties: [(String, _GrammarJSONSchema.Property)]? {
                         nil
                     }
                 }
@@ -785,7 +787,7 @@ struct JSONSchemaBridgeMacro: ExtensionMacro {
             extension \(raw: targetType): _GrammarJSONSchemaConvertible {
                 public static var type: String { "object" }
 
-                public static var properties: [(String, JSONSchema.Property)]? {
+                public static var _swiftLMJsonSchemaProperties: [(String, JSONSchema.Property)]? {
                     [\(raw: propertiesCode)]
                 }
 
