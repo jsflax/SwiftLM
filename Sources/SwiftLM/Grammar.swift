@@ -259,7 +259,12 @@ struct JSONSchemaStateTracker: Sendable {
 
     // MARK: - Token Filtering
 
-    func applyPenalty(_ tensor: MLTensor) -> MLTensor {
+    /// Penalty applied to array close bracket when not at max count
+    /// This discourages "lazy" early termination while still allowing it if model is confident
+    /// Higher values = stronger preference for continuation
+    private let arrayEarlyClosePenalty: Float = 10.0
+
+    func applyPenalty(_ tensor: MLTensor) async -> MLTensor {
         let validTokens = getValidTokens()
 
         if Self.debugEnabled {
@@ -279,11 +284,30 @@ struct JSONSchemaStateTracker: Sendable {
             validTokens.contains(idx) ? nil : Int32(idx)
         }
 
-        return tensor.replacing(
+        var result = tensor.replacing(
             atIndices: MLTensor(disallowedIndices, scalarType: Int32.self),
             with: -Float.greatestFiniteMagnitude,
             alongAxis: -1
         )
+
+        // Soft penalty: discourage early array termination when count constraint exists
+        // Only applies when we're in an array and haven't reached maxCount yet
+        if case .expectingArrayCommaOrEnd(_, let currentCount, _, let maxCount) = state,
+           maxCount != Int.max,
+           currentCount < maxCount {
+            let closeBracketIdx = categories.closeBracket
+            if closeBracketIdx >= 0 && closeBracketIdx < tensor.shape[0] {
+                // Get current logit value for ], subtract penalty, replace
+                let currentValue = await result[closeBracketIdx].shapedArray(of: Float.self).scalar ?? 0
+                result = result.replacing(
+                    atIndices: MLTensor([Int32(closeBracketIdx)], scalarType: Int32.self),
+                    with: currentValue - arrayEarlyClosePenalty,
+                    alongAxis: 0
+                )
+            }
+        }
+
+        return result
     }
 
     private func getValidTokens() -> Set<Int> {

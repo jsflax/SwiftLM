@@ -12,7 +12,7 @@ import OSLog
 
 // MARK: - Error Types
 
-public enum LlamaANEError: Error, LocalizedError {
+public enum SwiftLMError: Error, LocalizedError {
     case modelLoadFailed(underlying: Error)
     case missingShapeConstraint(inputName: String)
     case missingModelName
@@ -63,7 +63,7 @@ public struct ModelConfiguration: Sendable {
     public let vocabSize: Int
     public let maxPositionEmbeddings: Int
 
-    private static let metadataPrefix = "co.llamaane."
+    private static let metadataPrefix = "co.swiftlm."
     private static let tokenizerKey = "co.huggingface.exporters.name"
 
     public init(from model: MLModel) {
@@ -266,7 +266,7 @@ public extension ModelFamily {
 
 extension Logger {
     /// Using your bundle identifier is a great way to ensure a unique identifier.
-    private static let subsystem = Bundle.module.bundleIdentifier ?? "com.llamaane"
+    private static let subsystem = Bundle.module.bundleIdentifier ?? "com.swiftlm"
 
     /// Logs the view cycles like a view that appeared.
     static let languageModel = Logger(subsystem: subsystem, category: "llama")

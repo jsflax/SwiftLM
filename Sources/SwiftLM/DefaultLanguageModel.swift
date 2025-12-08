@@ -75,7 +75,7 @@ public final class CoreMLLanguageModel: @unchecked Sendable, LanguageModelProtoc
         // Parse shape constraints from model description
         let inputDescription = model.modelDescription.inputDescriptionsByName[Self.inputIdsKey]
         guard let shapeConstraint = inputDescription?.multiArrayConstraint?.shapeConstraint else {
-            throw LlamaANEError.missingShapeConstraint(inputName: Self.inputIdsKey)
+            throw SwiftLMError.missingShapeConstraint(inputName: Self.inputIdsKey)
         }
 
         switch shapeConstraint.type {
@@ -116,10 +116,10 @@ public final class CoreMLLanguageModel: @unchecked Sendable, LanguageModelProtoc
         let dataURL = directory.appendingPathComponent("tokenizer.json")
 
         guard FileManager.default.fileExists(atPath: configURL.path) else {
-            throw LlamaANEError.resourceNotFound(name: "tokenizer_config", extension: "json")
+            throw SwiftLMError.resourceNotFound(name: "tokenizer_config", extension: "json")
         }
         guard FileManager.default.fileExists(atPath: dataURL.path) else {
-            throw LlamaANEError.resourceNotFound(name: "tokenizer", extension: "json")
+            throw SwiftLMError.resourceNotFound(name: "tokenizer", extension: "json")
         }
 
         do {
@@ -131,17 +131,17 @@ public final class CoreMLLanguageModel: @unchecked Sendable, LanguageModelProtoc
 
             guard let configDict = tokenizerConfig as? [NSString: Any],
                   let dataDict = tokenizerData as? [NSString: Any] else {
-                throw LlamaANEError.tokenizerConfigInvalid
+                throw SwiftLMError.tokenizerConfigInvalid
             }
 
             return try AutoTokenizer.from(
                 tokenizerConfig: Config(configDict),
                 tokenizerData: Config(dataDict)
             )
-        } catch let error as LlamaANEError {
+        } catch let error as SwiftLMError {
             throw error
         } catch {
-            throw LlamaANEError.tokenizerLoadFailed(underlying: error)
+            throw SwiftLMError.tokenizerLoadFailed(underlying: error)
         }
     }
 
@@ -151,7 +151,7 @@ public final class CoreMLLanguageModel: @unchecked Sendable, LanguageModelProtoc
         do {
             return try await AutoTokenizer.from(pretrained: modelId)
         } catch {
-            throw LlamaANEError.tokenizerLoadFailed(underlying: error)
+            throw SwiftLMError.tokenizerLoadFailed(underlying: error)
         }
     }
 
@@ -175,10 +175,10 @@ public final class CoreMLLanguageModel: @unchecked Sendable, LanguageModelProtoc
         }
 
         guard let configURL = Bundle.module.url(forResource: "\(prefix)_tokenizer_config", withExtension: "json") else {
-            throw LlamaANEError.resourceNotFound(name: "\(prefix)_tokenizer_config", extension: "json")
+            throw SwiftLMError.resourceNotFound(name: "\(prefix)_tokenizer_config", extension: "json")
         }
         guard let dataURL = Bundle.module.url(forResource: "\(prefix)_tokenizer", withExtension: "json") else {
-            throw LlamaANEError.resourceNotFound(name: "\(prefix)_tokenizer", extension: "json")
+            throw SwiftLMError.resourceNotFound(name: "\(prefix)_tokenizer", extension: "json")
         }
 
         do {
@@ -190,27 +190,27 @@ public final class CoreMLLanguageModel: @unchecked Sendable, LanguageModelProtoc
 
             guard let configDict = tokenizerConfig as? [NSString: Any],
                   let dataDict = tokenizerData as? [NSString: Any] else {
-                throw LlamaANEError.tokenizerConfigInvalid
+                throw SwiftLMError.tokenizerConfigInvalid
             }
 
             return try AutoTokenizer.from(
                 tokenizerConfig: Config(configDict),
                 tokenizerData: Config(dataDict)
             )
-        } catch let error as LlamaANEError {
+        } catch let error as SwiftLMError {
             throw error
         } catch {
-            throw LlamaANEError.tokenizerLoadFailed(underlying: error)
+            throw SwiftLMError.tokenizerLoadFailed(underlying: error)
         }
     }
 
     private static func loadBundledTokenizer() throws -> Tokenizer {
         // Default to Llama tokenizer for backwards compatibility
         guard let configURL = Bundle.module.url(forResource: "llama_tokenizer_config", withExtension: "json") else {
-            throw LlamaANEError.resourceNotFound(name: "llama_tokenizer_config", extension: "json")
+            throw SwiftLMError.resourceNotFound(name: "llama_tokenizer_config", extension: "json")
         }
         guard let dataURL = Bundle.module.url(forResource: "llama_tokenizer", withExtension: "json") else {
-            throw LlamaANEError.resourceNotFound(name: "llama_tokenizer", extension: "json")
+            throw SwiftLMError.resourceNotFound(name: "llama_tokenizer", extension: "json")
         }
 
         do {
@@ -222,17 +222,17 @@ public final class CoreMLLanguageModel: @unchecked Sendable, LanguageModelProtoc
 
             guard let configDict = tokenizerConfig as? [NSString: Any],
                   let dataDict = tokenizerData as? [NSString: Any] else {
-                throw LlamaANEError.tokenizerConfigInvalid
+                throw SwiftLMError.tokenizerConfigInvalid
             }
 
             return try AutoTokenizer.from(
                 tokenizerConfig: Config(configDict),
                 tokenizerData: Config(dataDict)
             )
-        } catch let error as LlamaANEError {
+        } catch let error as SwiftLMError {
             throw error
         } catch {
-            throw LlamaANEError.tokenizerLoadFailed(underlying: error)
+            throw SwiftLMError.tokenizerLoadFailed(underlying: error)
         }
     }
     
@@ -289,10 +289,10 @@ public extension CoreMLLanguageModel {
         do {
             let model = try MLModel(contentsOf: url, configuration: mlConfig)
             return try CoreMLLanguageModel(model: model)
-        } catch let error as LlamaANEError {
+        } catch let error as SwiftLMError {
             throw error
         } catch {
-            throw LlamaANEError.modelLoadFailed(underlying: error)
+            throw SwiftLMError.modelLoadFailed(underlying: error)
         }
     }
 }

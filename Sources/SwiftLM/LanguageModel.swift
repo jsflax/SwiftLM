@@ -3,7 +3,7 @@ import FoundationModels
 
 
 #if canImport(FoundationModels)
-@available(macOS 26.0, *)
+@available(macOS 26.0, iOS 26.0, *)
 public typealias GenerableCompat = Generable
 #else
 @_marker protocol GenerableCompat {}
@@ -48,6 +48,13 @@ public protocol LanguageModel: Sendable {
         input: Input,
         output: Output.Type,
     ) async throws -> Output where Input: Encodable, Output: JSONSchemaConvertible, Output: Generable
+    
+    @available(macOS 26.0, iOS 26.0, *)
+    func strusturedAsk<Output>(
+        system: String,
+        input: String,
+        output: Output.Type,
+    ) async throws -> Output where Output: JSONSchemaConvertible, Output: Generable
 }
 
 extension Session: LanguageModelConversation {
@@ -77,7 +84,7 @@ extension CoreMLLanguageModel: LanguageModel {
         return try await oneShot(prompt: system, input: input, output: output) as! Output
     }
     
-    @available(macOS 26.0, *)
+    @available(macOS 26.0, iOS 26.0, *)
     public func strusturedAsk<Input, Output>(system: String, input: Input, output: Output.Type) async throws -> Output where Input : Encodable, Output : Generable, Output : JSONSchemaConvertible, Output : Sendable {
         let input = try String(data: JSONEncoder().encode(input), encoding: .utf8)!
         let output = output as (JSONSchemaConvertible & Sendable).Type
@@ -131,7 +138,7 @@ extension LanguageModelSession: LanguageModelConversation {
 //    }
 }
 
-@available(macOS 26.0, *)
+@available(macOS 26.0, iOS 26.0, *)
 public struct FoundationLanguageModel: LanguageModel {
     private let model: SystemLanguageModel
     public init(model: SystemLanguageModel) {

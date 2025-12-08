@@ -115,7 +115,7 @@ public actor Session {
     ) async throws -> T {
         let jsonString = await infer(prompt: prompt, as: type).reduce("", +)
         guard let data = jsonString.data(using: .utf8) else {
-            throw LlamaANEError.invalidLogitsOutput
+            throw SwiftLMError.invalidLogitsOutput
         }
         do {
             return try JSONDecoder().decode(T.self, from: data)
@@ -145,7 +145,7 @@ public actor Session {
         encoder.outputFormatting = .sortedKeys
         guard let data = try? encoder.encode(input),
               let jsonString = String(data: data, encoding: .utf8) else {
-            throw LlamaANEError.invalidLogitsOutput
+            throw SwiftLMError.invalidLogitsOutput
         }
         return try await infer(prompt: jsonString, as: type)
     }
@@ -210,7 +210,7 @@ public actor Session {
         let currentLength = input["inputIds"]?.multiArrayValue?.count ?? 1
         if currentLength > contextSize {
             logger.warning("Context length exceeded: \(currentLength) > \(self.contextSize)")
-            throw LlamaANEError.contextLengthExceeded(current: currentLength, maximum: contextSize)
+            throw SwiftLMError.contextLengthExceeded(current: currentLength, maximum: contextSize)
         }
 
         var totalDecoded = ""
@@ -225,15 +225,15 @@ public actor Session {
             time = Date.now
 
             guard let logitsValue = output.featureValue(for: "logits")?.shapedArrayValue(of: Float16.self) else {
-                throw LlamaANEError.invalidLogitsOutput
+                throw SwiftLMError.invalidLogitsOutput
             }
 
             // Flatten tensor for processing
             var mlTensor = MLTensor(logitsValue).cast(to: Float.self).flattened()
 
-            // Apply grammar constraints if active (GPU operation, no await needed)
+            // Apply grammar constraints if active
             if let tracker = grammarTracker {
-                mlTensor = tracker.applyPenalty(mlTensor)
+                mlTensor = await tracker.applyPenalty(mlTensor)
             }
 
             // Apply repetition penalty
@@ -448,7 +448,7 @@ public actor Session {
                 return try await model.prediction(from: input)
             }
         } catch {
-            throw LlamaANEError.predictionFailed(underlying: error)
+            throw SwiftLMError.predictionFailed(underlying: error)
         }
     }
 
@@ -457,7 +457,7 @@ public actor Session {
     private func input(from tokens: [Int], totalBuffer: [Int]) async throws -> MLDictionaryFeatureProvider {
         let inputDescription = model.modelDescription.inputDescriptionsByName["inputIds"]
         guard let shapeConstraint = inputDescription?.multiArrayConstraint?.shapeConstraint else {
-            throw LlamaANEError.missingShapeConstraint(inputName: "inputIds")
+            throw SwiftLMError.missingShapeConstraint(inputName: "inputIds")
         }
 
         var inputDictionary: [String: MLFeatureValue] = [:]
@@ -503,7 +503,7 @@ public actor Session {
             guard let fixed_seq_len = shapeConstraint.enumeratedShapes.first(where: {
                 $0[1].intValue > tokens.count
             })?[1].intValue else {
-                throw LlamaANEError.contextLengthExceeded(current: tokens.count, maximum: contextSize)
+                throw SwiftLMError.contextLengthExceeded(current: tokens.count, maximum: contextSize)
             }
 
             let maxTokens = min(tokens.count, fixed_seq_len)

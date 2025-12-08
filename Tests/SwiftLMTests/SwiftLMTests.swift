@@ -1,6 +1,6 @@
 import Foundation
 import Testing
-@testable import LlamaANE
+@testable import SwiftLM
 import CoreML
 import Tokenizers
 import TensorUtils
@@ -11,10 +11,10 @@ import XCTest
 import JSONSchema
 
 // Path to test models - update this to point to your exported models
-let testModelsPath = "/Users/jason/Documents/LlamaANE/Plugins/LLMGenerator/models"
+let testModelsPath = "/Users/jason/Documents/SwiftLM/Plugins/LLMGenerator/models"
 
-@Suite("LlamaANETest Suite")
-struct LlamaANETests {
+@Suite("SwiftLMTest Suite")
+struct SwiftLMTests {
 
     // MARK: - Basic Model Loading Test
 
@@ -1849,7 +1849,11 @@ struct LlamaANETests {
         lm.makeSession(systemPrompt: "", tools: MyTools(), temperature: 1.0, topK: 0, topP: 1.0, repetitionPenalty: 1.0, isLogginEnabled: false)
     }
     */ // End of commented-out tests requiring specific model classes
+    @Test func testMKPointOfInterestCategory() {
+        print(MKPointOfInterestCategory.allCases.map(\.description))
+    }
 }
+import MapKit
 
 @llamaActor(.v3_2) actor MyTools {
     /// Returns the current date as a human readable string.

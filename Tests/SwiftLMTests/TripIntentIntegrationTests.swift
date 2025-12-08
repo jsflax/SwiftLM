@@ -1,13 +1,13 @@
 import Foundation
 import Testing
-@testable import LlamaANE
+@testable import SwiftLM
 import CoreML
 import JSONSchema
 import MapKit
 import CoreLocation
 
-// Path to test models (uses the one from LlamaANETests.swift via internal linkage)
-private let tripTestModelsPath = "/Users/jason/Documents/LlamaANE/Plugins/LLMGenerator/models"
+// Path to test models
+private let tripTestModelsPath = "/Users/jason/Documents/SwiftLM/Plugins/LLMGenerator/models"
 
 // MARK: - TripIntent Data Models (Ported from JoyJet)
 
