@@ -11,6 +11,7 @@ struct SwiftLMCLI: AsyncParsableCommand {
             Export.self,
             Test.self,
             Embed.self,
+            Finetune.self,
         ],
         defaultSubcommand: nil
     )

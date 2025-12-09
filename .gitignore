@@ -13,3 +13,22 @@ Package.resolved
 \#*\#
 .\#*
 Sources/ModelDumpSources/Main/Resources/swiftlm-export
+Sources/Main/Resources/swiftlm-export
+
+# AppleAdapterToolkit (13GB+ with model weights)
+Plugins/AppleAdapterToolkit/
+
+# Python artifacts
+Plugins/LLMGenerator/.venv/
+Plugins/LLMGenerator/__pycache__/
+Plugins/LLMGenerator/build/
+Plugins/LLMGenerator/dist/
+Plugins/LLMGenerator/*.spec
+*.pyc
+
+# Training artifacts
+Plugins/LLMGenerator/*.jsonl
+Plugins/LLMGenerator/*-merged/
+Plugins/LLMGenerator/qwen-*/
+Plugins/LLMGenerator/trip-models/
+Plugins/LLMGenerator/*.log
