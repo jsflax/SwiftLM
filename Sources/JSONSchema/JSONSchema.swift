@@ -1,5 +1,7 @@
 import Foundation
+#if canImport(FoundationModels)
 @_exported import FoundationModels
+#endif
 
 public enum JSONType: String, Codable {
     case string, integer, number, boolean, array, object
@@ -336,10 +338,12 @@ public protocol JSONSchemaConvertible: Codable {
     static func decode<K: CodingKey>(from container: KeyedDecodingContainer<K>,
                                      forKey key: K) throws -> Self
     
+    #if canImport(FoundationModels)
     @available(iOS 26.0, macOS 26.0, *)
     static var generationSchema: FoundationModels.GenerationSchema { get }
     @available(iOS 26.0, macOS 26.0, *)
     init(_ content: FoundationModels.GeneratedContent) throws
+    #endif
 }
 
 public typealias _GrammarJSONSchemaConvertible = JSONSchemaConvertible

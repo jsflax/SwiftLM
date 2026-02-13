@@ -1,6 +1,8 @@
 import Foundation
-import FoundationModels
 
+#if canImport(FoundationModels)
+import FoundationModels
+#endif
 
 #if canImport(FoundationModels)
 @available(macOS 26.0, iOS 26.0, *)
