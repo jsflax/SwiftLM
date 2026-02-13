@@ -60,7 +60,7 @@ let profile: UserProfile = try await session.infer(prompt: "Generate a user prof
 ### Text Embeddings
 
 ```swift
-let model = try CoreMLEmbeddingModel.load(url: embeddingModelURL)
+let model = try await CoreMLEmbeddingModel.load(url: embeddingModelURL)
 
 // Embed text
 let embedding = try await model.embed(text: "Hello world")
@@ -93,6 +93,18 @@ swiftlm export nomic-ai/nomic-embed-text-v1.5 --embedding
 ```bash
 swiftlm test ./models/Qwen2.5-1.5B-Instruct.mlpackage --prompt "Hello!"
 ```
+
+### Fine-Tune Models
+
+```bash
+# Fine-tune for CoreML export
+swiftlm finetune --data train.jsonl --model Qwen/Qwen2.5-1.5B-Instruct --merge
+
+# Train adapter for Apple's foundation model
+swiftlm finetune --data train.jsonl --train-fmadapter --export-fmadapter
+```
+
+Requires Python with: `pip install transformers peft accelerate datasets trl`
 
 ## @SchemaGuide Constraints
 
@@ -127,9 +139,9 @@ swiftlm test ./models/Qwen2.5-1.5B-Instruct.mlpackage --prompt "Hello!"
 
 ## Requirements
 
-- macOS 14.0+ / iOS 17.0+
-- Swift 5.9+
-- Xcode 15.0+
+- macOS 15.0+ / iOS 18.0+
+- Swift 6.0+
+- Xcode 16.0+
 
 ## License
 
