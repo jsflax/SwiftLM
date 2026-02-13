@@ -12,10 +12,17 @@ public typealias GenerableCompat = Generable
 #endif
 
 public protocol LanguageModelConversation {
+#if compiler(>=6.2)
     nonisolated(nonsending) func `continue`<Input: Encodable, Output>(
         input: Input,
         expecting: Output.Type
     ) async throws -> Output where Output: JSONSchemaConvertible
+#else
+    func `continue`<Input: Encodable, Output>(
+        input: Input,
+        expecting: Output.Type
+    ) async throws -> Output where Output: JSONSchemaConvertible
+#endif
 
     #if canImport(FoundationModels)
     @available(macOS 26.0, iOS 26.0, *)
@@ -27,12 +34,21 @@ public protocol LanguageModelConversation {
 }
 
 extension LanguageModelConversation {
+#if compiler(>=6.2)
     nonisolated(nonsending) func `continue`<Input: Codable, Output>(
         input: Input,
         expecting: Output.Type
     ) async throws -> Output where Output: JSONSchemaConvertible {
         try await self.continue(input: input, expecting: expecting)
     }
+#else
+    func `continue`<Input: Codable, Output>(
+        input: Input,
+        expecting: Output.Type
+    ) async throws -> Output where Output: JSONSchemaConvertible {
+        try await self.continue(input: input, expecting: expecting)
+    }
+#endif
 }
 
 public protocol LanguageModel: Sendable {
@@ -74,6 +90,7 @@ extension Session: LanguageModelConversation {
         return try await self.infer(input: input, as: expecting) as! Output
     }
 
+#if compiler(>=6.2)
     nonisolated(nonsending) public func `continue`<Input: Encodable, Output>(
         input: Input,
         expecting: Output.Type
@@ -81,6 +98,15 @@ extension Session: LanguageModelConversation {
         let expecting = expecting as! (JSONSchemaConvertible & Sendable).Type
         return try await self.infer(input: input, as: expecting) as! Output
     }
+#else
+    public func `continue`<Input: Encodable, Output>(
+        input: Input,
+        expecting: Output.Type
+    ) async throws -> Output where Input: Sendable, Output: Sendable {
+        let expecting = expecting as! (JSONSchemaConvertible & Sendable).Type
+        return try await self.infer(input: input, as: expecting) as! Output
+    }
+#endif
 }
 
 extension CoreMLLanguageModel: LanguageModel {
