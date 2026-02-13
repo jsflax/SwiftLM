@@ -18,7 +18,7 @@ public protocol LanguageModelConversation {
         expecting: Output.Type
     ) async throws -> Output where Output: JSONSchemaConvertible
 #else
-    func `continue`<Input: Encodable, Output>(
+    func `continue`<Input: Encodable & Sendable, Output: Sendable>(
         input: Input,
         expecting: Output.Type
     ) async throws -> Output where Output: JSONSchemaConvertible
@@ -26,17 +26,10 @@ public protocol LanguageModelConversation {
 
     #if canImport(FoundationModels)
     @available(macOS 26.0, iOS 26.0, *)
-    #if compiler(>=6.2)
     nonisolated(nonsending) func `continue`<Input: Encodable, Output>(
         input: Input,
         expecting: Output.Type
     ) async throws -> Output where Output: JSONSchemaConvertible & Generable
-    #else
-    func `continue`<Input: Encodable, Output>(
-        input: Input,
-        expecting: Output.Type
-    ) async throws -> Output where Output: JSONSchemaConvertible & Generable
-    #endif
     #endif
 }
 
@@ -49,7 +42,7 @@ extension LanguageModelConversation {
         try await self.continue(input: input, expecting: expecting)
     }
 #else
-    func `continue`<Input: Codable, Output>(
+    func `continue`<Input: Codable & Sendable, Output: Sendable>(
         input: Input,
         expecting: Output.Type
     ) async throws -> Output where Output: JSONSchemaConvertible {
@@ -106,10 +99,10 @@ extension Session: LanguageModelConversation {
         return try await self.infer(input: input, as: expecting) as! Output
     }
 #else
-    public func `continue`<Input: Encodable, Output>(
+    public func `continue`<Input: Encodable & Sendable, Output: Sendable>(
         input: Input,
         expecting: Output.Type
-    ) async throws -> Output where Input: Sendable, Output: Sendable {
+    ) async throws -> Output {
         let expecting = expecting as! (JSONSchemaConvertible & Sendable).Type
         return try await self.infer(input: input, as: expecting) as! Output
     }
