@@ -33,16 +33,18 @@ public enum GuideConstraint: Sendable, Equatable {
 /// The LLM won't generate a value - the default will be used instead
 /// Similar to Apple's GenerationID
 public struct GenerationID: Codable, Sendable, Hashable, JSONSchemaConvertible {
+    #if canImport(FoundationModels)
     @available(macOS 26.0, iOS 26.0, *)
     public static var generationSchema: GenerationSchema {
         .init(type: String.self, properties: [])
     }
-    
+
     @available(macOS 26.0, iOS 26.0, *)
     public init(_ content: GeneratedContent) throws {
         fatalError()
     }
-    
+    #endif
+
     public let value: String
 
     public init() {
@@ -474,16 +476,18 @@ extension String : JSONSchemaConvertible {
     }
 }
 extension UUID : JSONSchemaConvertible {
+    #if canImport(FoundationModels)
     @available(macOS 26.0, iOS 26.0, *)
     public static var generationSchema: GenerationSchema {
         .init(type: String.self, properties: [])
     }
-    
+
     @available(macOS 26.0, iOS 26.0, *)
     public init(_ content: GeneratedContent) throws {
         fatalError()
     }
-    
+    #endif
+
     public init(from json: Any) throws {
         guard let json = json as? String else {
             throw JSONDecodingError.invalidType
@@ -726,15 +730,17 @@ extension Array : JSONSchemaConvertible where Element : JSONSchemaConvertible {
         ]
     }
     
+    #if canImport(FoundationModels)
     @available(macOS 26.0, iOS 26.0, *)
     public static var generationSchema: GenerationSchema {
         fatalError()
     }
-    
+
     @available(macOS 26.0, iOS 26.0, *)
     public init(_ content: GeneratedContent) throws {
         fatalError()
     }
+    #endif
 }
 
 // MARK: - Dictionary Support
@@ -784,18 +790,18 @@ extension Dictionary: JSONSchemaConvertible where Key: JSONSchemaKey, Value: JSO
 
     /// The value type for dictionary entries
     public static var valueType: (any JSONSchemaConvertible.Type)? { Value.self }
-    
-    
+
+    #if canImport(FoundationModels)
     @available(macOS 26.0, iOS 26.0, *)
     public static var generationSchema: GenerationSchema {
         fatalError()
     }
-    
+
     @available(macOS 26.0, iOS 26.0, *)
     public init(_ content: GeneratedContent) throws {
         fatalError()
     }
-    
+    #endif
 }
 
 extension Optional : JSONSchemaConvertible where Wrapped : JSONSchemaConvertible {
@@ -814,17 +820,18 @@ extension Optional : JSONSchemaConvertible where Wrapped : JSONSchemaConvertible
     }
     public static var schemaProperties: [SchemaProperty]? { Wrapped.schemaProperties }
     public static var elementType: (any JSONSchemaConvertible.Type)? { Wrapped.elementType }
-    
-    
+
+    #if canImport(FoundationModels)
     @available(macOS 26.0, iOS 26.0, *)
     public static var generationSchema: GenerationSchema {
         fatalError()
     }
-    
+
     @available(macOS 26.0, iOS 26.0, *)
     public init(_ content: GeneratedContent) throws {
         fatalError()
     }
+    #endif
 }
 
 #if canImport(MapKit)
@@ -1258,11 +1265,19 @@ extension MKPointOfInterestCategory: Generable {
 #endif
 
 
+#if canImport(FoundationModels)
 @attached(member, names: arbitrary)
 @attached(extension, conformances: JSONSchemaConvertible, CaseIterable, Generable, JSONSchemaKey,
           names: arbitrary)
 public macro JSONSchema() = #externalMacro(module: "JSONSchemaMacros",
                                            type: "JSONSchemaMacro")
+#else
+@attached(member, names: arbitrary)
+@attached(extension, conformances: JSONSchemaConvertible, CaseIterable, JSONSchemaKey,
+          names: arbitrary)
+public macro JSONSchema() = #externalMacro(module: "JSONSchemaMacros",
+                                           type: "JSONSchemaMacro")
+#endif
 
 /// Bridges an external type to JSONSchemaConvertible using a marker struct.
 ///

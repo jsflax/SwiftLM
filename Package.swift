@@ -18,7 +18,7 @@ let package = Package(
             name: "SwiftLM",
             targets: ["SwiftLM"]),
         .executable(
-            name: "swift-lm",
+            name: "swiftlm",
             targets: ["Main"]),
     ],
     dependencies: [

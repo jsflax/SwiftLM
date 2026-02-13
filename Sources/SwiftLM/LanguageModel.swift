@@ -16,12 +16,14 @@ public protocol LanguageModelConversation {
         input: Input,
         expecting: Output.Type
     ) async throws -> Output where Output: JSONSchemaConvertible
-    
+
+    #if canImport(FoundationModels)
     @available(macOS 26.0, iOS 26.0, *)
     nonisolated(nonsending) func `continue`<Input: Encodable, Output>(
         input: Input,
         expecting: Output.Type
     ) async throws -> Output where Output: JSONSchemaConvertible & Generable
+    #endif
 }
 
 extension LanguageModelConversation {
@@ -35,33 +37,35 @@ extension LanguageModelConversation {
 
 public protocol LanguageModel: Sendable {
     associatedtype Conversation: LanguageModelConversation
-    
+
     func startConversation(systemPrompt: String) async -> Conversation
-    
+
     func structuredAsk<Input, Output>(
         system: String,
         input: Input,
         output: Output.Type,
     ) async throws -> Output where Input: Encodable
-    
+
+    #if canImport(FoundationModels)
     @available(macOS 26.0, iOS 26.0, *)
     func structuredAsk<Input: Sendable, Output>(
         system: String,
         input: Input,
         output: Output.Type,
     ) async throws -> Output where Input: Encodable, Output: JSONSchemaConvertible, Output: Generable
-    
+
     @available(macOS 26.0, iOS 26.0, *)
     func structuredAsk<Output>(
         system: String,
         input: String,
         output: Output.Type,
     ) async throws -> Output where Output: JSONSchemaConvertible, Output: Generable
+    #endif
 }
 
 extension Session: LanguageModelConversation {
     public typealias Generable = JSONSchemaConvertible
-    
+
     public func `continue`<Output: Sendable>(
         input: String,
         expecting: Output.Type
@@ -69,7 +73,7 @@ extension Session: LanguageModelConversation {
         let expecting = expecting as! (JSONSchemaConvertible & Sendable).Type
         return try await self.infer(input: input, as: expecting) as! Output
     }
-    
+
     nonisolated(nonsending) public func `continue`<Input: Encodable, Output>(
         input: Input,
         expecting: Output.Type
@@ -99,6 +103,7 @@ extension CoreMLLanguageModel: LanguageModel {
         return try await oneShot(prompt: system, input: input, output: output) as! Output
     }
 
+    #if canImport(FoundationModels)
     @available(macOS 26.0, iOS 26.0, *)
     public func structuredAsk<Input, Output>(system: String, input: Input, output: Output.Type) async throws -> Output where Input : Encodable, Output : Generable, Output : JSONSchemaConvertible, Output : Sendable {
         let encodedInput = try String(data: JSONEncoder().encode(input), encoding: .utf8)!
@@ -112,52 +117,30 @@ extension CoreMLLanguageModel: LanguageModel {
         let output = output as (JSONSchemaConvertible & Sendable).Type
         return try await oneShot(prompt: system, input: input, output: output) as! Output
     }
+    #endif
 
     public func startConversation(systemPrompt: String) async -> Session {
         await self.makeSession(systemPrompt: systemPrompt)
     }
 }
 
+#if canImport(FoundationModels)
 @available(macOS 26.0, iOS 26.0, *)
 extension LanguageModelSession: LanguageModelConversation {
     public typealias Generable = FoundationModels.Generable
-    
+
     public func `continue`<Input, Output>(input: Input, expecting: Output.Type) async throws -> Output where Input : Encodable, Output : JSONSchemaConvertible {
         let expecting = expecting as! (any Generable & JSONSchemaConvertible).Type
         let input = try String(data: JSONEncoder().encode(input), encoding: .utf8)!
         let content = try await self.respond(to: input, schema: Output.generationSchema)
         return try Output(content.content)
     }
-    
+
     public func `continue`<Input, Output>(input: Input, expecting: Output.Type) async throws -> Output where Input : Encodable, Output: Generable & JSONSchemaConvertible {
         let input = try String(data: JSONEncoder().encode(input), encoding: .utf8)!
         let content: LanguageModelSession.Response<Output> = try await respond(to: input, generating: Output.self)
         return content.content
     }
-    
-    
-    
-//    public nonisolated func `continue`<Output>(
-//        input: String,
-//        expecting: Output.Type
-//    ) async throws -> Output where Output: Generable {
-//        return try await self.respond(to: input, generating: expecting).content
-//    }
-//    
-//    func test<Input: Encodable, Output: Generable>(input: Input, outputType: Output.Type) async throws -> Output {
-//        let input = try String(data: JSONEncoder().encode(input), encoding: .utf8)!
-//        let content: LanguageModelSession.Response<Output> = try await respond(to: input, generating: Output.self)
-//        return content.content
-//    }
-//    
-//    public func `continue`<Input: Codable, Output>(
-//        input: Input,
-//        expecting outputType: Output.Type
-//    ) async throws -> Output where Output: Generable {
-//        let input = try String(data: JSONEncoder().encode(input), encoding: .utf8)!
-//        let content: LanguageModelSession.Response<Output> = try await respond(to: input, generating: Output.self)
-//        return content.content
-//    }
 }
 
 @available(macOS 26.0, iOS 26.0, *)
@@ -166,38 +149,30 @@ public struct FoundationLanguageModel: LanguageModel {
     public init(model: SystemLanguageModel) {
         self.model = model
     }
-    
+
     func test<Input: Encodable, Output: Generable>(system: String, input: Input, outputType: Output.Type) async throws -> Output {
         let session = await self.startConversation(systemPrompt: system)
         let input = try String(data: JSONEncoder().encode(input), encoding: .utf8)!
         let content: LanguageModelSession.Response<Output> = try await session.respond(to: input, generating: Output.self)
         return content.content
     }
-    
+
     public func structuredAsk<Input, Output>(system: String, input: Input, output: Output.Type) async throws -> Output where Input : Encodable {
         let session = await self.startConversation(systemPrompt: system)
         let input = try String(data: JSONEncoder().encode(input), encoding: .utf8)!
         let output = output as! (Generable & Sendable).Type
         return try await test(system: system, input: input, outputType: output) as! Output
     }
-    
+
     public func structuredAsk<Input, Output>(system: String, input: Input, output: Output.Type) async throws -> Output where Input : Encodable, Output : Generable, Output : JSONSchemaConvertible, Output : Sendable {
         let session = await self.startConversation(systemPrompt: system)
         let input = try String(data: JSONEncoder().encode(input), encoding: .utf8)!
         return try await session.respond(to: input, generating: output).content
     }
-    
+
     public func startConversation(systemPrompt: String) async -> LanguageModelSession {
         let session = LanguageModelSession(model: model, instructions: systemPrompt)
         return session
     }
 }
-//struct Test {
-//
-//}
-//if #available(macOS 26.0, *) {
-//
-//}
-//@available(macOS 26.0, *)
-//typealias _Generable = FoundationModels.Generable
-//typealias _Generable = LanguageModel.JSONSchema
+#endif
