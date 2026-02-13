@@ -25,11 +25,19 @@ public protocol LanguageModelConversation {
 #endif
 
     #if canImport(FoundationModels)
+    #if compiler(>=6.2)
     @available(macOS 26.0, iOS 26.0, *)
     nonisolated(nonsending) func `continue`<Input: Encodable, Output>(
         input: Input,
         expecting: Output.Type
     ) async throws -> Output where Output: JSONSchemaConvertible & Generable
+    #else
+    @available(macOS 26.0, iOS 26.0, *)
+    func `continue`<Input: Encodable & Sendable, Output: Sendable>(
+        input: Input,
+        expecting: Output.Type
+    ) async throws -> Output where Output: JSONSchemaConvertible & Generable
+    #endif
     #endif
 }
 
