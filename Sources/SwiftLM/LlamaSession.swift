@@ -16,7 +16,7 @@ public actor Session {
     // MARK: - Core Properties
     let model: MLModel
     let tokenizer: Tokenizer
-    let kvCache: MLState?
+    var kvCache: MLState?
     let contextSize: Int
     let chatTemplate: any ChatTemplate
     let systemPrompt: String
@@ -31,6 +31,7 @@ public actor Session {
     let requiresCausal: Bool
     let requiresAttention: Bool
     var logger: Logger
+    let additionalStopTokens: Set<Int>
 
     // MARK: - Initialization
 
@@ -68,6 +69,117 @@ public actor Session {
         } else {
             kvCache = nil
         }
+
+        // Set up additional stop tokens based on model type
+        // Qwen models use <|endoftext|> (151643) in addition to <|im_end|> (151645)
+        if chatTemplate is QwenChatTemplate || chatTemplate is DeepSeekChatTemplate {
+            self.additionalStopTokens = [151643] // <|endoftext|>
+        } else {
+            self.additionalStopTokens = []
+        }
+    }
+
+    // MARK: - Context Info
+
+    /// Total context size (maximum tokens the session can hold)
+    public var maxContextTokens: Int { contextSize }
+
+    /// Number of tokens currently used in the context
+    public var usedTokens: Int { outputBuffer.count }
+
+    /// Number of tokens remaining before context is full
+    public var remainingTokens: Int { max(0, contextSize - outputBuffer.count) }
+
+    /// Percentage of context used (0.0 to 1.0)
+    public var contextUsage: Double { Double(outputBuffer.count) / Double(contextSize) }
+
+    // MARK: - Session Management
+
+    /// Serializable conversation state for save/restore
+    public struct ConversationState: Codable, Sendable {
+        /// The token buffer representing the full conversation
+        public let tokens: [Int]
+        /// The system prompt used for this conversation
+        public let systemPrompt: String
+        /// Timestamp when the state was saved
+        public let savedAt: Date
+
+        public init(tokens: [Int], systemPrompt: String, savedAt: Date = Date()) {
+            self.tokens = tokens
+            self.systemPrompt = systemPrompt
+            self.savedAt = savedAt
+        }
+    }
+
+    /// Reset the session, clearing the KV cache and conversation history.
+    /// The system prompt is preserved and will be re-applied on the next inference.
+    public func reset() {
+        outputBuffer.removeAll()
+        hasShownInitialPrompt = false
+        // Create fresh KV cache state
+        if !model.modelDescription.stateDescriptionsByName.isEmpty {
+            kvCache = model.makeState()
+        }
+    }
+
+    /// Save the current conversation state for later restoration.
+    /// Returns a serializable state that can be persisted to disk.
+    public func save() -> ConversationState {
+        ConversationState(
+            tokens: outputBuffer,
+            systemPrompt: systemPrompt
+        )
+    }
+
+    /// Restore a previously saved conversation state.
+    /// This resets the session and prefills with the saved tokens.
+    /// - Parameter state: The conversation state to restore
+    /// - Parameter ignoreSystemPromptMismatch: If true, allows restoring even if system prompts differ
+    /// - Throws: If the state's system prompt doesn't match and ignoreSystemPromptMismatch is false
+    public func restore(from state: ConversationState, ignoreSystemPromptMismatch: Bool = false) async throws {
+        if !ignoreSystemPromptMismatch && state.systemPrompt != systemPrompt {
+            throw SwiftLMError.systemPromptMismatch(expected: systemPrompt, got: state.systemPrompt)
+        }
+        reset()
+        try await prefill(tokens: state.tokens)
+    }
+
+    /// Prefill the session with text, processing it through the model
+    /// without generating new tokens. Useful for injecting context or history.
+    /// - Parameter text: The text to prefill (will be tokenized)
+    public func prefill(text: String) async throws {
+        let tokens = tokenizer.encode(text: text)
+        try await prefill(tokens: tokens)
+    }
+
+    /// Prefill the session with tokens, processing them through the model
+    /// without generating new tokens.
+    /// - Parameter tokens: The token IDs to prefill
+    public func prefill(tokens: [Int]) async throws {
+        guard !tokens.isEmpty else { return }
+
+        // Add tokens to the buffer FIRST so input() computes correct mask dimensions.
+        // This matches the runInference pattern where tokens are appended before input() is called.
+        outputBuffer.append(contentsOf: tokens)
+
+        // Process all buffered tokens through the model to populate KV cache
+        let input = try await self.input(from: outputBuffer, totalBuffer: outputBuffer)
+        _ = try await asynchronousPredict(input: input)
+
+        hasShownInitialPrompt = true
+    }
+
+    /// Prefill with a formatted conversation history.
+    /// Each message should be a tuple of (role, content) where role is "user" or "assistant".
+    /// - Parameters:
+    ///   - messages: Array of (role, content) tuples
+    ///   - includeSystemPrompt: Whether to include the system prompt (default: true)
+    public func prefill(messages: [(role: String, content: String)], includeSystemPrompt: Bool = true) async throws {
+        let formattedText = chatTemplate.formatFullPrompt(
+            system: includeSystemPrompt ? systemPrompt : "",
+            userMessages: messages
+        )
+        try await prefill(text: formattedText)
     }
 
     // MARK: - Public API
@@ -228,8 +340,11 @@ public actor Session {
                 throw SwiftLMError.invalidLogitsOutput
             }
 
-            // Flatten tensor for processing
-            var mlTensor = MLTensor(logitsValue).cast(to: Float.self).flattened()
+            // Extract logits for the LAST token position only
+            // Shape is [1, seq_len, vocab_size] - we want [vocab_size] from position [-1]
+            let logitsTensor = MLTensor(logitsValue).cast(to: Float.self)
+            let seqLen = logitsTensor.shape[1]
+            var mlTensor = logitsTensor[0, seqLen - 1].flattened()
 
             // Apply grammar constraints if active
             if let tracker = grammarTracker {
@@ -339,7 +454,14 @@ public actor Session {
                 if topP < 1.0 {
                     let probs = topKLogits.softmax(alongAxis: -1)
                     let cumsum = probs.cumulativeSum(alongAxis: -1)
-                    let excludeMask = cumsum .> Float(topP)
+                    // Shift cumsum left so we always keep at least the first token
+                    // Original: exclude where cumsum > topP (but this excludes token 0 if prob[0] > topP)
+                    // Fixed: exclude where shifted_cumsum > topP (token 0 is never excluded)
+                    let shiftedCumsum = MLTensor(
+                        concatenating: [MLTensor(repeating: Float(0), shape: [1]), cumsum[0..<(topK-1)]],
+                        alongAxis: 0
+                    )
+                    let excludeMask = shiftedCumsum .> Float(topP)
                     filteredLogits = topKLogits.replacing(
                         with: MLTensor(repeating: -Float.greatestFiniteMagnitude, shape: topKLogits.shape),
                         where: excludeMask
@@ -355,9 +477,9 @@ public actor Session {
 
             outputBuffer.append(nextToken)
 
-            // Check for end of sequence
-            if nextToken == config.eosTokenId {
-                logger.debug("Found end of sequence token.")
+            // Check for end of sequence (main EOS token or additional stop tokens)
+            if nextToken == config.eosTokenId || additionalStopTokens.contains(nextToken) {
+                logger.debug("Found end of sequence token: \(nextToken)")
                 break
             }
 
@@ -372,8 +494,16 @@ public actor Session {
             // This ensures the final token is yielded even when grammar completes
             let decoded = tokenizer.decode(tokens: [nextToken])
 
-            // Handle tool calls (only for free-form text)
-            if grammarTracker == nil && tools != nil && decoded.starts(with: "[") {
+            // Check if token decodes to only replacement characters (U+FFFD)
+            // This can happen with special tokens that aren't properly handled
+            let trimmed = decoded.trimmingCharacters(in: .whitespacesAndNewlines)
+            let isReplacementChar = !trimmed.isEmpty && trimmed.allSatisfy({ $0 == "\u{FFFD}" })
+
+            if isReplacementChar {
+                // Don't yield replacement characters but continue generation
+                logger.debug("Skipping replacement character token from stream: \(nextToken)")
+            } else if grammarTracker == nil && tools != nil && decoded.starts(with: "[") {
+                // Handle tool calls (only for free-form text)
                 totalDecoded += decoded
                 isExpectedToolCall = true
             } else {

@@ -4,7 +4,6 @@ from typing import Tuple, Dict, Optional, Any
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, PretrainedConfig
-from transformers.cache_utils import Cache
 from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Attention,
     Qwen2Config,
@@ -13,11 +12,14 @@ from transformers.models.qwen2.modeling_qwen2 import (
 )
 
 
-class SliceUpdateKeyValueCache(Cache):
-    """KV cache with slice-based updates for efficient incremental decoding."""
+class SliceUpdateKeyValueCache:
+    """KV cache with slice-based updates for efficient incremental decoding.
+
+    Note: Does not inherit from Cache to avoid transformers 4.45+ API changes
+    that require layers or layer_class_to_replicate arguments.
+    """
 
     def __init__(self, shape: Tuple[int, ...], device="cpu", dtype=torch.float32):
-        super().__init__()
         self.past_seen_tokens: int = 0
         self.k_cache: torch.Tensor = torch.zeros(shape, dtype=dtype, device=device)
         self.v_cache: torch.Tensor = torch.zeros(shape, dtype=dtype, device=device)
@@ -62,7 +64,8 @@ class SliceUpdateQwen2Attention(Qwen2Attention):
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_values: Optional["SliceUpdateKeyValueCache"] = None,
+        cache_position: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, ...]:
         bsz, q_len, _ = hidden_states.size()
@@ -80,7 +83,7 @@ class SliceUpdateQwen2Attention(Qwen2Attention):
 
         # Compute end_step from attention_mask shape
         end_step = attention_mask.shape[-1]
-        key_states, value_states = past_key_value.update(
+        key_states, value_states = past_key_values.update(
             key_states,
             value_states,
             self.layer_idx,

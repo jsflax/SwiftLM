@@ -351,17 +351,23 @@ extension RawRepresentable where Self : CaseIterable, RawValue : JSONSchemaConve
         RawValue.type
     }
     public static var _swiftLMJsonSchemaProperties: [String: JSONSchema.Property]? { nil }
+    
     public init(from json: Any) throws {
         guard let json = json as? RawValue else {
             throw JSONDecodingError.invalidType
         }
         self.init(rawValue: json)!
     }
+    
     public static var jsonSchema: [String: Any] {
         [
             "type": RawValue.type,
             "enum": Self.allCases.map(\.rawValue)
         ]
+    }
+    
+    public static func decode<K: CodingKey>(from container: KeyedDecodingContainer<K>, forKey key: K) throws -> Self where RawValue == Int {
+        return Self(rawValue: Int(try container.decode(String.self, forKey: key)) as! Self.RawValue)!
     }
 }
 
@@ -1059,9 +1065,27 @@ extension MKPointOfInterestCategory: JSONSchemaKey {}
 #if canImport(OpenAI)
 import protocol OpenAI.JSONSchemaEnumConvertible
 
-extension MKPointOfInterestCategory: @retroactive OpenAI.JSONSchemaEnumConvertible {
+extension MKPointOfInterestCategory: @retroactive OpenAI.JSONSchemaEnumConvertible, JSONSchemaConvertible {
     public var caseNames: [String] {
         Self.allCases.map(\.rawValue)
+    }
+    
+    public init(from json: Any) throws {
+        guard let json = json as? String else {
+            throw JSONDecodingError.invalidType
+        }
+        self.init(rawValue: json)
+    }
+    
+    public static var _swiftLMJsonSchemaProperties: [(String, JSONSchema.Property)]? {
+        nil
+    }
+    
+    public static var type: String { "string" }
+    public static var jsonSchema: [String: Any] {
+        [
+            "type": "string"
+        ]
     }
 }
 
@@ -1209,6 +1233,23 @@ extension DateInterval: Generable {
         ])
     }
 }
+
+@available(iOS 26.0, macOS 26.0, *)
+extension MKPointOfInterestCategory: Generable {
+    public static var generationSchema: GenerationSchema {
+        // Date is represented as a string in ISO format
+        GenerationSchema(type: Self.self, properties: [])
+    }
+
+    public init(_ content: GeneratedContent) throws {
+        self.init(rawValue: try content.value())
+    }
+
+    public var generatedContent: GeneratedContent {
+        return GeneratedContent(self.rawValue)
+    }
+}
+
 #endif
 #endif
 

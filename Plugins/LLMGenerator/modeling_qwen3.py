@@ -14,7 +14,12 @@ from transformers.models.qwen3.modeling_qwen3 import (
 
 
 class SliceUpdateKeyValueCache(Cache):
-    """KV cache with slice-based updates for efficient incremental decoding."""
+    """
+    Custom KV cache for CoreML export with slice-based updates.
+    Inherits from transformers.Cache to satisfy type checks in newer transformers.
+    """
+
+    is_compileable = False
 
     def __init__(self, shape: Tuple[int, ...], device="cpu", dtype=torch.float32):
         super().__init__()
@@ -40,11 +45,18 @@ class SliceUpdateKeyValueCache(Cache):
         v_cache: torch.Tensor = self.v_cache[layer_idx, :, :, :end, :]
         return k_cache, v_cache
 
-    def get_seq_length(self, _: Optional[int] = 0) -> int:
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         return self.past_seen_tokens
 
     def get_max_cache_shape(self) -> Optional[int]:
         return self.k_cache.shape[3]
+
+    def __len__(self) -> int:
+        return self.k_cache.shape[0]
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield (self.k_cache[i], self.v_cache[i])
 
 
 class SliceUpdateQwen3Attention(Qwen3Attention):
@@ -65,7 +77,7 @@ class SliceUpdateQwen3Attention(Qwen3Attention):
         hidden_states: torch.Tensor,
         position_embeddings: Tuple[torch.Tensor, torch.Tensor],
         attention_mask: Optional[torch.Tensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_value: Optional["SliceUpdateKeyValueCache"] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, ...]:
         bsz, q_len, _ = hidden_states.size()

@@ -1,22 +1,41 @@
 #!/usr/bin/env python3
 """
-Export Hugging Face LLMs to CoreML format for use with LlamaANE.
+Export Hugging Face LLMs to CoreML format for use with SwiftLM.
 
 Usage:
     python export.py <model_id> [options]
 
 Examples:
+    # Causal LMs (text generation)
     python export.py meta-llama/Llama-3.2-1B-Instruct
     python export.py Qwen/Qwen2.5-1.5B-Instruct --max-context 4096
     python export.py mistralai/Mistral-7B-Instruct-v0.3 --quantize int4
+
+    # Embedding models
+    python export.py nomic-ai/nomic-embed-text-v1.5 --embedding
+    python export.py BAAI/bge-small-en-v1.5 --embedding --pooling cls
 """
 
 import argparse
 import logging
+import multiprocessing
 import os
 import sys
 from pathlib import Path
 from typing import Optional
+
+# Fix multiprocessing issues with PyInstaller
+if getattr(sys, 'frozen', False):
+    # Disable the multiprocessing resource tracker to avoid cleanup crash
+    try:
+        from multiprocessing import resource_tracker
+        def _noop(*args, **kwargs):
+            pass
+        resource_tracker.ensure_running = _noop
+        resource_tracker.register = _noop
+        resource_tracker.unregister = _noop
+    except Exception:
+        pass
 
 import coremltools as ct
 import numpy as np
@@ -31,14 +50,19 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 # Metadata keys for Swift to read
 METADATA_KEYS = {
     "model_id": "co.huggingface.exporters.name",
-    "num_hidden_layers": "co.llamaane.num_hidden_layers",
-    "num_attention_heads": "co.llamaane.num_attention_heads",
-    "num_key_value_heads": "co.llamaane.num_key_value_heads",
-    "hidden_size": "co.llamaane.hidden_size",
-    "head_dim": "co.llamaane.head_dim",
-    "vocab_size": "co.llamaane.vocab_size",
-    "max_position_embeddings": "co.llamaane.max_position_embeddings",
-    "model_type": "co.llamaane.model_type",
+    "num_hidden_layers": "co.swiftlm.num_hidden_layers",
+    "num_attention_heads": "co.swiftlm.num_attention_heads",
+    "num_key_value_heads": "co.swiftlm.num_key_value_heads",
+    "hidden_size": "co.swiftlm.hidden_size",
+    "head_dim": "co.swiftlm.head_dim",
+    "vocab_size": "co.swiftlm.vocab_size",
+    "max_position_embeddings": "co.swiftlm.max_position_embeddings",
+    "model_type": "co.swiftlm.model_type",
+    # Embedding-specific metadata
+    "output_type": "co.swiftlm.output_type",  # "logits" or "embeddings"
+    "embedding_dim": "co.swiftlm.embedding_dim",
+    "pooling_strategy": "co.swiftlm.pooling_strategy",
+    "normalize_embeddings": "co.swiftlm.normalize_embeddings",
 }
 
 
@@ -72,7 +96,7 @@ def generate_causal_mask(seq_length: int) -> np.ndarray:
 
 
 def build_model_metadata(config, model_id: str, max_context: int) -> dict:
-    """Build metadata dictionary to embed in the CoreML model."""
+    """Build metadata dictionary to embed in the CoreML model (causal LM)."""
     head_dim = config.hidden_size // config.num_attention_heads
     return {
         METADATA_KEYS["model_id"]: model_id,
@@ -84,6 +108,30 @@ def build_model_metadata(config, model_id: str, max_context: int) -> dict:
         METADATA_KEYS["vocab_size"]: str(config.vocab_size),
         METADATA_KEYS["max_position_embeddings"]: str(getattr(config, "max_position_embeddings", max_context)),
         METADATA_KEYS["model_type"]: str(config.model_type),
+        METADATA_KEYS["output_type"]: "logits",
+    }
+
+
+def build_embedding_metadata(
+    config,
+    model_id: str,
+    max_context: int,
+    pooling: str,
+    normalize: bool,
+) -> dict:
+    """Build metadata dictionary for embedding models."""
+    return {
+        METADATA_KEYS["model_id"]: model_id,
+        METADATA_KEYS["num_hidden_layers"]: str(getattr(config, "num_hidden_layers", 12)),
+        METADATA_KEYS["num_attention_heads"]: str(getattr(config, "num_attention_heads", 12)),
+        METADATA_KEYS["hidden_size"]: str(config.hidden_size),
+        METADATA_KEYS["vocab_size"]: str(config.vocab_size),
+        METADATA_KEYS["max_position_embeddings"]: str(getattr(config, "max_position_embeddings", max_context)),
+        METADATA_KEYS["model_type"]: str(config.model_type),
+        METADATA_KEYS["output_type"]: "embeddings",
+        METADATA_KEYS["embedding_dim"]: str(config.hidden_size),
+        METADATA_KEYS["pooling_strategy"]: pooling,
+        METADATA_KEYS["normalize_embeddings"]: str(normalize).lower(),
     }
 
 
@@ -145,6 +193,184 @@ def test_generation(
     output = tokenizer.decode(generated_ids, skip_special_tokens=True)
     print(f"Generated: {output}\n")
     return output
+
+
+def test_embedding(
+    mlmodel: MLModel,
+    tokenizer,
+    texts: list[str],
+) -> np.ndarray:
+    """Test the exported embedding model."""
+    print(f"\nTesting embedding with {len(texts)} texts...")
+
+    embeddings = []
+    for text in texts:
+        tokens = tokenizer(text, return_tensors="np", padding=True, truncation=True)
+        input_ids = tokens["input_ids"].astype(np.int32)
+        attention_mask = tokens["attention_mask"].astype(np.int32)
+
+        predictions = mlmodel.predict({
+            "inputIds": input_ids,
+            "attentionMask": attention_mask,
+        })
+
+        embedding = predictions["embeddings"]
+        embeddings.append(embedding[0])  # Remove batch dimension
+        print(f"  '{text[:30]}...' -> shape {embedding.shape}")
+
+    embeddings = np.array(embeddings)
+
+    # Compute pairwise cosine similarities
+    if len(texts) > 1:
+        print("\nCosine similarities:")
+        for i in range(len(texts)):
+            for j in range(i + 1, len(texts)):
+                sim = np.dot(embeddings[i], embeddings[j]) / (
+                    np.linalg.norm(embeddings[i]) * np.linalg.norm(embeddings[j])
+                )
+                print(f"  [{i}] vs [{j}]: {sim:.4f}")
+
+    return embeddings
+
+
+def export_embedding_model(
+    model_id: str,
+    output_dir: str = "models",
+    max_context: int = 512,
+    pooling: str = "mean",
+    normalize: bool = True,
+    quantize: Optional[str] = None,
+    skip_test: bool = False,
+) -> str:
+    """
+    Export a HuggingFace embedding model to CoreML format.
+
+    Args:
+        model_id: HuggingFace model ID (e.g., "nomic-ai/nomic-embed-text-v1.5")
+        output_dir: Directory to save exported models
+        max_context: Maximum sequence length
+        pooling: Pooling strategy ("mean", "cls", "last", "none")
+        normalize: Whether to L2-normalize embeddings
+        quantize: Quantization type ("int4" or None)
+        skip_test: Skip embedding test after export
+
+    Returns:
+        Path to the exported model
+    """
+    from modeling_embedding import EmbeddingModelWrapper, get_embedding_wrapper
+
+    print(f"Exporting embedding model: {model_id}")
+    print(f"Max context: {max_context}")
+    print(f"Pooling: {pooling}, Normalize: {normalize}")
+
+    # Create output directory
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Load config and tokenizer
+    print("Loading model configuration...")
+    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+
+    # Define output paths
+    base_name = Path(model_id).name
+    suffix = "_Embedding"
+    fp16_path = output_path / f"{base_name}{suffix}.mlpackage"
+    int4_path = output_path / f"{base_name}{suffix}_Int4.mlpackage"
+    tokenizer_path = output_path / f"{base_name}_tokenizer"
+
+    # Save tokenizer
+    print(f"Saving tokenizer to: {tokenizer_path}")
+    tokenizer.save_pretrained(tokenizer_path)
+
+    # Check if model already exists
+    if fp16_path.exists():
+        print(f"Loading existing model from: {fp16_path}")
+        mlmodel = ct.models.MLModel(str(fp16_path))
+    else:
+        # Load and wrap the PyTorch model
+        print("Loading PyTorch model...")
+        WrapperClass = get_embedding_wrapper(model_id)
+        torch_model = WrapperClass(model_id, normalize=normalize)
+
+        # Override pooling if specified
+        if pooling != torch_model.pooling:
+            print(f"Overriding default pooling '{torch_model.pooling}' with '{pooling}'")
+            torch_model.pooling = pooling
+
+        torch_model.eval()
+
+        # Create sample inputs for tracing
+        sample_text = "Hello, world!"
+        sample_tokens = tokenizer(sample_text, return_tensors="pt", padding=True)
+        input_ids = sample_tokens["input_ids"]
+        attention_mask = sample_tokens["attention_mask"].float()
+
+        # Trace the model
+        print("Tracing model...")
+        traced_model = torch.jit.trace(torch_model, (input_ids, attention_mask))
+        traced_model.eval()
+
+        # Define CoreML input/output specs
+        seq_length = ct.RangeDim(lower_bound=1, upper_bound=max_context, default=32)
+
+        inputs = [
+            ct.TensorType(shape=(1, seq_length), dtype=np.int32, name="inputIds"),
+            ct.TensorType(shape=(1, seq_length), dtype=np.float32, name="attentionMask"),
+        ]
+
+        # Output shape depends on pooling
+        if pooling == "none":
+            # Full sequence embeddings
+            outputs = [ct.TensorType(dtype=np.float16, name="embeddings")]
+        else:
+            # Pooled embeddings [batch, hidden_dim]
+            outputs = [ct.TensorType(dtype=np.float16, name="embeddings")]
+
+        # Convert to CoreML (no states needed for embedding models)
+        # Note: iOS18 target produces NaN for BERT-style models, use iOS17
+        print("Converting to CoreML...")
+        mlmodel = ct.convert(
+            traced_model,
+            inputs=inputs,
+            outputs=outputs,
+            minimum_deployment_target=ct.target.iOS17,
+        )
+
+        # Add metadata
+        metadata = build_embedding_metadata(config, model_id, max_context, pooling, normalize)
+        mlmodel._spec.description.metadata.userDefined.update(metadata)
+
+        # Save FP16 model
+        print(f"Saving FP16 model to: {fp16_path}")
+        mlmodel.save(str(fp16_path))
+
+    # Apply quantization if requested
+    final_model = mlmodel
+    final_path = str(fp16_path)
+
+    if quantize == "int4":
+        if int4_path.exists():
+            print(f"Loading existing INT4 model from: {int4_path}")
+        else:
+            quantize_to_int4(mlmodel, str(int4_path))
+        final_model = ct.models.MLModel(str(int4_path))
+        final_path = str(int4_path)
+
+    # Test embedding
+    if not skip_test:
+        test_texts = [
+            "The quick brown fox jumps over the lazy dog.",
+            "A fast auburn canine leaps above a sleepy hound.",
+            "Machine learning is transforming the world.",
+        ]
+        test_embedding(final_model, tokenizer, test_texts)
+
+    print(f"\nExport complete!")
+    print(f"Model: {final_path}")
+    print(f"Tokenizer: {tokenizer_path}")
+
+    return final_path
 
 
 def export_model(
@@ -293,9 +519,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Causal LMs (text generation)
   %(prog)s meta-llama/Llama-3.2-1B-Instruct
   %(prog)s Qwen/Qwen2.5-1.5B-Instruct --max-context 4096
   %(prog)s mistralai/Mistral-7B-Instruct-v0.3 --quantize int4
+
+  # Embedding models
+  %(prog)s nomic-ai/nomic-embed-text-v1.5 --embedding
+  %(prog)s BAAI/bge-small-en-v1.5 --embedding --pooling cls
+  %(prog)s intfloat/e5-small-v2 --embedding --quantize int4
         """,
     )
     parser.add_argument(
@@ -310,8 +542,8 @@ Examples:
     parser.add_argument(
         "--max-context", "-c",
         type=int,
-        default=8192,
-        help="Maximum context length (default: 8192)",
+        default=None,
+        help="Maximum context length (default: 8192 for LLMs, 512 for embeddings)",
     )
     parser.add_argument(
         "--quantize", "-q",
@@ -321,19 +553,51 @@ Examples:
     parser.add_argument(
         "--skip-test",
         action="store_true",
-        help="Skip generation test after export",
+        help="Skip generation/embedding test after export",
+    )
+    # Embedding-specific arguments
+    parser.add_argument(
+        "--embedding", "-e",
+        action="store_true",
+        help="Export as embedding model (not causal LM)",
+    )
+    parser.add_argument(
+        "--pooling",
+        choices=["mean", "cls", "last", "none"],
+        default="mean",
+        help="Pooling strategy for embeddings (default: mean)",
+    )
+    parser.add_argument(
+        "--no-normalize",
+        action="store_true",
+        help="Don't L2-normalize embeddings (default: normalize)",
     )
 
     args = parser.parse_args()
 
     try:
-        export_model(
-            model_id=args.model_id,
-            output_dir=args.output_dir,
-            max_context=args.max_context,
-            quantize=args.quantize,
-            skip_test=args.skip_test,
-        )
+        if args.embedding:
+            # Export embedding model
+            max_context = args.max_context if args.max_context else 512
+            export_embedding_model(
+                model_id=args.model_id,
+                output_dir=args.output_dir,
+                max_context=max_context,
+                pooling=args.pooling,
+                normalize=not args.no_normalize,
+                quantize=args.quantize,
+                skip_test=args.skip_test,
+            )
+        else:
+            # Export causal LM
+            max_context = args.max_context if args.max_context else 8192
+            export_model(
+                model_id=args.model_id,
+                output_dir=args.output_dir,
+                max_context=max_context,
+                quantize=args.quantize,
+                skip_test=args.skip_test,
+            )
     except Exception as e:
         print(f"Error: {e}", file=sys.stderr)
         sys.exit(1)

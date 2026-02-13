@@ -4,7 +4,6 @@ from typing import Tuple, Dict, Optional, Any
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, PretrainedConfig
-from transformers.cache_utils import Cache
 from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
     DeepseekV3Attention,
     DeepseekV3Config,
@@ -12,9 +11,18 @@ from transformers.models.deepseek_v3.modeling_deepseek_v3 import (
     repeat_kv,
 )
 
-class SliceUpdateKeyValueCache(Cache):
+
+class SliceUpdateKeyValueCache:
+    """
+    Custom KV cache for CoreML export with slice-based updates.
+
+    Does not inherit from transformers.Cache to avoid breaking changes in the
+    Cache base class API (transformers 4.55+ requires layers/layer_class_to_replicate).
+    """
+
+    is_compileable = False
+
     def __init__(self, shape: Tuple[int, ...], device="cpu", dtype=torch.float32):
-        super().__init__()
         self.past_seen_tokens: int = 0
         self.k_cache: torch.Tensor = torch.zeros(shape, dtype=dtype, device=device)
         self.v_cache: torch.Tensor = torch.zeros(shape, dtype=dtype, device=device)
@@ -34,8 +42,15 @@ class SliceUpdateKeyValueCache(Cache):
         v_cache: torch.Tensor = self.v_cache[layer_idx, :, :, :end, :]
         return k_cache, v_cache
 
-    def get_seq_length(self, _: Optional[int] = 0) -> int:
+    def get_seq_length(self, layer_idx: Optional[int] = 0) -> int:
         return self.past_seen_tokens
+
+    def __len__(self) -> int:
+        return self.k_cache.shape[0]
+
+    def __iter__(self):
+        for i in range(len(self)):
+            yield (self.k_cache[i], self.v_cache[i])
 
 
 class SliceUpdateDeepseekV3Attention(DeepseekV3Attention):
@@ -48,7 +63,7 @@ class SliceUpdateDeepseekV3Attention(DeepseekV3Attention):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor,
         position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Cache] = None,
+        past_key_values: Optional["SliceUpdateKeyValueCache"] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, ...]:
         bsz, q_len, _ = hidden_states.size()
@@ -65,7 +80,7 @@ class SliceUpdateDeepseekV3Attention(DeepseekV3Attention):
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         end_step = attention_mask.shape[-1]
-        key_states, value_states = past_key_value.update(
+        key_states, value_states = past_key_values.update(
             key_states,
             value_states,
             self.layer_idx,

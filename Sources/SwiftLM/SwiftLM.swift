@@ -23,6 +23,7 @@ public enum SwiftLMError: Error, LocalizedError {
     case contextLengthExceeded(current: Int, maximum: Int)
     case invalidLogitsOutput
     case unsupportedModelArchitecture(String)
+    case systemPromptMismatch(expected: String, got: String)
 
     public var errorDescription: String? {
         switch self {
@@ -46,6 +47,8 @@ public enum SwiftLMError: Error, LocalizedError {
             return "Model returned invalid logits output"
         case .unsupportedModelArchitecture(let arch):
             return "Unsupported model architecture: \(arch)"
+        case .systemPromptMismatch(let expected, let got):
+            return "System prompt mismatch: session has '\(expected)' but state has '\(got)'"
         }
     }
 }
@@ -181,7 +184,13 @@ public struct MistralChatTemplate: ChatTemplate, Sendable {
 }
 
 public struct QwenChatTemplate: ChatTemplate, Sendable {
-    public init() {}
+    /// Whether to enable Qwen3's thinking/reasoning mode.
+    /// When false (default), adds `/no_think` to disable chain-of-thought output.
+    public var enableThinking: Bool
+
+    public init(enableThinking: Bool = false) {
+        self.enableThinking = enableThinking
+    }
 
     public var beginOfText: String { "" }
     public var endOfTurn: String { "<|im_end|>" }
@@ -191,7 +200,8 @@ public struct QwenChatTemplate: ChatTemplate, Sendable {
     }
 
     public func formatUserMessage(_ message: String) -> String {
-        "<|im_start|>user\n\(message)\(endOfTurn)\n"
+        let suffix = enableThinking ? "" : " /no_think"
+        return "<|im_start|>user\n\(message)\(suffix)\(endOfTurn)\n"
     }
 
     public func formatAssistantPrefix() -> String {
@@ -200,9 +210,13 @@ public struct QwenChatTemplate: ChatTemplate, Sendable {
 
     public func formatFullPrompt(system: String, userMessages: [(role: String, content: String)]) -> String {
         var result = formatSystemPrompt(system)
-        for message in userMessages {
+        for (index, message) in userMessages.enumerated() {
             if message.role == "user" {
-                result += formatUserMessage(message.content)
+                // Only add /no_think to the last user message
+                let isLast = index == userMessages.count - 1 ||
+                    userMessages[(index + 1)...].allSatisfy { $0.role != "user" }
+                let suffix = (!enableThinking && isLast) ? " /no_think" : ""
+                result += "<|im_start|>user\n\(message.content)\(suffix)\(endOfTurn)\n"
             } else if message.role == "assistant" {
                 result += formatAssistantPrefix() + message.content + endOfTurn + "\n"
             }

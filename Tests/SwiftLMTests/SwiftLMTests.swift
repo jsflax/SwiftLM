@@ -1852,6 +1852,166 @@ struct SwiftLMTests {
     @Test func testMKPointOfInterestCategory() {
         print(MKPointOfInterestCategory.allCases.map(\.description))
     }
+
+    // MARK: - Prefill / Save / Restore Tests
+
+    @Test("Prefill with text populates KV cache and allows inference")
+    func testPrefillText() async throws {
+        let modelPath = "\(testModelsPath)/Llama-3.2-1B-Instruct_Int4.mlpackage"
+        let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
+
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = .cpuAndGPU
+        let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
+
+        let lm = try CoreMLLanguageModel(model: mlModel)
+        try await lm.warmup()
+
+        let session = await lm.makeSession(
+            systemPrompt: "You are a helpful assistant.",
+            logging: true
+        )
+
+        // Prefill with a formatted conversation history
+        try await session.prefill(messages: [
+            (role: "user", content: "My name is Alice."),
+            (role: "assistant", content: "Nice to meet you, Alice! How can I help you today?")
+        ])
+
+        // Verify buffer has tokens
+        let usedAfterPrefill = await session.usedTokens
+        print("Tokens after prefill: \(usedAfterPrefill)")
+        #expect(usedAfterPrefill > 0, "Buffer should have tokens after prefill")
+
+        // Run inference that references the prefilled context
+        let stream = await session.infer(prompt: "What is my name?")
+        var output = ""
+        for await token in stream {
+            output += token
+            print(token, terminator: "")
+        }
+        print()
+
+        print("Output: \(output)")
+        #expect(!output.isEmpty, "Should generate output after prefill")
+        // The model should reference "Alice" from the prefilled context
+        #expect(output.lowercased().contains("alice"), "Model should recall 'Alice' from prefilled context")
+    }
+
+    @Test("Save and restore conversation state")
+    func testSaveRestore() async throws {
+        let modelPath = "\(testModelsPath)/Llama-3.2-1B-Instruct_Int4.mlpackage"
+        let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
+
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = .cpuAndGPU
+        let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
+
+        let lm = try CoreMLLanguageModel(model: mlModel)
+        try await lm.warmup()
+
+        let session = await lm.makeSession(
+            systemPrompt: "You are a helpful assistant."
+        )
+
+        // Have a conversation
+        var output1 = ""
+        for await token in await session.infer(prompt: "The capital of France is") {
+            output1 += token
+        }
+        print("First response: \(output1)")
+
+        // Save state
+        let state = await session.save()
+        #expect(!state.tokens.isEmpty, "Saved state should contain tokens")
+        #expect(state.systemPrompt == "You are a helpful assistant.", "System prompt should be preserved")
+
+        // Verify state is Codable
+        let encoder = JSONEncoder()
+        let data = try encoder.encode(state)
+        let decoder = JSONDecoder()
+        let decoded = try decoder.decode(Session.ConversationState.self, from: data)
+        #expect(decoded.tokens == state.tokens, "Decoded tokens should match")
+        #expect(decoded.systemPrompt == state.systemPrompt, "Decoded system prompt should match")
+
+        print("State saved: \(state.tokens.count) tokens, serialized to \(data.count) bytes")
+    }
+
+    @Test("Reset clears session state")
+    func testReset() async throws {
+        let modelPath = "\(testModelsPath)/Llama-3.2-1B-Instruct_Int4.mlpackage"
+        let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
+
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = .cpuAndGPU
+        let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
+
+        let lm = try CoreMLLanguageModel(model: mlModel)
+        try await lm.warmup()
+
+        let session = await lm.makeSession(
+            systemPrompt: "You are a helpful assistant."
+        )
+
+        // Prefill some context
+        try await session.prefill(messages: [
+            (role: "user", content: "Remember the number 42."),
+            (role: "assistant", content: "I'll remember that! The number is 42.")
+        ])
+
+        let usedBefore = await session.usedTokens
+        #expect(usedBefore > 0, "Should have tokens before reset")
+
+        // Reset
+        await session.reset()
+        let usedAfter = await session.usedTokens
+        #expect(usedAfter == 0, "Should have no tokens after reset")
+
+        // Should be able to run inference again after reset
+        var output = ""
+        for await token in await session.infer(prompt: "Hello!") {
+            output += token
+        }
+        print("After reset: \(output)")
+        #expect(!output.isEmpty, "Should generate output after reset")
+    }
+
+    @Test("Restore with mismatched system prompt throws error")
+    func testRestoreMismatchThrows() async throws {
+        let modelPath = "\(testModelsPath)/Llama-3.2-1B-Instruct_Int4.mlpackage"
+        let compiledURL = try await MLModel.compileModel(at: URL(fileURLWithPath: modelPath))
+
+        let mlConfig = MLModelConfiguration()
+        mlConfig.computeUnits = .cpuAndGPU
+        let mlModel = try MLModel(contentsOf: compiledURL, configuration: mlConfig)
+
+        let lm = try CoreMLLanguageModel(model: mlModel)
+
+        let session = await lm.makeSession(
+            systemPrompt: "You are a helpful assistant."
+        )
+
+        let mismatchedState = Session.ConversationState(
+            tokens: [1, 2, 3],
+            systemPrompt: "You are a pirate."
+        )
+
+        do {
+            try await session.restore(from: mismatchedState)
+            #expect(Bool(false), "Should have thrown systemPromptMismatch")
+        } catch let error as SwiftLMError {
+            if case .systemPromptMismatch = error {
+                print("Correctly threw systemPromptMismatch: \(error.localizedDescription)")
+            } else {
+                #expect(Bool(false), "Wrong error type: \(error)")
+            }
+        }
+
+        // Should succeed with ignoreSystemPromptMismatch
+        try await session.restore(from: mismatchedState, ignoreSystemPromptMismatch: true)
+        let used = await session.usedTokens
+        #expect(used == 3, "Should have 3 tokens after restore with ignore flag")
+    }
 }
 import MapKit
 

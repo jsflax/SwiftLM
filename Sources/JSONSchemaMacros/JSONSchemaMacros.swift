@@ -338,7 +338,7 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
                 @available(iOS 26.0, macOS 26.0, *)
                 public init(_ content: FoundationModels.GeneratedContent) throws {
                     let rawValue: String = try content.value()
-                    guard let value = Self(rawValue: rawValue as! RawValue) else {
+                    guard let value = Self(rawValue: rawValue) else {
                         throw JSONDecodingError.invalidValue
                     }
                     self = value
@@ -347,7 +347,7 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
                 """
                 @available(iOS 26.0, macOS 26.0, *)
                 public var generatedContent: FoundationModels.GeneratedContent {
-                    FoundationModels.GeneratedContent(rawValue as! String)
+                    FoundationModels.GeneratedContent(rawValue)
                 }
                 """
             ]
@@ -451,7 +451,7 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
             """,
             """
             public func encode(to encoder: Swift.Encoder) throws {
-                var container = try encoder.container(keyedBy: CodingKeys.self)
+                var container = encoder.container(keyedBy: CodingKeys.self)
                 \(raw: qualifiedMembers.map {
                     """
                     try container.encode(\($0.name), forKey: .\($0.name))
@@ -653,11 +653,7 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
                 memberBlock: """
                 {
                     public static func decode<K: CodingKey>(from container: KeyedDecodingContainer<K>, forKey key: K) throws -> Self {
-                        if RawValue.self is Int.Type {
-                            return Self(rawValue: Int(try container.decode(String.self, forKey: key)) as! Self.RawValue)!
-                        } else {
-                            return try container.decode(Self.self, forKey: key)
-                        }
+                        return try container.decode(Self.self, forKey: key)
                     }
 
                     public static var _swiftLMJsonSchemaProperties: [(String, _GrammarJSONSchema.Property)]? {

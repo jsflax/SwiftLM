@@ -1,18 +1,7 @@
-# Core dependencies for LLM export to CoreML
-torch==2.5.1
-transformers==4.51.3
-coremltools==8.1
-numpy==2.2.0
-tokenizers==0.21.0
-safetensors==0.4.5
-
-# Required by transformers
-Jinja2>=3.1.0
-regex>=2024.0.0
-requests>=2.32.0
-tqdm>=4.67.0
-packaging>=24.0
-filelock>=3.16.0
-fsspec>=2024.10.0
-PyYAML>=6.0.0
-protobuf>=5.0.0
+# Pinned versions for stable CoreML export
+# Qwen3 requires transformers >= 4.52
+# Pin to 4.52.x for stability
+transformers>=4.52.0,<4.53.0
+torch>=2.0.0
+coremltools>=7.0
+numpy<2.0

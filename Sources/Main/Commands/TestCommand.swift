@@ -20,6 +20,12 @@ struct Test: AsyncParsableCommand {
     @Option(name: [.customLong("system")], help: "System prompt")
     var systemPrompt: String = "You are a helpful assistant."
 
+    @Option(name: [.customLong("temperature")], help: "Sampling temperature (0 = greedy)")
+    var temperature: Double = 1.0
+
+    @Option(name: [.customLong("top-p")], help: "Top-p (nucleus) sampling")
+    var topP: Double = 1.0
+
     mutating func run() async throws {
         print("Loading model from: \(modelPath)")
         print("Prompt: \(prompt)")
@@ -32,7 +38,12 @@ struct Test: AsyncParsableCommand {
         print("Generating response...")
         print("---")
 
-        let session = await model.makeSession(systemPrompt: systemPrompt)
+        let session = await model.makeSession(
+            systemPrompt: systemPrompt,
+            temperature: temperature,
+            topP: topP,
+            doSample: temperature > 0 && temperature != 1.0
+        )
         var output = ""
         for await token in await session.infer(prompt: prompt) {
             print(token, terminator: "")
