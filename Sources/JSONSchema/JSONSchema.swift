@@ -1299,6 +1299,7 @@ public macro SchemaGuide(_ description: String? = nil, _ constraints: GuideConst
 
 // MARK: - Dictionary Generable Support (Enum Keys with CaseIterable)
 
+#if canImport(FoundationModels)
 @available(iOS 26.0, macOS 26.0, *)
 extension Dictionary: ConvertibleFromGeneratedContent where Key: RawRepresentable & CaseIterable, Key.RawValue == String, Value: Generable {
     public init(_ content: GeneratedContent) throws {
@@ -1347,6 +1348,7 @@ extension Dictionary: Generable where Key: RawRepresentable & CaseIterable, Key.
         return GenerationSchema(type: Self.self, properties: properties)
     }
 }
+#endif
 
 #if canImport(OpenAI)
 import protocol OpenAI.JSONSchemaConvertible
