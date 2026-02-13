@@ -80,14 +80,12 @@ extension Session: LanguageModelConversation {
 extension CoreMLLanguageModel: LanguageModel {
     // Generic version for Encodable types - JSON encodes the input
     public func structuredAsk<Input, Output>(system: String, input: Input, output: Output.Type) async throws -> Output where Input : Encodable {
-        print("🔴 structuredAsk<Input: Encodable> - JSON encoding input of type: \(type(of: input))")
         let encodedInput: String
         if let input = input as? String {
             encodedInput = input
         } else {
             encodedInput = try String(data: JSONEncoder().encode(input), encoding: .utf8)!
         }
-        print("   Input preview: \(encodedInput.prefix(100))...")
         let output = output as! (JSONSchemaConvertible & Sendable).Type
         return try await oneShot(prompt: system, input: encodedInput, output: output) as! Output
     }
@@ -95,17 +93,13 @@ extension CoreMLLanguageModel: LanguageModel {
     // String-specific version - uses the string directly WITHOUT JSON encoding
     // This matches how training data is formatted (plain text, not JSON-escaped)
     public func structuredAsk<Output>(system: String, input: String, output: Output.Type) async throws -> Output where Output: JSONSchemaConvertible {
-        print("🟢 structuredAsk<String> - NOT encoding input, using plain text")
-        print("   Input preview: \(input.prefix(100))...")
         let output = output as! (JSONSchemaConvertible & Sendable).Type
         return try await oneShot(prompt: system, input: input, output: output) as! Output
     }
 
     @available(macOS 26.0, iOS 26.0, *)
     public func structuredAsk<Input, Output>(system: String, input: Input, output: Output.Type) async throws -> Output where Input : Encodable, Output : Generable, Output : JSONSchemaConvertible, Output : Sendable {
-        print("🔴 structuredAsk<Input: Encodable, Output: Generable> - JSON encoding input of type: \(type(of: input))")
         let encodedInput = try String(data: JSONEncoder().encode(input), encoding: .utf8)!
-        print("   Input preview: \(encodedInput.prefix(100))...")
         let output = output as (JSONSchemaConvertible & Sendable).Type
         return try await oneShot(prompt: system, input: encodedInput, output: output) as! Output
     }
@@ -113,8 +107,6 @@ extension CoreMLLanguageModel: LanguageModel {
     // String-specific version for Generable outputs
     @available(macOS 26.0, iOS 26.0, *)
     public func structuredAsk<Output>(system: String, input: String, output: Output.Type) async throws -> Output where Output: JSONSchemaConvertible, Output: Generable, Output: Sendable {
-        print("🟢 structuredAsk<String, Output: Generable> - NOT encoding input, using plain text")
-        print("   Input preview: \(input.prefix(100))...")
         let output = output as (JSONSchemaConvertible & Sendable).Type
         return try await oneShot(prompt: system, input: input, output: output) as! Output
     }

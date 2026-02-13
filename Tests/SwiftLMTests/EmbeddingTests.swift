@@ -3,8 +3,14 @@ import Testing
 @testable import SwiftLM
 import CoreML
 
-// Path to test models
-private let embeddingModelsPath = "/Users/jason/Documents/SwiftLM/Plugins/LLMGenerator/models"
+// Path to test models - set SWIFTLM_TEST_MODELS_PATH or uses default relative path
+private let embeddingModelsPath = ProcessInfo.processInfo.environment["SWIFTLM_TEST_MODELS_PATH"]
+    ?? URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent() // SwiftLMTests/
+        .deletingLastPathComponent() // Tests/
+        .deletingLastPathComponent() // SwiftLM/
+        .appendingPathComponent("Plugins/LLMGenerator/models")
+        .path
 
 @Suite("Embedding Model Tests")
 struct EmbeddingTests {

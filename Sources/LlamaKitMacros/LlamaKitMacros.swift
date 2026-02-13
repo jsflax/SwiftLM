@@ -13,8 +13,6 @@ struct ToolMacro: BodyMacro {
         []
     }
 }
-///Users/jason/Projects/llama.cpp/swift/main/main.swift:34:1 Message("AttributeSyntax\n├─atSign: atSign\n├─attributeName: IdentifierTypeSyntax\n│ ╰─name: identifier(\"llamaActor\")\n├─leftParen: leftParen\n├─arguments: LabeledExprListSyntax\n│ ╰─[0]: LabeledExprSyntax\n│   ╰─expression: MemberAccessExprSyntax\n│     ├─period: period\n│     ╰─declName: DeclReferenceExprSyntax\n│       ╰─baseName: identifier(\"v3_2\")\n╰─rightParen: rightParen")
-
 class LlamaActorMacro: ExtensionMacro, MemberMacro {
     static func expansion(of node: AttributeSyntax, providingMembersOf declaration: some DeclGroupSyntax, conformingTo protocols: [TypeSyntax], in context: some MacroExpansionContext) throws -> [DeclSyntax] {
         

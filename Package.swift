@@ -45,10 +45,6 @@ let package = Package(
             ]
 //            path: "LlamaKitMacros"
         ),
-//        .plugin(name: "LLMGenerator",
-//                capability: .command(intent: .custom(verb: "generate", description: "Generate a CoreML Model"),
-//                                     permissions: [.writeToPackageDirectory(reason: "To add generated files")]),
-//                exclude: ["export.py", "modeling_llama.py", "venv"]),
         .target(
             name: "JSONSchema",
             dependencies: ["JSONSchemaMacros"]

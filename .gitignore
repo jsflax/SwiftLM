@@ -32,3 +32,10 @@ Plugins/LLMGenerator/*-merged/
 Plugins/LLMGenerator/qwen-*/
 Plugins/LLMGenerator/trip-models/
 Plugins/LLMGenerator/*.log
+
+# JoyJet-specific files
+Plugins/LLMGenerator/trip_finetune_data*.py
+Plugins/LLMGenerator/mapkit_poi.py
+
+# Local dev files
+Plugins/LLMGenerator/CLAUDE.md

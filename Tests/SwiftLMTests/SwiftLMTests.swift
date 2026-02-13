@@ -10,8 +10,14 @@ import Hub
 import XCTest
 import JSONSchema
 
-// Path to test models - update this to point to your exported models
-let testModelsPath = "/Users/jason/Documents/SwiftLM/Plugins/LLMGenerator/models"
+// Path to test models - set SWIFTLM_TEST_MODELS_PATH or uses default relative path
+let testModelsPath = ProcessInfo.processInfo.environment["SWIFTLM_TEST_MODELS_PATH"]
+    ?? URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent() // SwiftLMTests/
+        .deletingLastPathComponent() // Tests/
+        .deletingLastPathComponent() // SwiftLM/
+        .appendingPathComponent("Plugins/LLMGenerator/models")
+        .path
 
 @Suite("SwiftLMTest Suite")
 struct SwiftLMTests {
