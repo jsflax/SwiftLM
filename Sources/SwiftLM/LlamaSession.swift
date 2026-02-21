@@ -336,9 +336,15 @@ public actor Session {
             logger.debug("\(Thread.current) Prediction took \(elapsed)s")
             time = Date.now
 
+            #if arch(arm64)
             guard let logitsValue = output.featureValue(for: "logits")?.shapedArrayValue(of: Float16.self) else {
                 throw SwiftLMError.invalidLogitsOutput
             }
+            #else
+            guard let logitsValue = output.featureValue(for: "logits")?.shapedArrayValue(of: Float.self) else {
+                throw SwiftLMError.invalidLogitsOutput
+            }
+            #endif
 
             // Extract logits for the LAST token position only
             // Shape is [1, seq_len, vocab_size] - we want [vocab_size] from position [-1]
@@ -604,6 +610,7 @@ public actor Session {
 
             if requiresCausal {
                 let kvLen = min(totalBuffer.count, contextSize)
+                #if arch(arm64)
                 let causalMask: MLShapedArray<Float16>
 
                 if queryLen == 1 {
@@ -619,6 +626,21 @@ public actor Session {
                     causalMask = await onesTensor.bandPart(lowerBandCount: -1, upperBandCount: 0)
                         .shapedArray(of: Float16.self)
                 }
+                #else
+                let causalMask: MLShapedArray<Float>
+
+                if queryLen == 1 {
+                    causalMask = MLShapedArray<Float>(
+                        repeating: 1.0,
+                        shape: [1, 1, 1, kvLen]
+                    )
+                } else {
+                    let shape = [1, 1, kvLen, kvLen]
+                    let onesTensor = MLTensor(ones: shape, scalarType: Float.self)
+                    causalMask = await onesTensor.bandPart(lowerBandCount: -1, upperBandCount: 0)
+                        .shapedArray(of: Float.self)
+                }
+                #endif
                 inputDictionary["causalMask"] = MLFeatureValue(shapedArray: causalMask)
             }
 

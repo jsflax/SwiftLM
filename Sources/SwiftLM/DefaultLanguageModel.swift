@@ -346,7 +346,11 @@ public extension CoreMLLanguageModel {
 
         // Add causal mask if required
         if requiresCausal {
+            #if arch(arm64)
             let causalMask = MLShapedArray<Float16>(repeating: 1.0, shape: [1, 1, 1, 1])
+            #else
+            let causalMask = MLShapedArray<Float>(repeating: 1.0, shape: [1, 1, 1, 1])
+            #endif
             inputDict["causalMask"] = MLFeatureValue(shapedArray: causalMask)
         }
 
