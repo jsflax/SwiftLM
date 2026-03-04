@@ -73,7 +73,6 @@ let package = Package(
                 "SwiftLM",
                 .product(name: "ArgumentParser", package: "swift-argument-parser")
             ],
-            resources: [.copy("Resources/swiftlm-export")]
         ),
     ]
 )
