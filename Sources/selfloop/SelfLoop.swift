@@ -53,6 +53,44 @@ struct SelfLoop {
             while true { try await Task.sleep(nanoseconds: 3_600_000_000_000) }   // park
         }
 
+        // CLUSTER_TEST=1 — minimal connectivity smoke: build the pool (this box + CLUSTER_WORKERS), send
+        // a few REAL best-of-N jobs straight through the fan-out, print results + timing. No flywheel /
+        // quality-gate / eval — the worker gets jobs within seconds, so it directly proves the RPC path.
+        //   CLUSTER_TEST_JOBS (4) · CLUSTER_TEST_N (2) · CLUSTER_TEST_MAXTOK (512)
+        if env["CLUSTER_TEST"] != nil {
+            log("CLUSTER_TEST: loading model \(env["SWIFTLM_MODEL"] ?? "(default)") ...")
+            let model = try await MLXLanguageModel.load()
+            let localPool = model.makeLocalPool()
+            let remotes: [TracePool] = (env["CLUSTER_WORKERS"] ?? "").split(separator: ",").compactMap { spec in
+                let p = spec.split(separator: ":")
+                guard p.count == 2, let port = UInt16(p[1]) else { return nil }
+                return RemotePool(host: String(p[0]), port: port,
+                                  descriptor: WorkerDescriptor(id: "remote-\(spec)", models: [ModelID(model.modelId)],
+                                              batchWidth: 12, effectiveParallelism: 1, estTokensPerSecPerStream: 12))
+            }
+            let pool: TracePool = remotes.isEmpty ? localPool : FanOutPool(workers: [localPool] + remotes)
+            let n = Int(env["CLUSTER_TEST_N"] ?? "") ?? 2
+            let njobs = Int(env["CLUSTER_TEST_JOBS"] ?? "") ?? 4
+            let maxTok = Int(env["CLUSTER_TEST_MAXTOK"] ?? "") ?? 512
+            let mid = ModelID(model.modelId)
+            let jobs = DomainEvalSuite.active.prefix(njobs).compactMap { $0.prompt }.map {
+                GenJob(model: mid, prompt: $0, n: n, maxTokens: maxTok, temperature: 0.7)
+            }
+            log("CLUSTER_TEST: pool = this box + \(remotes.count) remote worker(s); dispatching \(jobs.count) best-of-\(n) jobs (round-robin) ...")
+            let t0 = Date()
+            let results = await pool.generateMany(jobs)
+            let dt = Date().timeIntervalSince(t0)
+            for (i, r) in results.enumerated() {
+                let ne = r.filter { !$0.isEmpty }.count
+                let first = r.first.map { String($0.prefix(70)).replacingOccurrences(of: "\n", with: "⏎") } ?? "(none)"
+                log("  job \(i) (worker \(i % (1 + remotes.count))): \(ne)/\(r.count) non-empty — \(first)")
+            }
+            let total = results.flatMap { $0 }.count
+            let nonEmpty = results.flatMap { $0 }.filter { !$0.isEmpty }.count
+            log("CLUSTER_TEST done in \(String(format: "%.1f", dt))s — \(nonEmpty)/\(total) non-empty completions across \(jobs.count) jobs / \(1 + remotes.count) worker(s)")
+            return
+        }
+
         let evalOnly = env["EVAL_ONLY"] != nil
         let registry = try Registry()
 

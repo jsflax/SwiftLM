@@ -14,6 +14,10 @@ import Network
 
 public enum ClusterError: Error, Sendable { case connectionClosed, badFrame, timeout }
 
+/// Unbuffered stderr log — the worker daemon parks, so `print()` (block-buffered stdout) never flushes;
+/// cluster events MUST go to stderr to be visible live.
+func clog(_ s: String) { FileHandle.standardError.write(Data((s + "\n").utf8)) }
+
 /// Wire messages. A GenJob in, the completions out (or an error string).
 struct JobRequest: Codable, Sendable { let job: GenJob }
 struct JobResponse: Codable, Sendable { let id: String; let completions: [String]; let error: String? }
@@ -101,10 +105,13 @@ public actor WorkerServer {
     /// Read job requests, run them on the local pool, write responses — pipelined until the peer closes.
     private static func serve(_ conn: NWConnection, pool: TracePool) async {
         let chan = FramedChannel(conn)
+        clog("[worker] ← connection accepted")
         while true {
             do {
                 let req = try await chan.receive(JobRequest.self)
+                clog("[worker] ← job \(req.job.id.prefix(8)) (n=\(req.job.n), maxTok=\(req.job.maxTokens)) — generating ...")
                 let comps = await pool.generate(req.job)
+                clog("[worker] → job \(req.job.id.prefix(8)): \(comps.filter { !$0.isEmpty }.count)/\(comps.count) completions sent")
                 try await chan.send(JobResponse(id: req.job.id, completions: comps, error: nil))
             } catch {
                 chan.cancel(); return
@@ -158,8 +165,10 @@ public actor RemotePool: TracePool {
             let chan = try await connect()
             try await chan.send(JobRequest(job: job))
             let resp = try await chan.receive(JobResponse.self)
+            clog("[coordinator] remote \(descriptor.id) served job \(job.id.prefix(8)) → \(resp.completions.count) completions")
             return resp.completions
         } catch {
+            clog("[coordinator] remote \(descriptor.id) FAILED job \(job.id.prefix(8)): \(error)")
             channel = nil   // failure detection: drop so the next job reconnects
             return []
         }

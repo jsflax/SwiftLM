@@ -43,8 +43,10 @@ extension DomainEvalSuite {
                 "for c in 0..<cols { maxV = max(maxV, data[base + c]) }",
                 "return Matrix(rows: rows, cols: cols, data: out)",
                 "let e = Foundation.exp(data[base + c] - maxV)",
-            ],
-            prompt: DomainPrompts.matrixSoftmaxRows),
+            ]),
+            // DEACTIVATED (no prompt): mutation-sanity FAILED — a stub body still passes
+            // testSoftmaxRowsSumToOne, so the test doesn't constrain the fn (it'd mint false-positive
+            // traces). Re-add a prompt only with a stronger covering test (exact values, not sum-to-one).
         DomainTask(
             id: "Matrix.softmaxRowsBackward", repo: llmFromScratch,
             targetFileRel: "Sources/MiniLLM/Core/Matrix.swift",

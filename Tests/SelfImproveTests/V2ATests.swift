@@ -159,7 +159,7 @@ final class ManifestTests: XCTestCase {
 
     func testActiveTasksHavePrompts() {
         let active = DomainEvalSuite.active
-        XCTAssertEqual(active.count, 26, "5 original + 4 backward + 17 auto-discovered moderate/hard = 26")
+        XCTAssertEqual(active.count, 25, "26 minus Matrix.softmaxRows (deactivated: non-constraining test)")
         // the original hand-authored five must remain active
         XCTAssertTrue(Set(active.map(\.id)).isSuperset(of:
                         ["Linear.backward", "GELU.backward", "Embedding.backward",
