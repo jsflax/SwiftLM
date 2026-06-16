@@ -1,8 +1,8 @@
 import Foundation
 import Generation
 import JSONSchema
+import MiniBPE
 @preconcurrency import CoreML
-import TensorUtils
 import Tokenizers
 import OSLog
 
@@ -16,6 +16,9 @@ public actor Session {
     // MARK: - Core Properties
     let model: MLModel
     let tokenizer: Tokenizer
+    /// Our own tokenizer (MiniBPE) used for grammar-constrained decoding — replaces
+    /// the swift-transformers fork's token↔id maps. nil = no constrained decoding.
+    let grammarTokenizer: (any GrammarTokenizer)?
     var kvCache: MLState?
     let contextSize: Int
     let chatTemplate: any ChatTemplate
@@ -43,10 +46,12 @@ public actor Session {
         config: GenerationConfig,
         chatTemplate: any ChatTemplate,
         tools: (any Llama32Tools)? = nil,
+        grammarTokenizer: (any GrammarTokenizer)? = nil,
         logging: Bool = false
     ) async {
         self.model = model
         self.tokenizer = tokenizer
+        self.grammarTokenizer = grammarTokenizer
         self.systemPrompt = systemPrompt
         self.contextSize = contextSize
         self.chatTemplate = chatTemplate
@@ -306,10 +311,11 @@ public actor Session {
         grammarType: (any JSONSchemaConvertible.Type)?,
         stream: AsyncStream<String>.Continuation?
     ) async throws -> String {
-        // Create grammar tracker if needed (scoped to this inference call)
+        // Create grammar tracker if needed (scoped to this inference call).
+        // Uses our own MiniBPE token↔id maps, not a third-party tokenizer.
         var grammarTracker: JSONSchemaStateTracker? = nil
-        if let grammarType {
-            grammarTracker = JSONSchemaStateTracker(schema: grammarType, tokenizer: tokenizer)
+        if let grammarType, let grammarTokenizer {
+            grammarTracker = JSONSchemaStateTracker(schema: grammarType, tokenizer: grammarTokenizer)
         }
 
         // Encode prompt and add to buffer

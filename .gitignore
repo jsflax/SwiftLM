@@ -1,5 +1,8 @@
 .DS_Store
 /.build
+/.xcode
+*.profraw
+*.bak
 /Packages
 xcuserdata/
 DerivedData/

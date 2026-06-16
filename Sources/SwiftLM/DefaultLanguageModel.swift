@@ -3,7 +3,7 @@ import CoreML
 import Tokenizers
 import Hub
 import Generation
-import TensorUtils
+import MiniBPE
 
 
 public final class CoreMLLanguageModel: @unchecked Sendable, LanguageModelProtocol {
@@ -98,9 +98,9 @@ public final class CoreMLLanguageModel: @unchecked Sendable, LanguageModelProtoc
         self.tools = tools
 
         self.config.topK = topK
-        self.config.topP = topP
-        self.config.repetitionPenalty = repetitionPenalty
-        self.config.temperature = temperature
+        self.config.topP = Float(topP)
+        self.config.repetitionPenalty = Float(repetitionPenalty)
+        self.config.temperature = Float(temperature)
         if config.temperature > 0 && config.temperature != 1 ||
             config.topP < 1 || config.topK > 0 || config.repetitionPenalty != 1.0 {
             config.doSample = true
@@ -204,6 +204,20 @@ public final class CoreMLLanguageModel: @unchecked Sendable, LanguageModelProtoc
         }
     }
 
+    /// Build our own MiniBPE from the bundled tokenizer.json for the family.
+    /// Provides the token↔id maps the grammar needs — no swift-transformers fork.
+    public static func loadBundledMiniBPE(for family: ModelFamily) throws -> MiniBPE {
+        let prefix: String
+        switch family {
+        case .qwen: prefix = "qwen"
+        case .llama, .mistral, .deepseek, .unknown: prefix = "llama"
+        }
+        guard let dataURL = Bundle.module.url(forResource: "\(prefix)_tokenizer", withExtension: "json") else {
+            throw SwiftLMError.resourceNotFound(name: "\(prefix)_tokenizer", extension: "json")
+        }
+        return try MiniBPE(tokenizerJSON: dataURL)
+    }
+
     private static func loadBundledTokenizer() throws -> Tokenizer {
         // Default to Llama tokenizer for backwards compatibility
         guard let configURL = Bundle.module.url(forResource: "llama_tokenizer_config", withExtension: "json") else {
@@ -256,28 +270,28 @@ public final class CoreMLLanguageModel: @unchecked Sendable, LanguageModelProtoc
     
     public var topP: Float {
         get {
-            Float(config.topP)
+            config.topP
         }
         set {
-            config.topP = Double(newValue)
+            config.topP = newValue
         }
     }
-    
+
     public var repeatPenalty: Float {
         get {
-            Float(config.repetitionPenalty)
+            config.repetitionPenalty
         }
         set {
-            config.repetitionPenalty = Double(newValue)
+            config.repetitionPenalty = newValue
         }
     }
-    
+
     public var temperature: Float {
         get {
-            Float(config.temperature)
+            config.temperature
         }
         set {
-            config.temperature = Double(newValue)
+            config.temperature = newValue
         }
     }
 }
@@ -396,10 +410,13 @@ public extension CoreMLLanguageModel {
     ) async -> Session {
         var config = GenerationConfig(maxNewTokens: maxContextLength)
         config.topK = topK
-        config.topP = topP
-        config.repetitionPenalty = repetitionPenalty
-        config.temperature = temperature
+        config.topP = Float(topP)
+        config.repetitionPenalty = Float(repetitionPenalty)
+        config.temperature = Float(temperature)
         config.doSample = doSample
+
+        // Build our own tokenizer (MiniBPE) for grammar-constrained decoding.
+        let grammarTok = try? Self.loadBundledMiniBPE(for: modelConfig.modelFamily)
 
         return await Session(
             model: model,
@@ -409,6 +426,7 @@ public extension CoreMLLanguageModel {
             config: config,
             chatTemplate: chatTemplate,
             tools: tools,
+            grammarTokenizer: grammarTok,
             logging: logging
         )
     }
@@ -427,24 +445,9 @@ public extension CoreMLLanguageModel {
     }
 }
 
-public extension CoreMLLanguageModel {
-    fileprivate static func logitsWarpers(config: GenerationConfig) -> [any LogitsWarper] {
-        var logitsWarpers = [any LogitsWarper]()
-        if config.temperature > 0 && config.temperature != 1 {
-            logitsWarpers.append(TemperatureLogitsWarper(temperature: Float(config.temperature)))
-        }
-        if config.topK > 0 {
-            logitsWarpers.append(TopKLogitsWarper(k: config.topK))
-        }
-        if config.topP < 1.0 {
-            logitsWarpers.append(TopPLogitsWarper(p: Float(config.topP)))
-        }
-        if config.repetitionPenalty != 1.0 {
-            logitsWarpers.append(RepetitionPenaltyWarper(penalty: config.repetitionPenalty))
-        }
-        return logitsWarpers
-    }
-}
+// (Removed dead `logitsWarpers(config:)` — never called; the decode loop in
+//  CoreMLSession does temperature/top-K/top-P inline. Sampling primitives now
+//  live in Sampling.swift, owned by us — no swift-transformers TensorUtils.)
 
 extension CoreMLLanguageModel {
     public var defaultGenerationConfig: GenerationConfig {

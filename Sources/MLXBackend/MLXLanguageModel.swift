@@ -1,0 +1,64 @@
+import Foundation
+import MLXLLM
+import MLXLMCommon
+import MLXHuggingFace
+import MLX
+import Tokenizers
+import Hub
+import HuggingFace
+import MiniBPE
+
+// The MLX backend — SwiftLM's Mac runtime: serves, LoRA-trains, and runs the
+// self-improvement loop. The third backend behind SwiftLM's `LanguageModel`
+// protocol, alongside CoreMLLanguageModel (iPhone/ANE) and FoundationLanguageModel.
+//
+// MLX uses Metal, so this target must be built with xcodebuild (not `swift build`).
+// Validated foundation (S1/S5/S6): 100 tok/s serve, pure-Swift LoRA, live MCP tools.
+
+/// An MLX-served language model. Immutable (`Sendable`): the model container is
+/// loaded once via `load()` and held by reference. `ModelContainer` is itself an
+/// actor, so concurrent generation is serialized safely inside it.
+public final class MLXLanguageModel: Sendable {
+    public let modelId: String
+    let container: ModelContainer
+
+    private init(modelId: String, container: ModelContainer) {
+        self.modelId = modelId
+        self.container = container
+    }
+
+    /// Load an mlx-community model and return a ready backend. The base is overridable via the
+    /// `SWIFTLM_MODEL` env var (e.g. `mlx-community/DeepSeek-R1-Distill-Qwen-32B-4bit` for the
+    /// reasoning-grade prod band) without a rebuild; 7B-Coder stays the fast default test harness.
+    public static func load(
+        modelId: String? = nil
+    ) async throws -> MLXLanguageModel {
+        let id = modelId
+            ?? ProcessInfo.processInfo.environment["SWIFTLM_MODEL"]
+            ?? "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
+        let container = try await #huggingFaceLoadModelContainer(
+            configuration: ModelConfiguration(id: id))
+        return MLXLanguageModel(modelId: id, container: container)
+    }
+
+    /// Text completion. A repetition penalty is on by default — LoRA adapters overfit to
+    /// a narrow style and degenerate into loops under pure-greedy decoding without it. BUT for
+    /// R1-distill reasoning bases, DeepSeek's recommended setup is temp 0.6 / top_p 0.95 / NO
+    /// rep-penalty (a penalty fights long CoT and corrupts the <think> tags) — pass
+    /// `repetitionPenalty: 1.0` to disable and set `topP: 0.95`.
+    public func generate(
+        _ prompt: String,
+        maxTokens: Int = 512,
+        temperature: Float = 0.0,
+        topP: Float = 1.0,
+        repetitionPenalty: Float = 1.15
+    ) async throws -> String {
+        var params = GenerateParameters(maxTokens: maxTokens, temperature: temperature, topP: topP)
+        if repetitionPenalty > 1.0 {            // disabled when ≤ 1.0 (reasoning models)
+            params.repetitionPenalty = repetitionPenalty
+            params.repetitionContextSize = 20
+        }
+        let session = ChatSession(container, generateParameters: params)
+        return try await session.respond(to: prompt)
+    }
+}

@@ -1,6 +1,6 @@
 import Foundation
 import JSONSchema
-@preconcurrency import Tokenizers
+import MiniBPE
 import CoreML
 
 public enum GrammarError: Error, LocalizedError {
@@ -47,7 +47,7 @@ private struct TokenCategories: Sendable {
     let commaOrCloseBrace: Set<Int>    // , or }
     let commaOrCloseBracket: Set<Int>  // , or ]
 
-    init(tokenizer: Tokenizer) {
+    init(tokenizer: any GrammarTokenizer) {
         // Get single-char structural tokens
         self.quote = tokenizer.tokensToIds["\""]!
         self.colon = tokenizer.tokensToIds[":"]!
@@ -197,7 +197,7 @@ private struct ObjectContext: @unchecked Sendable {
 // MARK: - JSON Schema State Tracker (Redesigned)
 struct JSONSchemaStateTracker: Sendable {
     private let schema: JSONSchemaConvertible.Type
-    private let tokenizer: Tokenizer
+    private let tokenizer: any GrammarTokenizer
     private let categories: TokenCategories
     private let vocabSize: Int
     private var state: JSONGenState = .expectingObjectStart
@@ -234,7 +234,7 @@ struct JSONSchemaStateTracker: Sendable {
         return false
     }
 
-    init(schema: JSONSchemaConvertible.Type, tokenizer: Tokenizer) {
+    init(schema: JSONSchemaConvertible.Type, tokenizer: any GrammarTokenizer) {
         self.schema = schema
         self.tokenizer = tokenizer
         self.categories = TokenCategories(tokenizer: tokenizer)
