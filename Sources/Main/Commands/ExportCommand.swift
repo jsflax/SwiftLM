@@ -55,13 +55,9 @@ struct Export: AsyncParsableCommand {
     }
 
     private func findExportBinary() -> String? {
-        // Check Bundle.module first (SwiftPM resource bundle)
-        if let bundledURL = Bundle.module.url(forResource: "swiftlm-export", withExtension: nil) {
-            let path = bundledURL.path
-            if FileManager.default.isExecutableFile(atPath: path) {
-                return path
-            }
-        }
+        // NOTE: the Main target no longer bundles `swiftlm-export` as a resource (the dangling
+        // resource declaration was removed), so `Bundle.module` doesn't exist here. Fall back to the
+        // runtime-location searches below (executable dir, Resources dir, cwd, Bundle.main).
 
         // Check if running from Xcode/SwiftPM build
         if let resourcePath = Bundle.main.resourcePath {
