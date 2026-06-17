@@ -152,14 +152,14 @@ final class HarvesterDecontamTests: XCTestCase {
 
 final class ManifestTests: XCTestCase {
     func testTaskCounts() {
-        XCTAssertEqual(DomainEvalSuite.tasks.count, 32)          // 9 core backward + 23 auto-discovered
+        XCTAssertEqual(DomainEvalSuite.tasks.count, 50)          // 9 core + 23 llm-from-scratch auto + 18 swift-transformers
         XCTAssertEqual(DomainEvalSuite.evalBodyHashes.count, DomainEvalSuite.tasks.count)   // all distinct
         XCTAssertFalse(DomainEvalSuite.evalSubstrings.isEmpty)
     }
 
     func testActiveTasksHavePrompts() {
         let active = DomainEvalSuite.active
-        XCTAssertEqual(active.count, 25, "26 minus Matrix.softmaxRows (deactivated: non-constraining test)")
+        XCTAssertEqual(active.count, 43, "25 (llm-from-scratch) + 18 (swift-transformers) active")
         // the original hand-authored five must remain active
         XCTAssertTrue(Set(active.map(\.id)).isSuperset(of:
                         ["Linear.backward", "GELU.backward", "Embedding.backward",
@@ -180,7 +180,7 @@ final class ManifestTests: XCTestCase {
         for t in DomainEvalSuite.tasks {
             XCTAssertLessThanOrEqual(t.bodyStartLine, t.bodyEndLine, "\(t.id) range")
             XCTAssertFalse(t.coveringTests.isEmpty, "\(t.id) has a covering test")
-            XCTAssertTrue(t.targetFileRel.hasPrefix("Sources/MiniLLM/"), "\(t.id) path")
+            XCTAssertTrue(t.targetFileRel.hasPrefix("Sources/"), "\(t.id) path")   // 2 repos now
         }
     }
 }

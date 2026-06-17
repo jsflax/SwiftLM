@@ -49,8 +49,8 @@ extension MLXLanguageModel {
                            temperature: Float = 0.0, topP: Float = 1.0, repetitionPenalty: Float = 1.0,
                            maxTokens: Int = 1200) async -> Double {
         let active = tasks.filter { $0.prompt != nil }
-        guard let repo = active.first?.repo else { return 0 }
-        DomainVerifier.prepare(repo: repo)
+        guard !active.isEmpty else { return 0 }
+        DomainVerifier.prepareAll(active)
         let draws = max(1, samples)
         var total = 0.0
         for t in active {
@@ -68,8 +68,8 @@ extension MLXLanguageModel {
                               topP: Float = 0.95, repetitionPenalty: Float = 1.0,
                               maxTokens: Int = 1200) async -> Double {
         let active = tasks.filter { $0.prompt != nil }
-        guard let repo = active.first?.repo else { return 0 }
-        DomainVerifier.prepare(repo: repo)
+        guard !active.isEmpty else { return 0 }
+        DomainVerifier.prepareAll(active)
         var solved = 0
         for t in active {
             let outs = await batchGenerate(domainPrompt(t, think: think), n: k,
@@ -87,8 +87,8 @@ extension MLXLanguageModel {
         topP: Float = 0.95, repetitionPenalty: Float = 1.0, maxTokens: Int = 1200, pool: TracePool
     ) async throws -> (traces: [TrainPair], passed: Int, attempted: Int, truncated: Int, perTask: [TaskYield]) {
         let active = tasks.filter { $0.prompt != nil }
-        guard let repo = active.first?.repo else { return ([], 0, 0, 0, []) }
-        DomainVerifier.prepare(repo: repo)
+        guard !active.isEmpty else { return ([], 0, 0, 0, []) }
+        DomainVerifier.prepareAll(active)
         // Distributed generation (one best-of-N job per task across the pool); verification local.
         let mid = ModelID(modelId)
         let jobs = active.map { GenJob(model: mid, prompt: domainPrompt($0, think: think), n: n,
@@ -143,8 +143,8 @@ extension MLXLanguageModel {
         maxPairsPerTask: Int = 24, pool: TracePool
     ) async throws -> (pairs: [DPOTraining.Pair], verified: Int, failed: Int, perTask: [TaskYield]) {
         let active = tasks.filter { $0.prompt != nil }
-        guard let repo = active.first?.repo else { return ([], 0, 0, []) }
-        DomainVerifier.prepare(repo: repo)
+        guard !active.isEmpty else { return ([], 0, 0, []) }
+        DomainVerifier.prepareAll(active)
         // One best-of-N GENERATION job per task → distributed across the pool's workers (cluster
         // fan-out; a local-only pool runs them serially). Verification stays HERE on the coordinator,
         // which alone holds the repo + sandbox — workers ship back only the candidate strings.

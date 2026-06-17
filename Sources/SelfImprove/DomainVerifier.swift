@@ -63,14 +63,23 @@ public enum DomainVerifier {
     /// Populate the shared module cache so per-rollout clones build in ~2s. Idempotent: a non-empty
     /// `sharedCache` is treated as warm. Uses the validated recipe: clone the golden, REMOVE the
     /// clone's stale in-tree ModuleCache (so the compiler repopulates SHARED cleanly), then build.
+    private static let warmLock = NSLock()
+    nonisolated(unsafe) private static var warmedRepos: Set<String> = []
+    /// Warm the shared module cache for EACH distinct repo in `tasks` (the multi-repo flywheel: tasks
+    /// can span llm-from-scratch AND swift-transformers). Idempotent per repo per process.
+    public static func prepareAll(_ tasks: [DomainTask], timeout: TimeInterval = 600) {
+        for r in Set(tasks.map(\.repo)) { _ = prepare(repo: r, timeout: timeout) }
+    }
     @discardableResult
     public static func prepare(repo: DomainRepo, timeout: TimeInterval = 600) -> DomainCheckResult {
         let fm = FileManager.default
-        if let entries = try? fm.contentsOfDirectory(atPath: sharedCache), !entries.isEmpty {
+        warmLock.lock(); let already = warmedRepos.contains(repo.path); warmLock.unlock()
+        if already {
             return DomainCheckResult(passed: true, stage: .passed,
-                                     diagnostics: "shared module cache already warm (\(entries.count) entries)")
+                                     diagnostics: "module cache already warm for \(repo.testProduct)")
         }
-        let warm = "/tmp/swiftlm-domain-warm"
+        // Per-repo warm path so multiple repos don't clobber each other.
+        let warm = "/tmp/swiftlm-domain-warm-\(repo.testProduct)"
         try? fm.removeItem(atPath: warm)
         let clone = CodeVerifier.runProc("/bin/cp", ["-Rc", repo.path, warm],
                                          cwd: URL(fileURLWithPath: "/tmp"), timeout: timeout)
@@ -86,7 +95,8 @@ public enum DomainVerifier {
         guard build.code == 0 else {
             return .fail(.build, "warm build failed (rc=\(build.code)):\n" + build.output.suffix(1500))
         }
-        return DomainCheckResult(passed: true, stage: .passed, diagnostics: "warmed shared module cache")
+        warmLock.lock(); warmedRepos.insert(repo.path); warmLock.unlock()
+        return DomainCheckResult(passed: true, stage: .passed, diagnostics: "warmed module cache for \(repo.testProduct)")
     }
 
     // ── Task-quality gate (step 3) ──────────────────────────────────────────────────────────────

@@ -241,7 +241,7 @@ public enum DomainEvalSuite {
 
     /// All v2a tasks: the 9 hand-inventoried backward passes + the auto-discovered breadth set
     /// (forward passes + algorithmic fns) in `autoTasks` (DomainEvalSuite2.swift).
-    public static let tasks: [DomainTask] = coreTasks + autoTasks
+    public static let tasks: [DomainTask] = coreTasks + autoTasks + autoTasks2
 
     /// Tasks the flywheel may currently generate rollouts for (have a leak-stripped prompt).
     public static var active: [DomainTask] { tasks.filter { $0.prompt != nil } }

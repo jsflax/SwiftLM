@@ -568,9 +568,11 @@ func runDomainFlywheel(
     guard !tasks.isEmpty else { log("✗ no active domain tasks (need a leak-stripped prompt)."); exit(1) }
     log("\(mode) calibration: \(tasks.count) active task(s) [\(tasks.map(\.id).joined(separator: ", "))], base=\(baseName)")
     log("warming verifier (shared module cache) ...")
-    let prep = DomainVerifier.prepare(repo: DomainEvalSuite.llmFromScratch)
-    guard prep.passed else { log("✗ verifier warm failed: \(prep.diagnostics)"); exit(1) }
-    log("verifier ready (\(prep.diagnostics))")
+    for r in Set(tasks.map(\.repo)) {
+        let prep = DomainVerifier.prepare(repo: r)
+        guard prep.passed else { log("✗ verifier warm failed for \(r.testProduct): \(prep.diagnostics)"); exit(1) }
+        log("verifier ready: \(prep.diagnostics)")
+    }
 
     log("\(mode): task-quality gate ...")
     for t in tasks {
