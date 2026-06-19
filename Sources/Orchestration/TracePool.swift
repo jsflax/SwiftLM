@@ -76,7 +76,8 @@ public final class LocalPool: TracePool, @unchecked Sendable {
 /// wall-clock ≈ (total jobs / #workers) × per-job time. THIS is what makes the broad 32B run tractable.
 public actor FanOutPool: TracePool {
     private let workers: [TracePool]
-    private var rr = 0   // round-robin cursor for single-job placement
+    private var rr = 0          // round-robin cursor for single-job placement
+    private var roundCount = 0  // generateMany invocations, for the dispatch summary
 
     public init(workers: [TracePool]) {
         precondition(!workers.isEmpty, "FanOutPool needs ≥1 worker")
@@ -98,17 +99,38 @@ public actor FanOutPool: TracePool {
     /// box is one GPU), all buckets concurrently. Results are reassembled in INPUT ORDER.
     public func generateMany(_ jobs: [GenJob]) async -> [[String]] {
         let nW = workers.count
+
+        // Resolve a human label + host per worker (for the dispatch summary + per-job accounting).
+        var labels = [String](repeating: "", count: nW)
+        var hosts = [String](repeating: "?", count: nW)
+        for wi in 0..<nW {
+            let cap = (await workers[wi].capabilities()).first
+            labels[wi] = cap?.id ?? "w\(wi)"
+            hosts[wi] = cap?.host ?? labels[wi]
+        }
+
         var buckets: [[(Int, GenJob)]] = Array(repeating: [], count: nW)
         for (i, job) in jobs.enumerated() { buckets[i % nW].append((i, job)) }
+
+        roundCount += 1
+        await ClusterStatus.shared.dispatched(
+            round: roundCount, split: (0..<nW).map { (labels[$0], buckets[$0].count) })
 
         var results = [[String]](repeating: [], count: jobs.count)
         await withTaskGroup(of: [(Int, [String])].self) { group in
             for wi in 0..<nW where !buckets[wi].isEmpty {
                 let worker = workers[wi]
                 let bucket = buckets[wi]
+                let label = labels[wi]
+                let host = hosts[wi]
                 group.addTask {
                     var out: [(Int, [String])] = []
-                    for (idx, job) in bucket { out.append((idx, await worker.generate(job))) }
+                    for (idx, job) in bucket {
+                        let r = await worker.generate(job)
+                        await ClusterStatus.shared.served(
+                            label: label, host: host, ok: r.contains { !$0.isEmpty })
+                        out.append((idx, r))
+                    }
                     return out
                 }
             }

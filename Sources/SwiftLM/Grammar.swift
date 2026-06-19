@@ -106,8 +106,13 @@ private struct TokenCategories: Sendable {
                 isSafeForString = false
             }
 
-            // Don't allow tokens with newlines (breaks JSON)
-            if token.contains("\n") || token.contains("\r") {
+            // Don't allow tokens whose REAL text contains a JSON control character (U+0000–U+001F): these
+            // MUST be escaped in a JSON string (RFC 8259 §7), so an unescaped one (raw newline/tab/…)
+            // corrupts the value. Byte-level BPE HIDES them — a newline (0x0A) is the vocab char "Ċ", a tab
+            // "ĉ", etc., NOT a literal "\n" — so classify on the DECODED token, not the raw byte-encoded
+            // vocab string. (The old literal "\n"/"\r" check matched nothing on GLM/Qwen, so raw newlines
+            // leaked into strings and the model rambled multi-line prose past the JSON value.)
+            if tokenizer.decodedToken(token).unicodeScalars.contains(where: { $0.value < 0x20 }) {
                 isSafeForString = false
             }
 
@@ -195,11 +200,15 @@ private struct ObjectContext: @unchecked Sendable {
 }
 
 // MARK: - JSON Schema State Tracker (Redesigned)
-struct JSONSchemaStateTracker: Sendable {
-    private let schema: JSONSchemaConvertible.Type
+public struct JSONSchemaStateTracker: Sendable {
     private let tokenizer: any GrammarTokenizer
     private let categories: TokenCategories
     private let vocabSize: Int
+    /// Optional per-field allowed-value sets (field name → values) — lets a RUNTIME caller constrain a
+    /// plain String field to an enum (e.g. tool `name` ∈ the connected tools) WITHOUT a compile-time enum
+    /// type (which `@JSONSchema` would require to be FoundationModels `@Generable`). Overrides the static
+    /// `valueType.jsonSchema["enum"]` when present for a field.
+    private let runtimeEnums: [String: [String]]?
     private var state: JSONGenState = .expectingObjectStart
     private var fields: [SchemaProperty] = []
     private var currentFieldIndex: Int = 0
@@ -229,21 +238,36 @@ struct JSONSchemaStateTracker: Sendable {
         currentField?.maxLength ?? defaultMaxStringLength
     }
 
-    var isComplete: Bool {
+    public var isComplete: Bool {
         if case .complete = state { return true }
         return false
     }
 
-    init(schema: JSONSchemaConvertible.Type, tokenizer: any GrammarTokenizer) {
-        self.schema = schema
+    public init(schema: JSONSchemaConvertible.Type, tokenizer: any GrammarTokenizer,
+                runtimeEnums: [String: [String]]? = nil) {
         self.tokenizer = tokenizer
         self.categories = TokenCategories(tokenizer: tokenizer)
         self.vocabSize = tokenizer.tokensToIds.count
+        self.runtimeEnums = runtimeEnums
 
         // Extract fields from schema using new schemaProperties
         if let properties = schema.schemaProperties {
             self.fields = properties
         }
+    }
+
+    /// Runtime-schema init: constrain to a directly-supplied `[SchemaProperty]` (built at RUNTIME from,
+    /// e.g., a tool's MCP inputSchema via primitive metatypes like `String.self`) — no compile-time
+    /// `@JSONSchema` type required. This is what makes constrained tool-call ARGS possible: the arg fields
+    /// are only known at runtime. `fields == []` ⇒ an empty object `{}`. (`schema` is unused after init,
+    /// so the runtime path needs no type at all.)
+    public init(fields: [SchemaProperty], tokenizer: any GrammarTokenizer,
+                runtimeEnums: [String: [String]]? = nil) {
+        self.tokenizer = tokenizer
+        self.categories = TokenCategories(tokenizer: tokenizer)
+        self.vocabSize = tokenizer.tokensToIds.count
+        self.runtimeEnums = runtimeEnums
+        self.fields = fields
     }
 
     // Helper to get current field
@@ -287,6 +311,11 @@ struct JSONSchemaStateTracker: Sendable {
 
         return result
     }
+
+    /// The tokens the grammar allows in the CURRENT state — the reusable masking core, exposed so the MLX
+    /// serve path (`GrammarLogitProcessor`) can mask `MLXArray` logits, not only the CoreML `MLTensor`
+    /// path (`applyPenalty`). Classification is by token STRING, so it's tokenizer-agnostic.
+    public func validTokens() -> Set<Int> { getValidTokens() }
 
     private func getValidTokens() -> Set<Int> {
         switch state {
@@ -619,7 +648,7 @@ struct JSONSchemaStateTracker: Sendable {
 
     // MARK: - State Updates
 
-    mutating func updateState(with token: Int, _ totalDecoded: inout [Int]) {
+    public mutating func updateState(with token: Int, _ totalDecoded: inout [Int]) {
         guard let tokenStr = tokenizer.idsToTokens[token] else { return }
 
         let oldState = "\(state)"
@@ -681,8 +710,10 @@ struct JSONSchemaStateTracker: Sendable {
             switch typeName {
             case "string":
                 if tokenStr == "\"" {
-                    // Check if this is an enum type with constrained values
-                    if let enumValues = valueType.jsonSchema["enum"] as? [Any], !enumValues.isEmpty {
+                    // A RUNTIME enum (e.g. tool `name` ∈ connected tools) wins over the static type's enum.
+                    if let rt = runtimeEnums?[fields[currentFieldIndex].name], !rt.isEmpty {
+                        state = .inEnumValue(validValues: rt, currentValue: "")
+                    } else if let enumValues = valueType.jsonSchema["enum"] as? [Any], !enumValues.isEmpty {
                         let stringValues = enumValues.compactMap { $0 as? String }
                         if !stringValues.isEmpty {
                             state = .inEnumValue(validValues: stringValues, currentValue: "")

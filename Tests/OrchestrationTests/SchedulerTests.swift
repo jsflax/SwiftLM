@@ -1,4 +1,4 @@
-import XCTest
+import Testing
 @testable import Orchestration
 
 /// A test-double pool: echoes the request id as a few tokens, yielding between them so concurrent
@@ -35,8 +35,8 @@ actor MockPool: ComputePool {
     }
 }
 
-final class SchedulerTests: XCTestCase {
-    func testConcurrencyCapRespected() async {
+struct SchedulerTests {
+    @Test func concurrencyCapRespected() async {
         let pool = MockPool(tokensPerReq: 6)
         let sched = Scheduler(pool: pool, maxConcurrent: 3)
         var completed = 0
@@ -46,26 +46,26 @@ final class SchedulerTests: XCTestCase {
             }
             for await _ in g { completed += 1 }
         }
-        XCTAssertEqual(completed, 24)
+        #expect(completed == 24)
         let peak = await pool.peak
         let started = await pool.totalStarted
-        XCTAssertEqual(started, 24, "every request reached the pool")
+        #expect(started == 24, "every request reached the pool")
         // The cap is 3. (+1 tolerance: the mock's leave() and the next admit() can momentarily
         // overlap on the pool actor — a test-double artifact, not a scheduler over-admission.)
-        XCTAssertLessThanOrEqual(peak, 4, "scheduler over-admitted (peak \(peak), cap 3)")
-        XCTAssertGreaterThanOrEqual(peak, 2, "no concurrency occurred at all")
+        #expect(peak <= 4, "scheduler over-admitted (peak \(peak), cap 3)")
+        #expect(peak >= 2, "no concurrency occurred at all")
         let inflight = await sched.inflightCount
-        XCTAssertEqual(inflight, 0, "all slots released after completion")
+        #expect(inflight == 0, "all slots released after completion")
     }
 
-    func testCompletesWithFullText() async {
+    @Test func completesWithFullText() async {
         let pool = MockPool(tokensPerReq: 3)
         let sched = Scheduler(pool: pool, maxConcurrent: 2)
         let out = await sched.complete(InferenceRequest(id: "x", model: ModelID("m"), prompt: "p"))
-        XCTAssertEqual(out, "x:0 x:1 x:2 ")
+        #expect(out == "x:0 x:1 x:2 ")
     }
 
-    func testSerialCapStillCompletes() async {
+    @Test func serialCapStillCompletes() async {
         // maxConcurrent = 1 forces full serialization; all must still finish.
         let pool = MockPool(tokensPerReq: 2)
         let sched = Scheduler(pool: pool, maxConcurrent: 1)
@@ -74,18 +74,18 @@ final class SchedulerTests: XCTestCase {
             for i in 0..<6 { g.addTask { await sched.complete(InferenceRequest(id: "s\(i)", model: ModelID("m"), prompt: "p")) } }
             for await _ in g { completed += 1 }
         }
-        XCTAssertEqual(completed, 6)
+        #expect(completed == 6)
         let peak = await pool.peak
-        XCTAssertEqual(peak, 1, "maxConcurrent=1 must never run two at once")
+        #expect(peak == 1, "maxConcurrent=1 must never run two at once")
     }
 
-    func testRequestBatchKeyGroupsByBaseAndSampler() {
+    @Test func requestBatchKeyGroupsByBaseAndSampler() {
         let a = InferenceRequest(model: ModelID("base"), adapter: AdapterID("lora-1"), prompt: "p", temperature: 0.7)
         let b = InferenceRequest(model: ModelID("base"), adapter: AdapterID("lora-2"), prompt: "q", temperature: 0.7)
         let c = InferenceRequest(model: ModelID("base"), adapter: AdapterID("lora-1"), prompt: "r", temperature: 0.0)
         // Same base + sampler co-batch (the SGMV key is base, NOT adapter) → a and b share a key.
-        XCTAssertEqual(a.batchKey, b.batchKey)
+        #expect(a.batchKey == b.batchKey)
         // Different sampler params cannot share a forward pass.
-        XCTAssertNotEqual(a.batchKey, c.batchKey)
+        #expect(a.batchKey != c.batchKey)
     }
 }

@@ -53,15 +53,19 @@ public struct InferenceRequest: Sendable, Identifiable {
     public var priority: Priority
     public var estTokens: Int        // estimated output length, for batch packing / fairness
     public var affinity: String?     // hint: keep related work on one worker (KV/prefix reuse)
+    /// Pre-rendered prompt tokens (already chat-templated by the caller). When set, the pool decodes THESE
+    /// directly instead of tokenizing `prompt` — the sub-agent path needs it because a sub-agent round's
+    /// input is a whole CONVERSATION, not a single user string. `nil` ⇒ tokenize `prompt` as before.
+    public var inputTokens: [Int32]?
 
     public init(id: String = UUID().uuidString, model: ModelID, adapter: AdapterID? = nil,
                 prompt: String, maxTokens: Int = 512, temperature: Float = 0.0, topP: Float = 1.0,
                 repetitionPenalty: Float = 1.0, priority: Priority = .normal,
-                estTokens: Int = 256, affinity: String? = nil) {
+                estTokens: Int = 256, affinity: String? = nil, inputTokens: [Int32]? = nil) {
         self.id = id; self.model = model; self.adapter = adapter; self.prompt = prompt
         self.maxTokens = maxTokens; self.temperature = temperature; self.topP = topP
         self.repetitionPenalty = repetitionPenalty; self.priority = priority
-        self.estTokens = estTokens; self.affinity = affinity
+        self.estTokens = estTokens; self.affinity = affinity; self.inputTokens = inputTokens
     }
 
     /// The co-batching key — BASE model + sampler params (NOT the adapter; SGMV co-batches adapters).
@@ -95,12 +99,15 @@ public struct WorkerDescriptor: Sendable {
     public let batchWidth: Int                 // max concurrent streams fused into one forward pass
     public let effectiveParallelism: Double    // ≈1 (LocalPool past ceiling) … ≈N (ClusterPool)
     public let estTokensPerSecPerStream: Double // measured decode rate (drops as batch/KV grows)
+    public let host: String?                   // where this worker lives (observability; nil = local/unset)
 
     public init(id: String, models: [ModelID], batchWidth: Int,
-                effectiveParallelism: Double, estTokensPerSecPerStream: Double) {
+                effectiveParallelism: Double, estTokensPerSecPerStream: Double,
+                host: String? = nil) {
         self.id = id; self.models = models; self.batchWidth = batchWidth
         self.effectiveParallelism = effectiveParallelism
         self.estTokensPerSecPerStream = estTokensPerSecPerStream
+        self.host = host
     }
 }
 

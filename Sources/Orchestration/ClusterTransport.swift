@@ -64,17 +64,19 @@ final class FramedChannel: @unchecked Sendable {
 public actor WorkerServer {
     private let pool: TracePool
     private let serviceName: String?
+    private let psk: String?
     private var listener: NWListener?
 
-    public init(pool: TracePool, serviceName: String? = nil) {
+    public init(pool: TracePool, serviceName: String? = nil, psk: String? = nil) {
         self.pool = pool
         self.serviceName = serviceName
+        self.psk = psk
     }
 
     /// Bind (auto-assigning a port unless `port` given), optionally advertise via Bonjour, and start
     /// accepting. Returns the bound port. Resolves once the listener is ready.
     public func start(port: UInt16? = nil) async throws -> UInt16 {
-        let params = NWParameters.tcp
+        let params = clusterParameters(psk: psk)
         let listener = port.flatMap { NWEndpoint.Port(rawValue: $0) }
             .map { try? NWListener(using: params, on: $0) } ?? (try? NWListener(using: params))
         guard let l = listener ?? (try? NWListener(using: params)) else { throw ClusterError.connectionClosed }
@@ -111,7 +113,9 @@ public actor WorkerServer {
                 let req = try await chan.receive(JobRequest.self)
                 clog("[worker] ← job \(req.job.id.prefix(8)) (n=\(req.job.n), maxTok=\(req.job.maxTokens)) — generating ...")
                 let comps = await pool.generate(req.job)
-                clog("[worker] → job \(req.job.id.prefix(8)): \(comps.filter { !$0.isEmpty }.count)/\(comps.count) completions sent")
+                let nonEmpty = comps.filter { !$0.isEmpty }.count
+                clog("[worker] → job \(req.job.id.prefix(8)): \(nonEmpty)/\(comps.count) completions sent")
+                await ClusterStatus.shared.served(label: "self", host: "local", ok: nonEmpty > 0)
                 try await chan.send(JobResponse(id: req.job.id, completions: comps, error: nil))
             } catch {
                 chan.cancel(); return
@@ -128,17 +132,19 @@ public actor RemotePool: TracePool {
     private let host: NWEndpoint.Host
     private let port: NWEndpoint.Port
     private let descriptor: WorkerDescriptor
+    private let psk: String?
     private var channel: FramedChannel?
 
-    public init(host: String, port: UInt16, descriptor: WorkerDescriptor) {
+    public init(host: String, port: UInt16, descriptor: WorkerDescriptor, psk: String? = nil) {
         self.host = NWEndpoint.Host(host)
         self.port = NWEndpoint.Port(rawValue: port) ?? .any
         self.descriptor = descriptor
+        self.psk = psk
     }
 
     private func connect() async throws -> FramedChannel {
         if let channel { return channel }
-        let conn = NWConnection(host: host, port: port, using: .tcp)
+        let conn = NWConnection(host: host, port: port, using: clusterParameters(psk: psk))
         try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
             let resumed = ResumeOnce()
             conn.stateUpdateHandler = { state in

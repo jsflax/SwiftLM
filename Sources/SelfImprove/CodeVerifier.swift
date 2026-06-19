@@ -98,7 +98,12 @@ public enum CodeVerifier {
         guard comp.code == 0 else {
             return CodeCheckResult(passed: false, diagnostics: "COMPILE ERROR:\n" + comp.output.suffix(1500))
         }
-        let run = runProc(bin.path, [], cwd: dir, timeout: timeout)
+        // Untrusted model code: run it UNDER the no-net seatbelt (network denied) — the same wrapper
+        // DomainVerifier.runTest uses, never bare like before (red-team P0.4). The compile above is
+        // trusted; the RUN is what we confine. (FS-scope tightening of the profile is a separate P0.)
+        let run = runProc("/usr/bin/sandbox-exec",
+                          ["-f", DomainVerifier.sandboxProfilePath, bin.path],
+                          cwd: dir, timeout: timeout)
         let passed = run.code == 0 && run.output.contains("ALL_PASS")
         return CodeCheckResult(
             passed: passed,

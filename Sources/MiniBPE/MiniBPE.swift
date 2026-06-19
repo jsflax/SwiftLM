@@ -187,10 +187,22 @@ public protocol GrammarTokenizer: Sendable {
     var idsToTokens: [Int: String] { get }
     var eosTokenId: Int? { get }
     func tokenize(text: String) -> [String]
+    /// Decode ONE vocab token's STRING to the actual text it contributes. For byte-level BPE the vocab
+    /// string is byte-encoded (newline 0x0A → "Ċ", space 0x20 → "Ġ"), so the grammar MUST classify on
+    /// this decoded form — else a control character hides behind "Ċ" and leaks into a JSON string. Default
+    /// is identity (for tokenizers whose vocab strings are already literal text).
+    func decodedToken(_ token: String) -> String
+}
+
+public extension GrammarTokenizer {
+    func decodedToken(_ token: String) -> String { token }
 }
 
 extension MiniBPE: GrammarTokenizer {
     public var idsToTokens: [Int: String] { idToToken }
+
+    /// Reverse the byte-level map for a single token so the grammar sees real characters (e.g. "Ċ" → "\n").
+    public func decodedToken(_ token: String) -> String { ByteLevel.decode(Array(token)) }
 
     public var eosTokenId: Int? {
         specials.first { $0.content == "<|im_end|>" }?.id

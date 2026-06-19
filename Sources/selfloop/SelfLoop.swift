@@ -47,6 +47,10 @@ struct SelfLoop {
             let model = try await MLXLanguageModel.load()
             let pool = model.makeLocalPool(workerId: env["WORKER_ID"],
                                            batchWidth: Int(env["WORKER_BATCH"] ?? "") ?? 12)
+            // Observability: this box gets its own status file (~/.swiftlm/cluster-status.json) + heartbeat,
+            // so `cat` on box B shows served/idle without grepping. WorkerServer.serve records each job.
+            await ClusterStatus.shared.start(role: "worker")
+            await ClusterStatus.shared.registerWorker(label: "self", host: "local")
             let server = WorkerServer(pool: pool, serviceName: env["WORKER_BONJOUR"])
             let bound = try await server.start(port: port)
             log("✅ SwiftLM cluster worker READY — model=\(model.modelId) port=\(bound). Waiting for jobs (Ctrl-C to stop) ...")
@@ -187,7 +191,7 @@ struct SelfLoop {
             ?? "/Users/jason/localdev/ClaudeUtils/.build/release/ClaudeUtils"
         var toolBefore: Double? = nil
         if FileManager.default.fileExists(atPath: mcpServer) {
-            _ = try? await host.connect(.init(command: mcpServer))
+            _ = try? await host.connect(.init(name: "claude-utils", command: mcpServer))
             log("evaluating tool-pass@1 (base) ...")
             toolBefore = await toolPass(model, host, EvalSuite.toolCases)
         } else { log("no MCP server at \(mcpServer) — tool-pass gate skipped.") }
@@ -551,6 +555,12 @@ func runDomainFlywheel(
     let pool: TracePool = remoteWorkers.isEmpty ? localPool : FanOutPool(workers: [localPool] + remoteWorkers)
     if !remoteWorkers.isEmpty {
         log("CLUSTER: generation fans across \(1 + remoteWorkers.count) workers (this box + \(remoteWorkers.count) remote)")
+        // Observability: status file + heartbeat + per-round dispatch summary. `cat ~/.swiftlm/cluster-status.json`
+        // answers "is each worker getting work" with zero grep/lsof; pre-register so 0-served workers show as idle.
+        await ClusterStatus.shared.start(role: "coordinator")
+        for cap in await pool.capabilities() {
+            await ClusterStatus.shared.registerWorker(label: cap.id, host: cap.host ?? cap.id)
+        }
     }
 
     // Env knobs (calibration wants N≈16–50; reasoning bases need room + R1 sampling):
@@ -604,6 +614,7 @@ func runDomainFlywheel(
         ? "HELD-OUT split: train[\(trainTasks.map(\.id).joined(separator: ","))] → eval[\(evalTasks.map(\.id).joined(separator: ","))]"
         : "in-distribution (train == eval)"
     log("\(mode): \(splitNote)")
+    await ClusterStatus.shared.enterPhase("baseline-eval", fanOut: false)   // domainPass runs on this box only
     log("\(mode): BEFORE pass@1 on eval (\(evalSamples)-sample, T=\(passTemp), think=\(think), maxTok=\(maxTok)) ...")
     let g1 = await model.domainPass(tasks: evalTasks, think: think, samples: evalSamples, temperature: passTemp,
                                     topP: topP, repetitionPenalty: repPen, maxTokens: maxTok)
@@ -619,6 +630,7 @@ func runDomainFlywheel(
     if isDPO {
         gen = ([], 0, 0, 0, [])
     } else {
+        await ClusterStatus.shared.enterPhase("trace-gen (verified traces)", fanOut: !remoteWorkers.isEmpty)
         log("\(mode): best-of-\(n) verified traces from TRAIN tasks ...")
         gen = try await model.bestOfNDomainTraces(tasks: trainTasks, think: think, n: n, temperature: sampleTemp,
                                                   topP: topP, repetitionPenalty: repPen, maxTokens: maxTok, pool: pool)
@@ -668,6 +680,7 @@ func runDomainFlywheel(
     // SFT-on-positives starves (3 unique); DPO uses the abundant FAILED rollouts as negatives and
     // targets "pass@k holds, greedy mis-selects". Eval lift on the HELD-OUT fn = genuine transfer.
     if env["DOMAIN_DPO"] != nil {
+        await ClusterStatus.shared.enterPhase("trace-gen (DPO pairs)", fanOut: !remoteWorkers.isEmpty)
         log("\(mode): DPO — best-of-\(n) → (verified, failed) preference pairs from TRAIN tasks ...")
         let pg = try await model.bestOfNDomainPairs(tasks: trainTasks, think: think, n: n,
                     temperature: sampleTemp, topP: topP, repetitionPenalty: repPen, maxTokens: maxTok, pool: pool)
@@ -698,6 +711,7 @@ func runDomainFlywheel(
         let r = try await model.trainDPO(pairs: pg.pairs, heldout: curriculum.heldout,
                     retention: RetentionSet.examples, adapterDir: adapterDir, config: cfg, beta: beta)
 
+        await ClusterStatus.shared.enterPhase("after-eval", fanOut: false)   // adapter is on this box only
         log("\(mode): measuring AFTER pass-rates on eval ...")
         let g1After = await model.domainPass(tasks: evalTasks, think: think, samples: evalSamples, temperature: passTemp, topP: topP, repetitionPenalty: repPen, maxTokens: maxTok)
         var passKAfter: [Int: Double] = [:]
@@ -764,6 +778,7 @@ func runDomainFlywheel(
         train: trainSet, heldout: curriculum.heldout,
         retention: RetentionSet.examples, adapterDir: adapterDir, config: cfg)
 
+    await ClusterStatus.shared.enterPhase("after-eval", fanOut: false)   // adapter is on this box only
     log("\(mode): measuring AFTER pass-rates on eval ...")
     let g1After = await model.domainPass(tasks: evalTasks, think: think, samples: evalSamples, temperature: passTemp, topP: topP, repetitionPenalty: repPen, maxTokens: maxTok)
     var passKAfter: [Int: Double] = [:]

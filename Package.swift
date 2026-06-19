@@ -95,6 +95,8 @@ let package = Package(
                 "MiniBPE",
                 "SelfImprove",
                 "Orchestration",
+                "Serving",
+                "NativeTools",
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
@@ -126,7 +128,7 @@ let package = Package(
         // Builds with xcodebuild (Metal). macOS.
         .executableTarget(
             name: "agent",
-            dependencies: ["MLXBackend", "SelfImprove"]
+            dependencies: ["MLXBackend", "SelfImprove", "Serving", "NativeTools", "MiniBPE", "JSONSchema"]
         ),
         // Orchestration spine (the "ComputePool" — the orchestration twin of the LanguageModel
         // dual-backend): one API, two execution realizations (LocalPool continuous-batching on one
@@ -138,6 +140,28 @@ let package = Package(
         .testTarget(
             name: "OrchestrationTests",
             dependencies: ["Orchestration"]
+        ),
+        // Serving layer (the "useful agent first" product): retrieval grounding, abstention, and the
+        // verifiable-vs-freeform router that wrap the serve-time loop. Pure Swift with INJECTED
+        // backends (recall closure, generate closure) → builds + tests under plain `swift build`/`swift
+        // test`, no Metal. The agent executable does the thin MLX/MCP wiring.
+        .target(
+            name: "Serving",
+            dependencies: ["MiniBPE"]   // pure-Swift tokenizer for context-compaction token counting (no MLX)
+        ),
+        .testTarget(
+            name: "ServingTests",
+            dependencies: ["Serving"]
+        ),
+        // Native (in-process) agent tools: Read/Write/Edit/Glob/Grep/Bash. Pure Foundation, ZERO deps →
+        // builds + tests under plain `swift build`/`swift test`. MLXBackend merges these into the model's
+        // MCP tool surface; the `agent` CLI registers the standard set.
+        .target(
+            name: "NativeTools"
+        ),
+        .testTarget(
+            name: "NativeToolsTests",
+            dependencies: ["NativeTools"]
         ),
         // Self-improvement data layer: transcript harvester + redactor + registry.
         // Pure Foundation (swift build); reads ~/.claude transcripts at runtime.

@@ -19,4 +19,31 @@ extension MLXLanguageModel {
                                      temperature: job.temperature, topP: job.topP)
         }
     }
+
+    /// Expose this model as a `LocalBatchPool` (SLICE 2): a coalescing `ComputePool` that fuses
+    /// concurrent DIFFERENT-prompt requests (sub-agent fan-out) into one variable-length forward pass
+    /// via `batchDecodeDistinct`. All coalesced rows share a `BatchKey`, so they have one sampler; the
+    /// batch's `maxTokens` is the max across its requests (rows evict on their own EOS). Put a
+    /// `Scheduler` (concurrency cap = batchWidth) in front for priority admission.
+    public func makeBatchPool(workerId: String? = nil, batchWidth: Int = 8,
+                              coalesceWindowMillis: Int = 5, estTokPerSec: Double = 12) -> LocalBatchPool {
+        let wid = workerId ?? (Host.current().localizedName ?? "local")
+        let desc = WorkerDescriptor(id: wid, models: [ModelID(modelId)], batchWidth: batchWidth,
+                                    effectiveParallelism: 1, estTokensPerSecPerStream: estTokPerSec)
+        return LocalBatchPool(descriptor: desc, batchWidth: batchWidth,
+                              coalesceWindowMillis: coalesceWindowMillis) { reqs in
+            let maxTok = reqs.map { $0.maxTokens }.max() ?? 512
+            let temp = reqs.first?.temperature ?? 0
+            // Sub-agent path: requests carry PRE-RENDERED conversation tokens → decode them directly (no
+            // chat template). Otherwise (flywheel / single-prompt) tokenize the prompt string as before.
+            if reqs.allSatisfy({ $0.inputTokens != nil }) {
+                if ProcessInfo.processInfo.environment["SWIFTLM_BATCH_DEBUG"] != nil {
+                    FileHandle.standardError.write(Data(("[batch-pool] coalesced \(reqs.count) sub-agent row(s) "
+                        + "into one forward pass (lens \(reqs.map { $0.inputTokens!.count }))\n").utf8))
+                }
+                return await self.batchGenerateRows(reqs.map { $0.inputTokens! }, maxTokens: maxTok, temperature: temp)
+            }
+            return await self.batchGenerateDistinct(reqs.map { $0.prompt }, maxTokens: maxTok, temperature: temp)
+        }
+    }
 }
