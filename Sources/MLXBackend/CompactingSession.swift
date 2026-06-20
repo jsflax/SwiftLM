@@ -75,7 +75,16 @@ final class CompactingSession: @unchecked Sendable {
             // returns nil from mlx's tag parser and is recovered by the round loop's
             // profile.recoverMissedToolCall(text) — exactly as on the non-batched path. So this needs no
             // special no-arg handling, only the correct ModelProfile (a GLM .taggedReasoning profile).
-            let call = toolsEnabled ? toolCallParser?.parse(content: text, tools: specs) : nil
+            //
+            // REASONING-MODEL FIX (GLM co-batch): GLM prefixes its call with `<think>…</think>`; parsing the
+            // FULL string makes the standalone parser mis-attribute that reasoning to the call NAME (observed:
+            // name = the whole think blob → bogus dispatch → "wrong tool name" retry loop, loop never advances).
+            // Strip ONLY `<think>` (keep `<tool_call>`) before parsing, and reject an obviously-garbage name so
+            // the round loop's recoverMissedToolCall(text) recovers the real `<tool_call>` call instead.
+            var call = toolsEnabled ? toolCallParser?.parse(content: Self.stripThinkSpans(text), tools: specs) : nil
+            if let c = call, c.function.name.contains("<") || c.function.name.contains("\n") || c.function.name.count > 64 {
+                call = nil
+            }
             if ProcessInfo.processInfo.environment["SWIFTLM_BATCH_DEBUG"] != nil {
                 FileHandle.standardError.write(Data(("[batch-gen] toolsOn=\(toolsEnabled) "
                     + "parsed=\(call?.function.name ?? "nil") hasToolCall=\(text.contains("<tool_call>"))\n").utf8))
@@ -124,4 +133,17 @@ final class CompactingSession: @unchecked Sendable {
     }
 
     private func render(_ m: Chat.Message) -> String { "\(m.role.rawValue): \(m.content)" }
+
+    /// Strip ONLY `<think>…</think>` spans (KEEP `<tool_call>`) — for the batched tool-call parse of a
+    /// reasoning model, whose leading reasoning otherwise confuses the standalone parser into reading the
+    /// think text as the call name. (Distinct from `stripReasoning`, which also removes `<tool_call>`.)
+    static func stripThinkSpans(_ text: String) -> String {
+        var s = text
+        while let o = s.range(of: "<think>") {
+            if let c = s.range(of: "</think>", range: o.upperBound..<s.endIndex) {
+                s.removeSubrange(o.lowerBound..<c.upperBound)
+            } else { s.removeSubrange(o.lowerBound..<s.endIndex); break }
+        }
+        return s
+    }
 }

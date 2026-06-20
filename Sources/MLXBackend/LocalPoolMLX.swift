@@ -46,4 +46,18 @@ extension MLXLanguageModel {
             return await self.batchGenerateDistinct(reqs.map { $0.prompt }, maxTokens: maxTok, temperature: temp)
         }
     }
+
+    /// B2 co-batch DI: a pool-backed `BatchGenerator` to pass into `makeAgentBackend(batchGenerator:)`. Hold
+    /// ONE per model and share it across ALL that model's agent backends, so CONCURRENT turns (esp. a consult
+    /// fan-out: N panelists answering one question simultaneously) coalesce into ONE batched forward pass via
+    /// `LocalBatchPool` (the proven `MLXSubagentRunner` pattern). Hides the `Orchestration` types behind the
+    /// `MLXBackend` API so the caller (Orbital's `SharedMLXScheduler`) needs only `import MLXBackend`.
+    public func makeCoBatchGenerator(batchWidth: Int = 8, coalesceWindowMillis: Int = 200) -> BatchGenerator {
+        let pool = makeBatchPool(batchWidth: batchWidth, coalesceWindowMillis: coalesceWindowMillis)
+        let mid = modelId
+        return { @Sendable (tokens: [Int32], maxTok: Int) in
+            await pool.complete(InferenceRequest(model: ModelID(mid), prompt: "",
+                                                 maxTokens: maxTok, inputTokens: tokens))
+        }
+    }
 }

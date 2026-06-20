@@ -34,12 +34,15 @@ let package = Package(
             targets: ["selfloop"]),
     ],
     dependencies: [
-        // Pinned (was branch:main) so it unifies with MLX/transformers' swift-syntax (603.x).
-        .package(url: "https://github.com/apple/swift-syntax.git", from: "600.0.0"),
+        // Range covers 600–603 so swift-syntax unifies with Lattice (pins [603,604)) when SwiftLM is a
+        // PATH DEP of Orbital. mlx-swift-lm + swift-transformers accept up to 603; SwiftPM picks 603.x.
+        // URL is `swiftlang/` (not `apple/`) to match mlx-swift-lm — avoids the package-identity conflict.
+        .package(url: "https://github.com/swiftlang/swift-syntax.git", "600.0.0"..<"604.0.0"),
         .package(url: "https://github.com/apple/swift-argument-parser.git", from: "1.3.0"),
         .package(url: "https://github.com/huggingface/swift-transformers", from: "1.3.0"),
         // MLX backend deps (Mac: serve + LoRA train + self-improve). Metal → xcodebuild.
-        .package(url: "https://github.com/ml-explore/mlx-swift-lm", branch: "main"),
+        // Pinned to a commit (was branch:main) so the graph can't drift mid-build.
+        .package(url: "https://github.com/ml-explore/mlx-swift-lm", revision: "e3cb1e1b4fb373391a414c33e9221516d02134ef"),
         .package(url: "https://github.com/ml-explore/mlx-swift", .upToNextMinor(from: "0.31.4")),
         .package(url: "https://github.com/huggingface/swift-huggingface", from: "0.1.0"),
         .package(url: "https://github.com/modelcontextprotocol/swift-sdk", from: "0.12.0"),

@@ -1,6 +1,12 @@
 import Foundation
 import MLXLMCommon
-import Serving
+// Re-exported so a downstream linker of THIS product (Orbital's orbital-loop) gets the neutral agent-turn
+// surface — AgentStreamEvent / streamAgentTurn / AgentTurnBackend / AgentTurnConfig / ToolPermissionPolicy
+// (Serving) and NativeTool / NativeToolRegistry / ToolArguments / JSONSchemaObject (NativeTools) — from a
+// single `import MLXBackend`. These ARE MLXBackend's API surface (what `makeAgentBackend`/`streamAgent`
+// return and consume), so re-exporting them here is the right seam (no Package product churn).
+@_exported import Serving
+@_exported import NativeTools
 import MiniBPE
 
 // ── The Orbital-facing serve surface: an in-process, claude-compatible streaming agent turn.
@@ -29,22 +35,40 @@ extension MLXLanguageModel {
         approvePlan: PlanApprover? = nil,
         toolTimeoutSeconds: Double = defaultToolDispatchTimeoutSeconds
     ) async -> AsyncThrowingStream<AgentStreamEvent, Error> {
+        // One-shot convenience: build a FRESH backend per call (no persistence). Long-lived callers that
+        // need per-agent KV + compaction continuity across turns (Orbital's SharedMLXScheduler) hold a
+        // `makeAgentBackend(...)` themselves and drive `streamAgentTurn` directly.
+        let backend = await makeAgentBackend(host: host)
+        let config = AgentTurnConfig(modelLabel: modelLabel, sessionID: sessionID, cwd: cwd,
+                                     toolNames: await host.toolNames, maxRounds: maxRounds, permission: permission,
+                                     approvePlan: approvePlan, toolTimeoutSeconds: toolTimeoutSeconds)
+        return streamAgentTurn(prompt: prompt, instructions: instructions, hooks: hooks,
+                               config: config, backend: backend)
+    }
+
+    /// Build a PERSISTENT agent-turn backend (ChatSession + MCPHost) the CALLER holds across turns, so a
+    /// room agent's KV cache + Claude-Code-style compaction history survive between its turns. N backends
+    /// built over ONE shared `MLXLanguageModel` ⇒ ONE `ModelContainer`'s weights — per-agent incremental
+    /// cost is only that backend's KV cache + message history (the shared-container floor). Orbital's
+    /// SharedMLXScheduler keys one of these per agentId and drives turns via `streamAgentTurn`.
+    ///
+    /// Profile detection, grammar tokenizer, and generation params are set up HERE (SwiftLM-internal model
+    /// knowledge) exactly as the live REPL loop does, so a room agent gets constrained valid tool calls.
+    /// `batchGenerator` (B2 co-batching) is forwarded into the round's CompactingSession with the model's
+    /// own tool-call parser; nil ⇒ the serial incremental-KV ChatSession path (B1), byte-for-byte the loop.
+    public func makeAgentBackend(host: MCPHost, batchGenerator: BatchGenerator? = nil) async -> any AgentTurnBackend {
         let specs = await host.specs
         let toolNames = await host.toolNames
-        // Auto-detect the family profile (reasoning?, tool-call style, physics-derived budget) and load the
-        // grammar tokenizer — same as the live REPL loop, so a room agent gets constrained valid tool calls.
         let profile = await self.profile
         let grammarTok = try? MiniBPE.grammarTokenizer(forModelId: modelId)
         var params = GenerateParameters(maxTokens: profile.budget.maxTokens, temperature: 0.0)
         params.repetitionPenalty = 1.15
         params.repetitionContextSize = 20
-        let backend = ChatSessionTurnBackend(model: self, host: host, specs: specs, toolNames: toolNames,
-                                             params: params, profile: profile, grammarTokenizer: grammarTok)
-        let config = AgentTurnConfig(modelLabel: modelLabel, sessionID: sessionID, cwd: cwd,
-                                     toolNames: toolNames, maxRounds: maxRounds, permission: permission,
-                                     approvePlan: approvePlan, toolTimeoutSeconds: toolTimeoutSeconds)
-        return streamAgentTurn(prompt: prompt, instructions: instructions, hooks: hooks,
-                               config: config, backend: backend)
+        // Only the batched path needs a standalone parser (ChatSession parses inline on the serial path).
+        let parser = batchGenerator != nil ? (await container.configuration.toolCallFormat)?.createParser() : nil
+        return ChatSessionTurnBackend(model: self, host: host, specs: specs, toolNames: toolNames,
+                                      params: params, profile: profile, grammarTokenizer: grammarTok,
+                                      batchGenerator: batchGenerator, toolCallParser: parser)
     }
 }
 
@@ -60,21 +84,31 @@ final class ChatSessionTurnBackend: AgentTurnBackend, @unchecked Sendable {
     let params: GenerateParameters
     let profile: ModelProfile
     let grammarTokenizer: (any GrammarTokenizer)?
+    let batchGenerator: BatchGenerator?          // B2 co-batch DI seam (nil ⇒ serial incremental-KV path)
+    let toolCallParser: (any ToolCallParser)?    // standalone parser for the batched path (nil on serial)
     private var compacting: CompactingSession?   // persistent conversation + Claude-Code-style compaction
     private var basePrompt = ""   // the original user prompt — used to constrain regenerated tool args
 
     init(model: MLXLanguageModel, host: MCPHost, specs: [ToolSpec], toolNames: [String],
-         params: GenerateParameters, profile: ModelProfile, grammarTokenizer: (any GrammarTokenizer)?) {
+         params: GenerateParameters, profile: ModelProfile, grammarTokenizer: (any GrammarTokenizer)?,
+         batchGenerator: BatchGenerator? = nil, toolCallParser: (any ToolCallParser)? = nil) {
         self.model = model; self.host = host; self.specs = specs; self.toolNames = toolNames
         self.params = params; self.profile = profile; self.grammarTokenizer = grammarTokenizer
+        self.batchGenerator = batchGenerator; self.toolCallParser = toolCallParser
     }
+
+    /// The real running context size (last round's prompt+gen tokens, from `Generation.info`) — honest
+    /// telemetry the sequencer reads at result-time instead of the hardcoded `0` (OPEN ITEM T1). nil until
+    /// the first round measures it.
+    func finalContextTokens() -> Int? { compacting?.contextTokens }
 
     func round(instructions: String?, prompt: String, resume: [ResumeMessage], toolsEnabled: Bool)
         -> AsyncThrowingStream<GenStep, Error> {
         if resume.isEmpty { basePrompt = prompt }   // remember the user prompt for arg constraining
         if compacting == nil {
             compacting = CompactingSession(model: model, instructions: instructions, params: params,
-                                           specs: specs, tokenizer: grammarTokenizer, budget: profile.contextBudget)
+                                           specs: specs, tokenizer: grammarTokenizer, budget: profile.contextBudget,
+                                           batchGen: batchGenerator, toolCallParser: toolCallParser)
         }
         let comp = compacting!
         return AsyncThrowingStream { continuation in

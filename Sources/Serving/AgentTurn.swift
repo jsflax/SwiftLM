@@ -30,6 +30,14 @@ public protocol AgentTurnBackend: Sendable {
         -> AsyncThrowingStream<GenStep, Error>
     /// Dispatch a tool call; return its result text + whether it errored.
     func dispatch(name: String, argsJSON: String) async -> (result: String, isError: Bool)
+    /// The real running context size (prompt+gen tokens) after the final round, for honest result telemetry
+    /// (OPEN ITEM T1). Default nil — a scripted stub that can't measure tokens degrades to the chars/4
+    /// estimate, harmless to the test path; the MLX backend returns its CompactingSession's `.info` count.
+    func finalContextTokens() -> Int?
+}
+
+public extension AgentTurnBackend {
+    func finalContextTokens() -> Int? { nil }
 }
 
 public struct AgentTurnConfig: Sendable {
@@ -252,9 +260,11 @@ public func streamAgentTurn(
                     : (finalText.isEmpty ? "(hit round cap without final text)" : "(model emitted only reasoning)")
                 // SEAM E — Stop: record the completed turn (memory-write, trace logging).
                 if let hooks { _ = await hooks.fire(.stop(answer: answer, toolsCalled: toolsCalled)) }
-                // TODO: real token counts from the backend's completion info; chars/4 only feeds Orbital's
-                // context-bar display (functionally harmless if off).
-                continuation.yield(.result(finalText: answer, inputTokens: 0,
+                // T1: real running context size from the backend (CompactingSession's last `.info`) →
+                // `inputTokens` is the honest window FILL Orbital maps to `TurnTelemetry.contextTokens`.
+                // Falls back to the chars/4 estimate only for a stub backend that can't measure.
+                let ctxTokens = backend.finalContextTokens()
+                continuation.yield(.result(finalText: answer, inputTokens: ctxTokens ?? 0,
                                            outputTokens: max(0, outputChars / 4), isError: false))
                 continuation.finish()
             } catch {
