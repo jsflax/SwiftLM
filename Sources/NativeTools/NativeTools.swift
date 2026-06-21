@@ -89,9 +89,13 @@ public struct NativeToolRegistry: Sendable {
     /// The standard agent toolset (Claude-Code-shaped names so transcripts/habits transfer). When a
     /// `subagentRunner` is injected, the Claude-faithful `Task` tool is included (the sub-agent capability);
     /// it's omitted by default so the pure module needs no backend.
-    public static func standard(subagentRunner: SubagentRunner? = nil) -> NativeToolRegistry {
-        var tools: [any NativeTool] = [ReadFileTool(), WriteFileTool(), EditFileTool(), GlobTool(),
-                                       GrepTool(), BashTool(), WebFetchTool(), ExitPlanModeTool()]
+    public static func standard(cwd: String = FileManager.default.currentDirectoryPath,
+                                subagentRunner: SubagentRunner? = nil) -> NativeToolRegistry {
+        // The path/search/exec tools resolve relative paths (+ glob/grep root + bash cwd) against `cwd` — the
+        // agent's working dir (the room cwd for a room agent), so file ops land in the room (bug D).
+        var tools: [any NativeTool] = [ReadFileTool(cwd: cwd), WriteFileTool(cwd: cwd), EditFileTool(cwd: cwd),
+                                       GlobTool(cwd: cwd), GrepTool(cwd: cwd), BashTool(cwd: cwd),
+                                       WebFetchTool(), ExitPlanModeTool()]
         if let subagentRunner { tools.append(TaskTool(runner: subagentRunner)) }
         return .init(tools)
     }

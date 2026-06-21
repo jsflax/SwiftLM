@@ -12,17 +12,28 @@ import Darwin
 // habits + harvested transcripts transfer. Each is a small, deterministic Foundation function — unit-
 // tested against temp dirs / safe commands. Mutating/exec tools (write/edit/bash) are gated at serve time
 // by the PreToolUse hook seam (plan-mode read-only, etc.); they don't self-restrict here.
+//
+// CWD (bug D fix): the file/search tools resolve a RELATIVE path — and the glob/grep root + the bash cwd —
+// against `cwd`, the agent's working directory. It defaults to the process dir for back-compat, but the MLX
+// driver injects the ROOM cwd via `NativeToolRegistry.standard(cwd:)`, so a room agent's `glob **/*.swift` /
+// relative `write_file` lands in the ROOM, not wherever orbital-loop happened to be launched.
+
+/// Resolve a possibly-relative tool path against the working dir; an absolute path passes through unchanged.
+func resolveToolPath(_ path: String, cwd: String) -> String {
+    path.hasPrefix("/") ? path : URL(fileURLWithPath: cwd).appendingPathComponent(path).standardizedFileURL.path
+}
 
 /// Read a UTF-8 text file.
 public struct ReadFileTool: NativeTool {
-    public init() {}
+    public let cwd: String
+    public init(cwd: String = FileManager.default.currentDirectoryPath) { self.cwd = cwd }
     public let name = "read_file"
-    public let description = "Read a UTF-8 text file at an absolute path and return its contents."
+    public let description = "Read a UTF-8 text file (absolute path, or relative to the working directory)."
     public var parameters: JSONSchemaObject {
-        .init([("path", .init("string", "Absolute path to the file"))], required: ["path"])
+        .init([("path", .init("string", "Path to the file (absolute, or relative to the working dir)"))], required: ["path"])
     }
     public func run(_ args: ToolArguments) async throws -> String {
-        let path = try args.requireString("path")
+        let path = resolveToolPath(try args.requireString("path"), cwd: cwd)
         do { return try String(contentsOfFile: path, encoding: .utf8) }
         catch { throw NativeToolError.io("cannot read \(path): \(error.localizedDescription)") }
     }
@@ -30,7 +41,8 @@ public struct ReadFileTool: NativeTool {
 
 /// Create or overwrite a UTF-8 text file (creating intermediate directories).
 public struct WriteFileTool: NativeTool {
-    public init() {}
+    public let cwd: String
+    public init(cwd: String = FileManager.default.currentDirectoryPath) { self.cwd = cwd }
     public let name = "write_file"
     public let description = "Write (create or overwrite) a UTF-8 text file at an absolute path."
     public var parameters: JSONSchemaObject {
@@ -38,7 +50,7 @@ public struct WriteFileTool: NativeTool {
                ("content", .init("string", "Full file contents"))], required: ["path", "content"])
     }
     public func run(_ args: ToolArguments) async throws -> String {
-        let path = try args.requireString("path")
+        let path = resolveToolPath(try args.requireString("path"), cwd: cwd)
         let content = try args.requireString("content")
         let url = URL(fileURLWithPath: path)
         do {
@@ -52,7 +64,8 @@ public struct WriteFileTool: NativeTool {
 
 /// Exact-string replace in a file. Refuses an ambiguous edit (old_string non-unique) unless replace_all.
 public struct EditFileTool: NativeTool {
-    public init() {}
+    public let cwd: String
+    public init(cwd: String = FileManager.default.currentDirectoryPath) { self.cwd = cwd }
     public let name = "edit_file"
     public let description = "Replace an exact string in a file. Fails if old_string is absent, or "
         + "(unless replace_all) is not unique. Returns the number of replacements."
@@ -64,7 +77,7 @@ public struct EditFileTool: NativeTool {
               required: ["path", "old_string", "new_string"])
     }
     public func run(_ args: ToolArguments) async throws -> String {
-        let path = try args.requireString("path")
+        let path = resolveToolPath(try args.requireString("path"), cwd: cwd)
         let oldS = try args.requireString("old_string")
         let newS = args.string("new_string") ?? ""   // empty replacement (deletion) is allowed
         let all = args.bool("replace_all") ?? false
@@ -89,7 +102,8 @@ public struct EditFileTool: NativeTool {
 
 /// Find files by glob pattern (POSIX fnmatch) under a directory.
 public struct GlobTool: NativeTool {
-    public init() {}
+    public let cwd: String
+    public init(cwd: String = FileManager.default.currentDirectoryPath) { self.cwd = cwd }
     public let name = "glob"
     public let description = "List files under a directory whose path matches a glob pattern "
         + "(e.g. **/*.swift). Returns up to 200 matching absolute paths, one per line."
@@ -100,7 +114,7 @@ public struct GlobTool: NativeTool {
     }
     public func run(_ args: ToolArguments) async throws -> String {
         let pattern = try args.requireString("pattern")
-        let base = args.string("path") ?? FileManager.default.currentDirectoryPath
+        let base = args.string("path").map { resolveToolPath($0, cwd: cwd) } ?? cwd
         let baseURL = URL(fileURLWithPath: base)
         guard let en = FileManager.default.enumerator(at: baseURL, includingPropertiesForKeys: [.isRegularFileKey],
                                                       options: [.skipsHiddenFiles]) else {
@@ -127,7 +141,8 @@ public struct GlobTool: NativeTool {
 
 /// Search file contents by regex under a directory; returns `path:line: text` matches.
 public struct GrepTool: NativeTool {
-    public init() {}
+    public let cwd: String
+    public init(cwd: String = FileManager.default.currentDirectoryPath) { self.cwd = cwd }
     public let name = "grep"
     public let description = "Search text files under a path for a regular expression. Returns up to 100 "
         + "matches as `file:line: text`."
@@ -138,7 +153,7 @@ public struct GrepTool: NativeTool {
     }
     public func run(_ args: ToolArguments) async throws -> String {
         let pattern = try args.requireString("pattern")
-        let base = args.string("path") ?? FileManager.default.currentDirectoryPath
+        let base = args.string("path").map { resolveToolPath($0, cwd: cwd) } ?? cwd
         guard let re = try? NSRegularExpression(pattern: pattern) else {
             throw NativeToolError.io("invalid regex: \(pattern)")
         }
@@ -179,7 +194,8 @@ public struct GrepTool: NativeTool {
 /// Run a shell command (`/bin/sh -c`), returning combined stdout+stderr (truncated), killed on timeout.
 /// The agent's hands for build/test/inspect — gated at serve time by the PreToolUse hook seam.
 public struct BashTool: NativeTool {
-    public init() {}
+    public let cwd: String
+    public init(cwd: String = FileManager.default.currentDirectoryPath) { self.cwd = cwd }
     public let name = "bash"
     public let description = "Run a shell command via /bin/sh -c and return its combined stdout+stderr."
     public var parameters: JSONSchemaObject {
@@ -194,6 +210,7 @@ public struct BashTool: NativeTool {
                 let proc = Process()
                 proc.executableURL = URL(fileURLWithPath: "/bin/sh")
                 proc.arguments = ["-c", command]
+                proc.currentDirectoryURL = URL(fileURLWithPath: cwd)   // run in the agent's working dir (bug D)
                 let outPipe = Pipe()
                 proc.standardOutput = outPipe
                 proc.standardError = outPipe
