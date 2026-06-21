@@ -57,15 +57,24 @@ public struct ToolPermissionPolicy: Sendable, Equatable {
     /// callers may extend it with known-read-only MCP tools.
     public var readOnlyTools: Set<String>
 
+    /// When `true` (the CLI default), a plan-mode agent may call `ExitPlanMode` to present its plan and, on
+    /// approval, flip the turn to `.auto` and implement. Orbital's multi-agent rooms set this `false`: there is
+    /// no exit-plan step — a planner hands off to the builder and approval is implicit in the handoff. With
+    /// `false`, both agent loops SKIP the `ExitPlanMode` interception, so the call falls to the deny gate (it is
+    /// not a read-only tool) and the `.plan → .auto` self-escalation is unreachable.
+    public var allowsPlanExit: Bool
+
     /// The built-in native tools that only observe the world (safe to run while planning).
     public static let readOnlyNativeTools: Set<String> = ["read_file", "glob", "grep", "web_fetch"]
 
     public init(mode: PermissionMode = .auto,
                 autopilot: Bool = true,
-                readOnlyTools: Set<String> = ToolPermissionPolicy.readOnlyNativeTools) {
+                readOnlyTools: Set<String> = ToolPermissionPolicy.readOnlyNativeTools,
+                allowsPlanExit: Bool = true) {
         self.mode = mode
         self.autopilot = autopilot
         self.readOnlyTools = readOnlyTools
+        self.allowsPlanExit = allowsPlanExit
     }
 
     public func decide(tool: String) -> Decision {
@@ -96,9 +105,14 @@ public struct ToolPermissionPolicy: Sendable, Equatable {
     public var instructionPrefix: String? {
         guard mode == .plan else { return nil }
         let readers = readOnlyTools.sorted().joined(separator: ", ")
+        // The closing action depends on whether this environment HAS an exit-plan step. The CLI does
+        // (ExitPlanMode → approve → implement); Orbital rooms do not — a planner hands off to the builder.
+        let close = allowsPlanExit
+            ? "call the \(exitPlanModeToolName) tool with your plan to request approval before making any changes."
+            : "call `handoff` to pass your plan to the next agent for execution — handing off IS the approval "
+              + "(there is no separate exit-plan step)."
         return "[Plan mode] You are PLANNING ONLY. You may inspect with read-only tools (\(readers)) but "
-            + "must NOT modify files, run commands, or take any action with side effects — those tools are "
-            + "blocked. Produce a concise, numbered plan of the steps you WOULD take, then call the "
-            + "\(exitPlanModeToolName) tool with your plan to request approval before making any changes."
+            + "must NOT modify files or run commands — those tools are blocked. Produce a concise, numbered "
+            + "plan of the steps you WOULD take, then " + close
     }
 }

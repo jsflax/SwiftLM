@@ -355,7 +355,7 @@ extension MLXLanguageModel {
                 // ExitPlanMode: the plan is ready → surface it for approval. Approve flips this turn to
                 // .auto (tools go live, the model implements on the next round); reject keeps plan mode.
                 // Intercepted BEFORE the gate so the (non-read-only) ExitPlanMode call is never blocked.
-                if currentPermission.mode == .plan, callName == exitPlanModeToolName {
+                if currentPermission.mode == .plan, currentPermission.allowsPlanExit, callName == exitPlanModeToolName {
                     let plan = extractPlan(fromArgsJSON: argsJSON)
                     switch await (approvePlan?(plan) ?? .approve) {
                     case .approve:

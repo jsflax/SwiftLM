@@ -53,4 +53,35 @@ struct PermissionsTests {
         #expect(PermissionMode(rawValue: "garbage") == nil)
         #expect(PermissionMode.allCases.count == 3)
     }
+
+    @Test func allowsPlanExitDefaultsTrueAndKeepsCLIExitPlanCeremony() {
+        // CLI default: the plan note still drives the ExitPlanMode → approve → implement ceremony, and the
+        // flag survives the post-approval `.auto` flip (so a half-approved policy stays consistent).
+        let cli = ToolPermissionPolicy(mode: .plan)
+        #expect(cli.allowsPlanExit == true)
+        #expect(cli.instructionPrefix?.contains(exitPlanModeToolName) == true)
+        #expect(cli.approved.allowsPlanExit == true)
+    }
+
+    @Test func orbitalPlanPolicyRoutesButCannotExitOrWrite() {
+        // Orbital's multi-agent plan policy: routing tools run; files/exec AND ExitPlanMode are denied, so a
+        // planner can consult + hand off but can NEVER self-escalate to writing code within its turn.
+        let p = ToolPermissionPolicy(
+            mode: .plan,
+            readOnlyTools: ToolPermissionPolicy.readOnlyNativeTools.union(["handoff", "consult", "done"]),
+            allowsPlanExit: false)
+        for ok in ["read_file", "glob", "grep", "web_fetch", "handoff", "consult", "done"] {
+            #expect(p.decide(tool: ok) == .allow, "expected \(ok) allowed for an Orbital planner")
+        }
+        for no in ["write_file", "edit_file", "bash", exitPlanModeToolName] {
+            guard case .deny = p.decide(tool: no) else { Issue.record("\(no) should be denied"); return }
+        }
+        #expect(!p.allowsMutation)
+        // The prompt steers to handoff, never ExitPlanMode, while keeping the plan-mode framing + reader list.
+        let prefix = p.instructionPrefix
+        #expect(prefix?.contains("Plan mode") == true)
+        #expect(prefix?.contains("read_file") == true)
+        #expect(prefix?.contains("handoff") == true)
+        #expect(prefix?.contains(exitPlanModeToolName) == false)
+    }
 }

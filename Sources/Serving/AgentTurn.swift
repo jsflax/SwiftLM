@@ -174,7 +174,7 @@ public func streamAgentTurn(
                         // ExitPlanMode: the plan is ready → surface it for approval. Approve flips the turn
                         // to .auto (tools go live, the model implements); reject keeps plan mode so it revises.
                         // Intercepted BEFORE the gate so the (non-read-only) ExitPlanMode call is never blocked.
-                        if permission.mode == .plan, call.name == exitPlanModeToolName {
+                        if permission.mode == .plan, permission.allowsPlanExit, call.name == exitPlanModeToolName {
                             let plan = extractPlan(fromArgsJSON: call.argsJSON)
                             let verdict = await (config.approvePlan?(plan) ?? .approve)
                             switch verdict {
