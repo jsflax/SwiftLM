@@ -3,6 +3,7 @@ import MLX
 import MLXRandom
 import MLXLMCommon
 import MLXLLM
+import Serving   // LocalAgentAdapter (ModelProfile) + TurnMessage — for the owned-render primitives
 
 // Batched best-of-N generation: N rollouts of the SAME prompt + sampler decoded in LOCKSTEP as one
 // [N, seq] batch through a single forward pass per step. This is the trace-volume win for the
@@ -21,11 +22,17 @@ extension MLXLanguageModel {
     /// must stop at these explicitly — else it runs past the assistant turn into the next user turn and
     /// rambles to the token budget (observed: GLM emitting `<|user|>` then re-stating the prompt). Covers
     /// Qwen (`<|im_end|>`), GLM (`<|user|>`/`<|observation|>`), Llama (`<|eot_id|>`), and `<|endoftext|>`.
-    func batchStops(_ tok: any Tokenizer) -> Set<Int> {
+    func batchStops(_ tok: any Tokenizer, adapter: ModelProfile? = nil) -> Set<Int> {
         var stops = Set<Int>()
         if let e = tok.eosTokenId { stops.insert(e) }
         for t in ["<|im_end|>", "<|user|>", "<|observation|>", "<|eot_id|>", "<|endoftext|>"] {
             if let id = tok.convertTokenToId(t) { stops.insert(id) }
+        }
+        // The adapter's OWN stops from the model's config — notably the 122B's SECOND eos id (248044), which
+        // the universal floor above misses, so a no-`<|im_end|>` finish doesn't run away. (Phase 3c.)
+        if let adapter {
+            stops.formUnion(adapter.eosTokenIds)
+            for s in adapter.stopStrings { if let id = tok.convertTokenToId(s) { stops.insert(id) } }
         }
         return stops
     }
@@ -223,6 +230,94 @@ extension MLXLanguageModel {
             let input = try await ctx.processor.prepare(
                 input: tools != nil ? UserInput(chat: msgs, tools: tools!) : UserInput(chat: msgs))
             return input.text.tokens.asType(.int32).asArray(Int32.self)
+        }
+    }
+
+    /// Render a STRUCTURED conversation to its prompt token row via the model's REAL chat template, using mlx's
+    /// raw-dict prompt hatch (`UserInput.messages`) — the dicts pass through `prepare` UNTOUCHED, so a strict
+    /// reasoning+tool template (the 122B's) gets the `reasoning_content` + `tool_calls` structure that
+    /// `Chat.Message` can't express. This is the OWNED-RENDER input: it preserves the original user query every
+    /// round (fixes the 122B "No user query found" throw) and replays prior reasoning for the in-progress tool
+    /// chain. `enableThinking` drives the template's generation prompt (`<think>` open). Built INSIDE
+    /// `container.perform` (the dicts are Sendable values that cross the boundary).
+    public func renderTurnMessages(_ turns: [TurnMessage], tools: [ToolSpec]?, enableThinking: Bool) async throws -> [Int32] {
+        try await container.perform { ctx in
+            let dicts: [[String: any Sendable]] = turns.map { t in
+                var d: [String: any Sendable] = ["role": t.role.rawValue, "content": t.content]
+                if let rc = t.reasoningContent, !rc.isEmpty { d["reasoning_content"] = rc }
+                if let calls = t.toolCalls, !calls.isEmpty {
+                    d["tool_calls"] = calls.map { c -> [String: any Sendable] in
+                        ["type": "function",
+                         "function": ["name": c.name, "arguments": Self.argsDict(c.argsJSON)] as [String: any Sendable]]
+                    }
+                }
+                return d
+            }
+            let input = try await ctx.processor.prepare(
+                input: UserInput(messages: dicts, tools: tools,
+                                 additionalContext: ["enable_thinking": enableThinking]))
+            return input.text.tokens.asType(.int32).asArray(Int32.self)
+        }
+    }
+
+    /// Parse a tool-call args JSON string → the dict the chat template iterates (`tool_call.arguments|items`).
+    /// Coerce only the JSON scalar types (tool args are overwhelmingly flat string/number/bool); a nested
+    /// object/array is stringified rather than dropped. `{}`/invalid → empty.
+    static func argsDict(_ argsJSON: String) -> [String: any Sendable] {
+        guard let d = argsJSON.data(using: .utf8),
+              let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { return [:] }
+        var out: [String: any Sendable] = [:]
+        for (k, v) in o {
+            switch v {
+            case let s as String: out[k] = s
+            case let b as Bool: out[k] = b
+            case let i as Int: out[k] = i
+            case let dbl as Double: out[k] = dbl
+            case let n as NSNumber: out[k] = n.doubleValue
+            default: out[k] = String(describing: v)
+            }
+        }
+        return out
+    }
+
+    /// Live-streaming SOLO decode from a PRE-RENDERED prompt row — the OWNED-RENDER generation primitive. It
+    /// adapts the single-row `batchDecode` (a fresh single-sequence `KVCache`, NEVER `BatchedKVCache`), so the
+    /// hybrid 122B decodes without the merge crash, AND it keeps LIVE streaming: `.chunk`s are emitted
+    /// incrementally via decode-then-diff detokenization (the UI sees tokens as they arrive). Stops on the
+    /// adapter's stop set (its EOS strings/ids ∪ the universal turn-end floor); `</think>` is never a stop, so a
+    /// reasoning model runs through its think block to the action. No `.info` is emitted — the caller sets its
+    /// own context-token count (parity with the batched path), which keeps compaction/telemetry working.
+    public func streamFromTokens(_ row: [Int32], maxTokens: Int, adapter: ModelProfile, temperature: Float)
+        -> AsyncThrowingStream<Generation, Error> {
+        AsyncThrowingStream { cont in
+            let task = Task {
+                await container.perform { ctx in
+                    let model = ctx.model, tok = ctx.tokenizer
+                    let stops = self.batchStops(tok, adapter: adapter)
+                    let cache = model.newCache(parameters: nil)
+                    let promptArr = MLXArray(row).reshaped([1, row.count])
+                    var logits = model(promptArr, cache: cache)[0..., -1, 0...]   // [1, vocab]
+                    eval(logits)
+                    var genIds: [Int] = []
+                    var emitted = ""
+                    for _ in 0..<max(1, maxTokens) {
+                        let nextTok = self.sampleBatched(logits, temperature: temperature)   // [1]
+                        eval(nextTok)
+                        let t = nextTok.asArray(Int.self)[0]
+                        if stops.contains(t) { break }
+                        genIds.append(t)
+                        let full = tok.decode(tokenIds: genIds)
+                        if full.count > emitted.count {                       // emit the newly-decoded suffix
+                            cont.yield(.chunk(String(full.dropFirst(emitted.count))))
+                            emitted = full
+                        }
+                        logits = model(nextTok.reshaped([1, 1]), cache: cache)[0..., -1, 0...]
+                        eval(logits)
+                    }
+                }
+                cont.finish()
+            }
+            cont.onTermination = { _ in task.cancel() }
         }
     }
 

@@ -59,16 +59,32 @@ extension MLXLanguageModel {
     public func makeAgentBackend(host: MCPHost, batchGenerator: BatchGenerator? = nil) async -> any AgentTurnBackend {
         let specs = await host.specs
         let toolNames = await host.toolNames
-        let profile = await self.profile
+        let adapter = await self.localAdapter   // config-driven (replaces forModelType `profile`): format/reasoning/stops/sampling from the model's own files
         let grammarTok = try? MiniBPE.grammarTokenizer(forModelId: modelId)
-        var params = GenerateParameters(maxTokens: profile.budget.maxTokens, temperature: 0.0)
-        params.repetitionPenalty = 1.15
-        params.repetitionContextSize = 20
-        // Only the batched path needs a standalone parser (ChatSession parses inline on the serial path).
-        let parser = batchGenerator != nil ? (await container.configuration.toolCallFormat)?.createParser() : nil
+        var params = GenerateParameters(maxTokens: adapter.budget.maxTokens, temperature: adapter.sampling.temperature)
+        params.repetitionPenalty = adapter.sampling.repetitionPenalty
+        params.repetitionContextSize = adapter.sampling.repetitionContextSize
+        // Only the batched path needs a standalone parser (ChatSession parses inline on the serial path). The
+        // format is the ADAPTER's template-derived choice — corrects mlx's `qwen3_next → .xmlFunction`
+        // misinference; `.deferToMLX` falls back to mlx's own inference, so a model is never made worse.
+        let needsParser = batchGenerator != nil || adapter.requiresOwnedRender   // owned render parses the call from text too
+        let parser = needsParser ? await makeToolCallParser(adapter) : nil
         return ChatSessionTurnBackend(model: self, host: host, specs: specs, toolNames: toolNames,
-                                      params: params, profile: profile, grammarTokenizer: grammarTok,
+                                      params: params, profile: adapter, grammarTokenizer: grammarTok,
                                       batchGenerator: batchGenerator, toolCallParser: parser)
+    }
+
+    /// Map the adapter's template-derived format choice → an mlx `ToolCallFormat` parser. `.deferToMLX` (and any
+    /// format we don't directly model, e.g. `.pythonic`) falls back to mlx-swift-lm's own inferred format —
+    /// strictly no worse than today. This is the one MLX-side bridge for the MLX-free `ToolCallFormatChoice`.
+    func makeToolCallParser(_ adapter: LocalAgentAdapter) async -> (any ToolCallParser)? {
+        switch adapter.toolCallFormat {
+        case .json:        return ToolCallFormat.json.createParser()
+        case .xmlFunction: return ToolCallFormat.xmlFunction.createParser()
+        case .glm4:        return ToolCallFormat.glm4.createParser()
+        case .pythonic, .deferToMLX:
+            return (await container.configuration.toolCallFormat)?.createParser()
+        }
     }
 }
 
@@ -108,7 +124,7 @@ final class ChatSessionTurnBackend: AgentTurnBackend, @unchecked Sendable {
         if compacting == nil {
             compacting = CompactingSession(model: model, instructions: instructions, params: params,
                                            specs: specs, tokenizer: grammarTokenizer, budget: profile.contextBudget,
-                                           batchGen: batchGenerator, toolCallParser: toolCallParser)
+                                           adapter: profile, batchGen: batchGenerator, toolCallParser: toolCallParser)
         }
         let comp = compacting!
         return AsyncThrowingStream { continuation in

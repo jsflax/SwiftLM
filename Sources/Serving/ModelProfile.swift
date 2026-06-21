@@ -73,15 +73,37 @@ public struct ModelProfile: Sendable {
     public let budgetForcing: BudgetForcing
     public let contextBudget: ContextBudget
 
+    // ── Adapter concerns (see LocalAgentAdapter.swift). All default to the current behavior so existing call
+    // sites (forModelType/generic/tests) are unchanged; `resolve(_:)` fills them from the model's real config.
+    public let toolCallFormat: ToolCallFormatChoice   // the wire the model emits (template-derived); .deferToMLX = use mlx's
+    public let reasoningTags: (open: String, close: String)   // the `<think>` span to strip / detect
+    public let reasoningContentField: String?         // template's reasoning field (e.g. "reasoning_content"), or nil
+    public let stopStrings: [String]                  // the model's own stop strings (∪ universal floor in MLXBackend)
+    public let eosTokenIds: [Int]                      // explicit EOS ids (the 122B has TWO) — added to the decode stop set
+    public let sampling: SamplingParams               // one source for temp/repPenalty/repContextSize (was copied ×2)
+    public let requiresOwnedRender: Bool              // strict template → re-render the full conversation each round
+
     public init(family: ModelFamily, emitsReasoning: Bool, toolCallStyle: ToolCallStyle,
                 budget: GenerationBudget, budgetForcing: BudgetForcing = .none,
-                contextBudget: ContextBudget = .forWindow(8192)) {
+                contextBudget: ContextBudget = .forWindow(8192),
+                toolCallFormat: ToolCallFormatChoice = .deferToMLX,
+                reasoningTags: (open: String, close: String) = ("<think>", "</think>"),
+                reasoningContentField: String? = nil,
+                stopStrings: [String] = [], eosTokenIds: [Int] = [],
+                sampling: SamplingParams = SamplingParams(), requiresOwnedRender: Bool = false) {
         self.family = family
         self.emitsReasoning = emitsReasoning
         self.toolCallStyle = toolCallStyle
         self.budget = budget
         self.budgetForcing = budgetForcing
         self.contextBudget = contextBudget
+        self.toolCallFormat = toolCallFormat
+        self.reasoningTags = reasoningTags
+        self.reasoningContentField = reasoningContentField
+        self.stopStrings = stopStrings
+        self.eosTokenIds = eosTokenIds
+        self.sampling = sampling
+        self.requiresOwnedRender = requiresOwnedRender
     }
 
     /// The user-facing answer: reasoning/tool tags removed, with a conclusion fallback when a reasoning model

@@ -29,13 +29,17 @@ final class CompactingSession: @unchecked Sendable {
     private let budget: ContextBudget
     private let batchGen: BatchGenerator?
     private let toolCallParser: (any ToolCallParser)?
+    private let adapter: ModelProfile           // the per-model harness (drives owned render / stops / reasoning)
     private var session: ChatSession
     private var messages: [Chat.Message] = []   // tracked conversation (excludes the system instructions)
+    private var structuredTurns: [TurnMessage] = []   // OWNED-RENDER transcript (carries reasoning_content + tool_calls)
+    private var lastOwnedToolCalls: [Serving.ToolCall]? = nil // the call parsed this round, recorded into the next assistant turn
     private(set) var contextTokens = 0          // last measured prompt+gen tokens (from Generation.info)
     private(set) var compactions = 0            // count, for the demo / observability
 
     init(model: MLXLanguageModel, instructions: String?, params: GenerateParameters,
          specs: [ToolSpec], tokenizer: (any GrammarTokenizer)?, budget: ContextBudget,
+         adapter: ModelProfile = .generic,
          batchGen: BatchGenerator? = nil, toolCallParser: (any ToolCallParser)? = nil) {
         var p = params
         if let kv = budget.maxKVSize { p.maxKVSize = kv }   // L3: RotatingKVCache memory floor
@@ -45,6 +49,7 @@ final class CompactingSession: @unchecked Sendable {
         self.specs = specs
         self.tokenizer = tokenizer
         self.budget = budget
+        self.adapter = adapter
         self.batchGen = batchGen
         self.toolCallParser = toolCallParser
         self.session = ChatSession(model.container, instructions: instructions,
@@ -58,6 +63,10 @@ final class CompactingSession: @unchecked Sendable {
     /// Split this way (vs a callback) so no closure crosses into an async method — keeps Swift concurrency
     /// happy while preserving live streaming.
     func beginRound(_ input: [Chat.Message], toolsEnabled: Bool) async -> AsyncThrowingStream<Generation, Error> {
+        // OWNED RENDER (strict reasoning+tool templates, e.g. the 122B): bypass ChatSession's lossy incremental
+        // restart (which drops the user query → "No user query found") and instead re-render the WHOLE
+        // structured transcript each round through the model's real template, decoding live via streamFromTokens.
+        if adapter.requiresOwnedRender { return await ownedRound(input, toolsEnabled: toolsEnabled) }
         if contextTokens > budget.maxContextTokens { await compact() }
         messages.append(contentsOf: input)
         // SLICE 3 batched path: render the WHOLE conversation (+ tools) to tokens, generate through the
@@ -103,8 +112,68 @@ final class CompactingSession: @unchecked Sendable {
     /// Record a round's outcome after the caller consumed the stream: append the assistant's turn + update the
     /// exact context size (from the stream's `.info`). Feeds the next compaction decision.
     func finishRound(assistantText: String, contextTokens: Int?) {
+        if adapter.requiresOwnedRender {
+            // Record the assistant turn STRUCTURED: split out the `<think>` span as reasoning_content (so it's
+            // replayed for the in-progress tool chain), keep the visible content, and attach the tool_calls
+            // parsed THIS round (nil ⇒ stored as plain content — never a malformed structured turn).
+            let (reasoning, content) = Self.splitReasoning(assistantText, tags: adapter.reasoningTags)
+            structuredTurns.append(TurnMessage(role: .assistant, content: content,
+                                               reasoningContent: reasoning, toolCalls: lastOwnedToolCalls))
+            lastOwnedToolCalls = nil
+            if let ct = contextTokens { self.contextTokens = ct }
+            return
+        }
         if !assistantText.isEmpty { messages.append(.assistant(assistantText)) }
         if let ct = contextTokens { self.contextTokens = ct }
+    }
+
+    /// OWNED-RENDER round: append the new input as structured turns, render the WHOLE transcript (user query
+    /// preserved by `continuationMessages`) through the model's real template, decode live, and parse the tool
+    /// call from the accumulated text (the xmlFunction/json parser the 122B needs; recover handles the rest).
+    private func ownedRound(_ input: [Chat.Message], toolsEnabled: Bool) async -> AsyncThrowingStream<Generation, Error> {
+        structuredTurns.append(contentsOf: input.map(Self.turnMessage))
+        let turns = adapter.continuationMessages(structuredTurns)
+        let tokens = (try? await model.renderTurnMessages(turns, tools: toolsEnabled ? specs : nil,
+                                                          enableThinking: toolsEnabled)) ?? []
+        contextTokens = tokens.count
+        let maxTok = params.maxTokens ?? 512
+        let temp = params.temperature
+        return AsyncThrowingStream { cont in
+            let task = Task {
+                var text = ""
+                do {
+                    for try await g in model.streamFromTokens(tokens, maxTokens: maxTok, adapter: adapter, temperature: temp) {
+                        if case .chunk(let c) = g { text += c; cont.yield(.chunk(c)) }
+                    }
+                } catch { cont.finish(throwing: error); return }
+                // Parse the tool call from the full text (think stripped so the parser doesn't read reasoning as
+                // the name); reject an obviously-garbage name. A parser miss falls to the round loop's recover.
+                if toolsEnabled, let call = toolCallParser?.parse(content: Self.stripThinkSpans(text), tools: specs),
+                   !(call.function.name.contains("<") || call.function.name.contains("\n") || call.function.name.count > 64) {
+                    self.lastOwnedToolCalls = [Serving.ToolCall(name: call.function.name,
+                                                                argsJSON: MLXLanguageModel.argsJSON(call.function.arguments))]
+                    cont.yield(.toolCall(call))
+                }
+                cont.finish()
+            }
+            cont.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    /// Convert an mlx `Chat.Message` (user/tool/system input) → a Sendable `TurnMessage` for the owned transcript.
+    static func turnMessage(_ m: Chat.Message) -> TurnMessage {
+        TurnMessage(role: TurnMessage.Role(rawValue: m.role.rawValue) ?? .user, content: m.content)
+    }
+
+    /// Split an assistant turn into (reasoning span, visible content). Reasoning = the text inside the model's
+    /// `<think>…</think>`; content = the answer with `<think>` AND `<tool_call>` spans removed.
+    static func splitReasoning(_ text: String, tags: (open: String, close: String)) -> (reasoning: String?, content: String) {
+        var reasoning: String? = nil
+        if let o = text.range(of: tags.open),
+           let c = text.range(of: tags.close, range: o.upperBound..<text.endIndex) {
+            reasoning = String(text[o.upperBound..<c.lowerBound]).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return (reasoning?.isEmpty == true ? nil : reasoning, stripReasoning(text))
     }
 
     /// Summarize the oldest messages and re-seed a fresh session with `[summary + recent verbatim]`.

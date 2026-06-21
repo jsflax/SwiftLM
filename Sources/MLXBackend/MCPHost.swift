@@ -274,11 +274,11 @@ extension MLXLanguageModel {
         // SLICE 3: when a batched generator is supplied (sub-agent fan-out), generation routes through the
         // coalescing pool; build the model's own tool-call parser so the round loop still gets `.toolCall`s
         // (the live/Orbital path passes nil → ChatSession streams + parses inline, unchanged).
-        let toolCallParser = batchGenerator != nil
+        let toolCallParser = (batchGenerator != nil || profile.requiresOwnedRender)
             ? (await container.configuration.toolCallFormat)?.createParser() : nil
         let compacting = CompactingSession(model: self, instructions: instr, params: params, specs: specs,
                                            tokenizer: grammarTokenizer, budget: profile.contextBudget,
-                                           batchGen: batchGenerator, toolCallParser: toolCallParser)
+                                           adapter: profile, batchGen: batchGenerator, toolCallParser: toolCallParser)
         var input: [Chat.Message] = [.user(prompt)]
         var answer = ""
         var toolsCalled: [String] = []
