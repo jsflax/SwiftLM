@@ -35,6 +35,13 @@ struct Agent {
         let model = try await MLXLanguageModel.load(modelId: modelId)
         log("loaded.")
 
+        // SPIRAL_BATTLETEST=1: A0 end-to-end proof — drive the real owned-render decode into a forced spiral
+        // and confirm the DegenerateRunDetector tripwire bounds it (guard-on vs guard-off vs healthy control).
+        if ProcessInfo.processInfo.environment["SPIRAL_BATTLETEST"] != nil {
+            print(try await model.spiralBattleTest())
+            return
+        }
+
         // Default: run the FROZEN BASE (per the "useful agent first" pivot). The champion adapter is
         // OPT-IN (CHAMPION=1) — it belongs to the offline-R&D loop, not the interactive default path.
         if ProcessInfo.processInfo.environment["CHAMPION"] != nil {

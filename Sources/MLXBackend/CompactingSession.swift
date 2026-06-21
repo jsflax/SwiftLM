@@ -137,7 +137,6 @@ final class CompactingSession: @unchecked Sendable {
                                                           enableThinking: toolsEnabled)) ?? []
         contextTokens = tokens.count
         let maxTok = params.maxTokens ?? 512
-        let temp = params.temperature
         // The owned-render generation prompt PRIMES `<think>` (enableThinking == toolsEnabled) — the open tag is
         // in the PROMPT, not the output — so a reasoning model's generated text begins INSIDE the think span.
         // Re-insert the open tag on the first chunk so every downstream stripper (the live display filter, the
@@ -151,7 +150,7 @@ final class CompactingSession: @unchecked Sendable {
                 var text = ""
                 var firstChunk = true
                 do {
-                    for try await g in model.streamFromTokens(tokens, maxTokens: maxTok, adapter: adapter, temperature: temp) {
+                    for try await g in model.streamFromTokens(tokens, maxTokens: maxTok, adapter: adapter, params: params) {
                         if case .chunk(let c) = g {
                             let piece = (firstChunk && primeThink) ? openTag + c : c
                             firstChunk = false

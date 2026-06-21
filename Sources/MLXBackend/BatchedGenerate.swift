@@ -287,7 +287,15 @@ extension MLXLanguageModel {
     /// adapter's stop set (its EOS strings/ids ∪ the universal turn-end floor); `</think>` is never a stop, so a
     /// reasoning model runs through its think block to the action. No `.info` is emitted — the caller sets its
     /// own context-token count (parity with the batched path), which keeps compaction/telemetry working.
-    public func streamFromTokens(_ row: [Int32], maxTokens: Int, adapter: ModelProfile, temperature: Float)
+    ///
+    /// A0 (the whitespace-spiral fix): decoding now runs through mlx's OWN logit processor + sampler
+    /// (`params.processor()` / `params.sampler()`), the SAME machinery the ChatSession path uses — so a
+    /// strict-template model samples IDENTICALLY here and on the incremental path. This restores the repetition
+    /// penalty that the old temperature-only `sampleBatched` silently dropped on the owned-render boundary (the
+    /// spiral root cause), plus min-p/top-p when configured. A `DegenerateRunDetector` is the UNCONDITIONAL
+    /// backstop the penalty can't promise: a degenerate run aborts in milliseconds instead of running to the
+    /// turn watchdog. `params` carries temp + rep-pen + min/top-p (built once in SwiftLMServe from the adapter).
+    public func streamFromTokens(_ row: [Int32], maxTokens: Int, adapter: ModelProfile, params: GenerateParameters)
         -> AsyncThrowingStream<Generation, Error> {
         AsyncThrowingStream { cont in
             let task = Task {
@@ -296,20 +304,38 @@ extension MLXLanguageModel {
                     let stops = self.batchStops(tok, adapter: adapter)
                     let cache = model.newCache(parameters: nil)
                     let promptArr = MLXArray(row).reshaped([1, row.count])
+                    // mlx's own decode chain — fresh per round (per-stream rep-pen ring + RNG state).
+                    var processor = params.processor()    // PenaltyProcessor? (rep/presence/freq) — nil if none set
+                    let sampler = params.sampler()         // ArgMax (temp 0) / TopP (min-p/top-p) / Categorical
+                    processor?.prompt(promptArr)           // seed the rep-pen ring from the prompt (ChatSession parity)
+                    var tripwire = DegenerateRunDetector()
+                    // Battle-test ONLY: force a pathological distribution to reproduce a spiral through the REAL
+                    // path. Read once (inert in production — the env var is unset).
+                    let injectId = ProcessInfo.processInfo.environment["SWIFTLM_SPIRAL_INJECT"].flatMap { Int32($0) }
                     var logits = model(promptArr, cache: cache)[0..., -1, 0...]   // [1, vocab]
                     eval(logits)
                     var genIds: [Int] = []
                     var emitted = ""
                     for _ in 0..<max(1, maxTokens) {
-                        let nextTok = self.sampleBatched(logits, temperature: temperature)   // [1]
+                        if let injectId { logits = Self.spikeLogits(like: logits, at: injectId) }
+                        let processed = processor?.process(logits: logits) ?? logits
+                        let nextTok = sampler.sample(logits: processed)          // [1]
                         eval(nextTok)
+                        processor?.didSample(token: nextTok)
                         let t = nextTok.asArray(Int.self)[0]
                         if stops.contains(t) { break }
                         genIds.append(t)
                         let full = tok.decode(tokenIds: genIds)
-                        if full.count > emitted.count {                       // emit the newly-decoded suffix
-                            cont.yield(.chunk(String(full.dropFirst(emitted.count))))
-                            emitted = full
+                        let suffix = full.count > emitted.count ? String(full.dropFirst(emitted.count)) : ""
+                        if !suffix.isEmpty {                                  // emit the newly-decoded suffix
+                            cont.yield(.chunk(suffix)); emitted = full
+                        }
+                        if let trip = tripwire.observe(token: t, suffix: suffix) {
+                            if ProcessInfo.processInfo.environment["SWIFTLM_CTX_DEBUG"] != nil {
+                                FileHandle.standardError.write(Data(("[tripwire] degenerate decode aborted after "
+                                    + "\(genIds.count) tokens: \(trip)\n").utf8))
+                            }
+                            break
                         }
                         logits = model(nextTok.reshaped([1, 1]), cache: cache)[0..., -1, 0...]
                         eval(logits)
@@ -319,6 +345,17 @@ extension MLXLanguageModel {
             }
             cont.onTermination = { _ in task.cancel() }
         }
+    }
+
+    /// Battle-test ONLY (`SWIFTLM_SPIRAL_INJECT=<tokenId>`): a `[1, vocab]` logit row peaked far above the rest
+    /// at `id`, so the REAL `streamFromTokens` loop deterministically tries to emit that one token forever —
+    /// reproducing a decode spiral end-to-end to prove the tripwire bounds it. Inert unless the env var is set.
+    static func spikeLogits(like template: MLXArray, at id: Int32) -> MLXArray {
+        let vocab = template.dim(-1)
+        var base = [Float](repeating: 0, count: vocab)
+        let i = Int(id)
+        if i >= 0 && i < vocab { base[i] = 60 }
+        return MLXArray(base).reshaped([1, vocab])
     }
 
     /// Token-level batched fan-out (the sub-agent coalescer's entry): decode B PRE-RENDERED token rows
