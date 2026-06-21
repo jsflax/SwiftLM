@@ -68,10 +68,38 @@ extension MLXLanguageModel {
                           String(c.head.prefix(40))))
         unsetenv("SWIFTLM_TRIPWIRE_IDENTICAL"); unsetenv("SWIFTLM_TRIPWIRE_WHITESPACE")
 
-        let pass = aBounded && bRanAway
+        // D — A1: a cancel must STOP the decode (free the GPU), not merely abandon the consumer. streamFromTokens
+        // holds the SerialAccessContainer for its ENTIRE loop, so a second decode can only start once the first
+        // RELEASES it. Start an injected, tripwire-OFF, 1M-cap spiral; cancel it after it's running; then race a
+        // normal decode. Prompt ⇒ the cancelled decode broke out (Task.isCancelled) and freed the container; a
+        // hang ⇒ the cancel never reached the decode loop and we're stuck behind a 1M-token spiral. This is the
+        // differential proof that cancellation actually propagates to the decode (otherwise un-observable).
+        setenv("SWIFTLM_SPIRAL_INJECT", "100", 1)
+        setenv("SWIFTLM_TRIPWIRE_IDENTICAL", "0", 1)
+        setenv("SWIFTLM_TRIPWIRE_WHITESPACE", "0", 1)
+        let spiral = Task { () -> Int in
+            var n = 0
+            for try await g in self.streamFromTokens(row, maxTokens: 1_000_000, adapter: adapter, params: params(1_000_000)) {
+                if case .chunk = g { n += 1 }
+            }
+            return n
+        }
+        try? await Task.sleep(for: .milliseconds(1500))   // let the spiral run + take the container
+        spiral.cancel()
+        unsetenv("SWIFTLM_SPIRAL_INJECT")                  // the probe must be a NORMAL decode
+        let tD = Date()
+        let probe = try await decode(row, maxTokens: 8)    // blocks here iff the container is still held
+        let probeSecs = Date().timeIntervalSince(tD)
+        _ = await spiral.result                            // reap the cancelled spiral
+        let freed = probeSecs < 20
+        out.append(String(format: "D cancel frees GPU (probe after cancel): %5.2fs %d tok  → %@",
+                          probeSecs, probe.chunks, freed ? "container released ✓ (decode observed cancel)" : "BLOCKED ✗ (cancel ignored)"))
+        unsetenv("SWIFTLM_TRIPWIRE_IDENTICAL"); unsetenv("SWIFTLM_TRIPWIRE_WHITESPACE")
+
+        let pass = aBounded && bRanAway && freed
         out.append(pass
-            ? "RESULT: PASS — the tripwire bounds the injected spiral (A≈\(a.chunks) ≪ B≈\(b.chunks))."
-            : "RESULT: FAIL — A=\(a.chunks) B=\(b.chunks) (expected A≤\(limit + 4) ≪ B≥250).")
+            ? "RESULT: PASS — tripwire bounds the spiral (A≈\(a.chunks) ≪ B≈\(b.chunks)); cancel frees the GPU (D=\(String(format: "%.1f", probeSecs))s)."
+            : "RESULT: FAIL — A=\(a.chunks) B=\(b.chunks) freed=\(freed) (want A≤\(limit + 4) ≪ B≥250, D prompt).")
         return out.joined(separator: "\n")
     }
 }

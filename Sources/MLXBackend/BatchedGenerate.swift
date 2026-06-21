@@ -54,6 +54,7 @@ extension MLXLanguageModel {
         var out = Array(repeating: [Int](), count: n)
         var streamOf = Array(0..<n)   // current batch ROW → original stream id; shrinks on eviction
         for _ in 0..<maxTokens {
+            if Task.isCancelled { break }   // A1: observe a watchdog/supersession cancel
             let toks = next.asArray(Int.self)
             var keep: [Int] = []
             for r in 0..<streamOf.count {
@@ -174,6 +175,7 @@ extension MLXLanguageModel {
         var out = Array(repeating: [Int](), count: n)
         var streamOf = Array(0..<n)
         for _ in 0..<maxTokens {
+            if Task.isCancelled { break }   // A1: observe a watchdog/supersession cancel
             let toks = next.asArray(Int.self)
             var keep: [Int] = []
             for r in 0..<streamOf.count {
@@ -317,6 +319,7 @@ extension MLXLanguageModel {
                     var genIds: [Int] = []
                     var emitted = ""
                     for _ in 0..<max(1, maxTokens) {
+                        if Task.isCancelled { break }   // A1: a watchdog/supersession cancel stops the decode
                         if let injectId { logits = Self.spikeLogits(like: logits, at: injectId) }
                         let processed = processor?.process(logits: logits) ?? logits
                         let nextTok = sampler.sample(logits: processed)          // [1]
