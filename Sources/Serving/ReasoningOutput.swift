@@ -68,17 +68,31 @@ public struct ReasoningStreamFilter {
                 } else {                                  // hold a possible split close tag
                     buf = String(buf.suffix(partialTailLen(buf, of: close))); break
                 }
-            } else {                                      // outside: emit up to the EARLIEST open tag
-                var best: (idx: Int, range: Range<String.Index>)?
+            } else {                                      // outside a span
+                // earliest OPEN across spans
+                var bestOpen: (idx: Int, range: Range<String.Index>)?
                 for (i, s) in spans.enumerated() {
                     if let r = buf.range(of: s.open),
-                       best == nil || r.lowerBound < best!.range.lowerBound { best = (i, r) }
+                       bestOpen == nil || r.lowerBound < bestOpen!.range.lowerBound { bestOpen = (i, r) }
                 }
-                if let b = best {
+                // earliest CLOSE across spans — a DANGLING close (no matching open in this stream) means the
+                // span was opened earlier (the owned-render `<think>` primed in the prompt) or the model emitted
+                // a stray close. Emit the genuine text before it and DROP the close tag, so a bare
+                // `</think>` / `</tool_call>` never leaks into the chat.
+                var bestClose: Range<String.Index>?
+                for s in spans {
+                    if let r = buf.range(of: s.close),
+                       bestClose == nil || r.lowerBound < bestClose!.lowerBound { bestClose = r }
+                }
+                if let c = bestClose, bestOpen == nil || c.lowerBound < bestOpen!.range.lowerBound {
+                    out += String(buf[..<c.lowerBound])
+                    buf = String(buf[c.upperBound...]); continue
+                }
+                if let b = bestOpen {
                     out += String(buf[..<b.range.lowerBound])
                     buf = String(buf[b.range.upperBound...]); current = b.idx
-                } else {                                  // emit all but a possible split open tag
-                    let keep = spans.map { partialTailLen(buf, of: $0.open) }.max() ?? 0
+                } else {                                  // emit all but a possible split open/close tag tail
+                    let keep = spans.flatMap { [partialTailLen(buf, of: $0.open), partialTailLen(buf, of: $0.close)] }.max() ?? 0
                     out += String(buf.dropLast(keep))
                     buf = String(buf.suffix(keep)); break
                 }

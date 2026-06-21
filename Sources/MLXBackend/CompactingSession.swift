@@ -138,12 +138,25 @@ final class CompactingSession: @unchecked Sendable {
         contextTokens = tokens.count
         let maxTok = params.maxTokens ?? 512
         let temp = params.temperature
+        // The owned-render generation prompt PRIMES `<think>` (enableThinking == toolsEnabled) — the open tag is
+        // in the PROMPT, not the output — so a reasoning model's generated text begins INSIDE the think span.
+        // Re-insert the open tag on the first chunk so every downstream stripper (the live display filter, the
+        // tool-call parse, and finishRound's reasoning split) sees a COMPLETE <think>…</think> span. Without it
+        // the whole reasoning block + a dangling </think> leak to the chat, and a tool the model calls WHILE
+        // reasoning renders mid-thought.
+        let primeThink = toolsEnabled && adapter.emitsReasoning
+        let openTag = adapter.reasoningTags.open
         return AsyncThrowingStream { cont in
             let task = Task {
                 var text = ""
+                var firstChunk = true
                 do {
                     for try await g in model.streamFromTokens(tokens, maxTokens: maxTok, adapter: adapter, temperature: temp) {
-                        if case .chunk(let c) = g { text += c; cont.yield(.chunk(c)) }
+                        if case .chunk(let c) = g {
+                            let piece = (firstChunk && primeThink) ? openTag + c : c
+                            firstChunk = false
+                            text += piece; cont.yield(.chunk(piece))
+                        }
                     }
                 } catch { cont.finish(throwing: error); return }
                 // Parse the tool call from the full text (think stripped so the parser doesn't read reasoning as
