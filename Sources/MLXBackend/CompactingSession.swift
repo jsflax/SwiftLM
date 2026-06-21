@@ -87,7 +87,8 @@ final class CompactingSession: @unchecked Sendable {
             }
             if ProcessInfo.processInfo.environment["SWIFTLM_BATCH_DEBUG"] != nil {
                 FileHandle.standardError.write(Data(("[batch-gen] toolsOn=\(toolsEnabled) "
-                    + "parsed=\(call?.function.name ?? "nil") hasToolCall=\(text.contains("<tool_call>"))\n").utf8))
+                    + "parsed=\(call?.function.name ?? "nil") hasToolCall=\(text.contains("<tool_call>")) "
+                    + "text=\"\(text.replacingOccurrences(of: "\n", with: " ").prefix(120))\"\n").utf8))
             }
             return AsyncThrowingStream { cont in
                 cont.yield(.chunk(text))

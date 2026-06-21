@@ -41,26 +41,22 @@ struct ModelProfileTests {
         #expect(!p.emitsReasoning)
     }
 
-    // ── physics-derived budget (floor never clipped, ceil never exceeded)
-    @Test func budgetClampsBetweenFloorAndCeil() {
-        let low = GenerationBudget(latencyTargetSeconds: 1, assumedTokensPerSecond: 1,
-                                   floorTokens: 512, ceilTokens: 2048)
-        #expect(low.maxTokens == 512)     // 1×1 → clamped UP to floor
-        let mid = GenerationBudget(latencyTargetSeconds: 10, assumedTokensPerSecond: 100,
-                                   floorTokens: 512, ceilTokens: 2048)
-        #expect(mid.maxTokens == 1000)    // 10×100, within [512, 2048]
-        let high = GenerationBudget(latencyTargetSeconds: 1000, assumedTokensPerSecond: 100,
-                                    floorTokens: 512, ceilTokens: 2048)
-        #expect(high.maxTokens == 2048)   // clamped DOWN to ceil
+    // ── output backstop: a single window-derived cap, clamped by the global runaway ceiling
+    @Test func budgetBackstopFromWindow() {
+        #expect(GenerationBudget.forWindow(8192).maxTokens == 8192)                              // small window → the window
+        #expect(GenerationBudget.forWindow(262144).maxTokens == GenerationBudget.runawayCeiling) // huge window → ceiling
+        #expect(GenerationBudget.forWindow(1024).maxTokens == 2048)                              // tiny → 2048 floor
     }
 
-    @Test func reasoningFloorNeverClipsCoT() {
-        let p = ModelProfile.forModelType("glm4_moe", toolCallStyle: .taggedReasoning, modelId: "x/GLM")
-        #expect(p.budget.floorTokens >= 4096)
-        #expect(p.budget.maxTokens >= 4096)
+    @Test func backstopLeavesRoomForAFullFileWrite() {
+        // The coder family must be able to emit a full source file in one write_file call — the old ~1000-token
+        // budget truncated it. A real-window model now gets the runaway ceiling (≫ a file).
+        let p = ModelProfile.forModelType("qwen3_next", toolCallStyle: .rawJSON, modelId: "x/Q", contextWindow: 262144)
+        #expect(p.budget.maxTokens == GenerationBudget.runawayCeiling)
+        #expect(p.budget.maxTokens >= 8192)
     }
 
-    // ── recovery keyed on style, not family
+    // ── recovery attempts the <tool_call> tag parser for ANY family; nil only when there's no usable tag
     @Test func taggedProfileRecoversBareNameCall() {
         let p = ModelProfile.forModelType("glm4_moe", toolCallStyle: .taggedReasoning, modelId: "x/GLM")
         let r = p.recoverMissedToolCall("done</think><tool_call>current_time\n</tool_call>")
@@ -68,9 +64,35 @@ struct ModelProfileTests {
         #expect(r?.argsJSON == "{}")
     }
 
-    @Test func rawJsonProfileRecoversNothing() {
-        let p = ModelProfile.forModelType("qwen2", toolCallStyle: .rawJSON, modelId: "x/Qwen")
-        #expect(p.recoverMissedToolCall("<tool_call>current_time</tool_call>") == nil)
+    @Test func rawJsonProfileRecoversQwenJSONInTags() {
+        // Qwen3-Next (qwen3_next → .rawJSON profile) emits JSON inside <tool_call> tags per its chat template;
+        // mlx hardcodes Qwen → .xmlFunction, whose parser can't read the JSON, so the call leaks as text and
+        // the round loop's recoverMissedToolCall must catch it. PRE-FIX this returned nil → the infinite loop.
+        let p = ModelProfile.forModelType("qwen3_next", toolCallStyle: .rawJSON, modelId: "x/Qwen3-Next-80B")
+        let r = p.recoverMissedToolCall(
+            "I'll write the file.\n<tool_call>\n{\"name\": \"Write\", "
+            + "\"arguments\": {\"file_path\": \"LRU.swift\", \"content\": \"x\"}}\n</tool_call>")
+        #expect(r?.name == "Write")
+        #expect(r?.argsJSON.contains("LRU.swift") == true)
+    }
+
+    @Test func rawJsonProfileRecoversNothingWithoutTag() {
+        // A genuine raw-JSON emission with NO <tool_call> tag (or plain prose) has nothing to recover → nil.
+        let p = ModelProfile.forModelType("qwen3_next", toolCallStyle: .rawJSON, modelId: "x/Qwen")
+        #expect(p.recoverMissedToolCall(#"{"name":"current_time","arguments":{}}"#) == nil)
+        #expect(p.recoverMissedToolCall("just explaining how tools work, no call here") == nil)
+    }
+
+    @Test func recoversMarkdownFencedJSONCall() {
+        // A weaker model (Qwen2.5-7B under the batched render) wraps the call in ```json …``` instead of
+        // <tool_call> tags. Recovery catches it — but requires BOTH name AND arguments, so a stray named JSON
+        // example in prose is not mistaken for a call.
+        let p = ModelProfile.forModelType("qwen3_next", toolCallStyle: .rawJSON, modelId: "x/Q")
+        let r = p.recoverMissedToolCall(
+            "Sure:\n```json\n{\"name\": \"write_file\", \"arguments\": {\"path\": \"/tmp/x.txt\"}}\n```")
+        #expect(r?.name == "write_file")
+        #expect(r?.argsJSON.contains("x.txt") == true)
+        #expect(p.recoverMissedToolCall("```json\n{\"name\": \"Alice\"}\n```") == nil)   // no arguments → not a call
     }
 
     @Test func stripForDisplayRemovesThink() {

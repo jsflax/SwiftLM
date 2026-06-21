@@ -101,30 +101,49 @@ public struct ReasoningStreamFilter {
     }
 }
 
-/// Recover a tool call emitted as a `<tool_call>…</tool_call>` tag that the backend parser didn't surface
-/// (notably GLM's bare-name no-arg form). Returns the tool NAME plus best-effort args JSON ("{}" when none) —
-/// the constrained-repair layer fills any required args. nil when there's no tag or no usable name.
+/// Parse a `{"name":…,"arguments":…}` object → (name, argsJSON). nil unless it's a valid NAMED tool call.
+/// `requireArguments` demands an `arguments` key too (a stronger signal — used for the bare/fenced forms that
+/// lack `<tool_call>` framing, so a stray named JSON object in prose isn't mistaken for a call).
+private func parseJSONToolCallObject(_ s: String, requireArguments: Bool = false)
+    -> (name: String, argsJSON: String)? {
+    let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard t.hasPrefix("{"), let d = t.data(using: .utf8),
+          let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
+          let n = o["name"] as? String, !n.isEmpty else { return nil }
+    if requireArguments, o["arguments"] == nil { return nil }
+    let args = o["arguments"].flatMap { try? JSONSerialization.data(withJSONObject: $0) }
+        .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+    return (n, args)
+}
+
+/// Recover a tool call the backend parser didn't surface. Handles the three real forms an on-device model
+/// emits when its `ToolCallFormat` parser misses: (1) `<tool_call>…</tool_call>` framing — GLM bare-name, or
+/// GLM/Qwen JSON-in-tags `{"name":…,"arguments":…}`; (2) a markdown-fenced ```json {"name":…,"arguments":…}```
+/// block (a weaker model's wrapper when it omits the tags — observed from Qwen2.5-7B under the batched render).
+/// Returns the tool NAME + best-effort args JSON ("{}" when none); the constrained-repair layer fills required
+/// args. nil when there's no recoverable call.
 public func recoverToolCallTag(_ text: String) -> (name: String, argsJSON: String)? {
-    guard let open = text.range(of: "<tool_call>") else { return nil }
-    let after = text[open.upperBound...]
-    let inner = after.range(of: "</tool_call>").map { String(after[..<$0.lowerBound]) } ?? String(after)
-    let trimmed = inner.trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !trimmed.isEmpty else { return nil }
-
-    // JSON form `{"name": "...", "arguments": {...}}` (some GLM/Qwen variants).
-    if trimmed.hasPrefix("{"), let d = trimmed.data(using: .utf8),
-       let o = try? JSONSerialization.jsonObject(with: d) as? [String: Any],
-       let n = o["name"] as? String, !n.isEmpty {
-        let args = o["arguments"].flatMap { try? JSONSerialization.data(withJSONObject: $0) }
-            .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-        return (n, args)
+    // 1. `<tool_call>…</tool_call>` framing.
+    if let open = text.range(of: "<tool_call>") {
+        let after = text[open.upperBound...]
+        let inner = after.range(of: "</tool_call>").map { String(after[..<$0.lowerBound]) } ?? String(after)
+        let trimmed = inner.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty {
+            // JSON-in-tags `{"name":…,"arguments":…}` (GLM/Qwen variants).
+            if let jc = parseJSONToolCallObject(trimmed) { return jc }
+            // GLM bare-name: the name is the first non-empty line (e.g. `current_time` or `bash\n<arg_key>…`).
+            let name = trimmed.split(whereSeparator: \.isNewline).first.map {
+                $0.trimmingCharacters(in: .whitespaces) } ?? trimmed
+            if !name.isEmpty, !name.contains("<"), !name.contains("{") { return (name, "{}") }
+        }
     }
-
-    // GLM tag form: the name is the first non-empty line (e.g. `current_time` or `bash\n<arg_key>…`).
-    let name = trimmed.split(whereSeparator: \.isNewline).first.map {
-        $0.trimmingCharacters(in: .whitespaces)
-    } ?? trimmed
-    // Guard against stray markup / empty tokens being treated as a tool name.
-    guard !name.isEmpty, !name.contains("<"), !name.contains("{") else { return nil }
-    return (name, "{}")
+    // 2. Markdown-fenced JSON tool call: ```json\n{"name":…,"arguments":…}\n``` (no <tool_call> tags). Only a
+    //    fenced object carrying BOTH name and arguments recovers, so a JSON example in prose is ignored.
+    if let fence = text.range(of: "```") {
+        let afterFence = String(text[fence.upperBound...])
+        let body = afterFence.range(of: "```").map { String(afterFence[..<$0.lowerBound]) } ?? afterFence
+        if let brace = body.firstIndex(of: "{"),
+           let jc = parseJSONToolCallObject(String(body[brace...]), requireArguments: true) { return jc }
+    }
+    return nil
 }

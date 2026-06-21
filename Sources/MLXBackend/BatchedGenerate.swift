@@ -126,9 +126,37 @@ extension MLXLanguageModel {
         return (merged, concatenated(firstLogits, axis: 0), lengths)    // firstLogits: [B, vocab]
     }
 
+    /// True iff EVERY layer's cache is a standard `[1,H,L,D]` KV that `BatchedKVCache` can left-pad-merge.
+    /// HYBRID-attention models are NOT: `qwen3_next`/`qwen3_5` interleave `Qwen3NextGatedDeltaNet` layers whose
+    /// `MambaCache` is a conv+recurrent state (not 4-D KV), so the left-pad merge indexes out of range
+    /// (`BatchedKVCache` reads `shape[3]`). Probed via a 1-token prefill — the only way to populate state shapes.
+    func cachesAreCoBatchable(model: any LanguageModel) -> Bool {
+        let cache = model.newCache(parameters: nil)
+        _ = model(MLXArray([Int32(0)]).reshaped([1, 1]), cache: cache)
+        for c in cache { eval(c.state) }
+        return cache.allSatisfy { c in
+            let st = c.state
+            return st.count == 2 && st[0].ndim == 4 && st[1].ndim == 4
+        }
+    }
+
     func batchDecodeDistinct(model: any LanguageModel, promptRows: [[Int32]], maxTokens: Int,
                              temperature: Float, stops: Set<Int>, stopOnEOS: Bool) -> [[Int]] {
         let n = promptRows.count
+        guard n > 0 else { return [] }
+        // HYBRID models (qwen3_next/qwen3_5 GatedDeltaNet `MambaCache`) can't be KV-merged → decode each row
+        // SOLO (the serial floor: correct, just unfused) instead of crashing in the left-pad merge. A single-row
+        // `batchDecode` never reaches its own KV-eviction reshape, so it is safe for ANY architecture.
+        if n > 1, !cachesAreCoBatchable(model: model) {
+            if ProcessInfo.processInfo.environment["SWIFTLM_BATCH_DEBUG"] != nil {
+                FileHandle.standardError.write(Data(("[batch-pool] non-mergeable cache (hybrid attention) "
+                    + "→ solo fallback for \(n) row(s)\n").utf8))
+            }
+            return promptRows.map {
+                batchDecode(model: model, promptRows: [$0], maxTokens: maxTokens,
+                            temperature: temperature, stops: stops, stopOnEOS: stopOnEOS)[0]
+            }
+        }
         guard let (merged, firstLogits, _) = prefillAndMerge(model: model, promptRows: promptRows) else {
             return Array(repeating: [], count: n)
         }

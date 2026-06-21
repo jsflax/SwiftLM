@@ -16,26 +16,23 @@ public enum ToolCallStyle: Sendable { case taggedReasoning, rawJSON }
 /// capability fields below, which keeps it generic); this just lets a human see what was detected.
 public enum ModelFamily: String, Sendable { case glm4, qwen, deepseekR1, generic }
 
-/// A PHYSICS-DERIVED generation bound — the plan's CoT rule made concrete: NOT an arbitrary cap. EOS is the
-/// real terminator (normal turns stop well under this); the bound only catches a non-terminating runaway
-/// (repetition / missing EOS). `maxTokens` = a latency budget (target seconds × assumed tok/s), clamped so
-/// it can never fall below a reasoning `floor` (a long `<think>` is never clipped) nor exceed a hard `ceil`.
-/// `assumedTokensPerSecond` is the documented per-family seed AND the seam where measured throughput lands
-/// later — an inert constant for now.
+/// The per-turn OUTPUT-token BACKSTOP — NOT a budget. EOS is the real terminator: every legitimate turn (a
+/// full-file write, a long reasoning chain) stops well under this. The cap exists ONLY because WE run the
+/// local decode loop and a local model can spin forever without ever emitting EOS — there is no provider to
+/// stop it (unlike the claude/codex/gemini CLIs, which own their own loop and get NO cap from us). Local
+/// generation therefore runs to EOS like a hosted model; this only bounds a non-terminating runaway. Derived
+/// from the model's REAL context window, clamped by ONE global runaway ceiling so a no-EOS loop in a
+/// huge-window model can't burn the whole window. No latency target, no tok/s guess, no floor/ceiling pair,
+/// no per-family tuning.
 public struct GenerationBudget: Sendable {
-    public var latencyTargetSeconds: Double
-    public var assumedTokensPerSecond: Double
-    public var floorTokens: Int
-    public var ceilTokens: Int
-    public init(latencyTargetSeconds: Double, assumedTokensPerSecond: Double,
-                floorTokens: Int, ceilTokens: Int) {
-        self.latencyTargetSeconds = latencyTargetSeconds
-        self.assumedTokensPerSecond = assumedTokensPerSecond
-        self.floorTokens = floorTokens
-        self.ceilTokens = ceilTokens
-    }
-    public var maxTokens: Int {
-        min(ceilTokens, max(floorTokens, Int((latencyTargetSeconds * assumedTokensPerSecond).rounded(.up))))
+    /// No legitimate single turn needs more output than this (~800 lines of code / a very long CoT); past it
+    /// is a repetition loop. The ONE hand-set constant — a safety ceiling, not a tuned budget.
+    public static let runawayCeiling = 16384
+    public let maxTokens: Int
+    public init(maxTokens: Int) { self.maxTokens = maxTokens }
+    /// Backstop from the model's real context window, clamped by the global runaway ceiling.
+    public static func forWindow(_ contextWindow: Int) -> GenerationBudget {
+        GenerationBudget(maxTokens: min(runawayCeiling, max(2048, contextWindow)))
     }
 }
 
@@ -91,17 +88,20 @@ public struct ModelProfile: Sendable {
     /// ends inside `<think>` (so the turn never displays empty). A no-op for non-reasoning output (no tags).
     public func stripForDisplay(_ text: String) -> String { displayAnswer(text) }
 
-    /// Recover a tool call the backend parser left unsurfaced — only for tag-emitting families (e.g. GLM's
-    /// bare-name no-arg `<tool_call>name</tool_call>`). Raw-JSON families return nil (nothing to recover).
+    /// Recover a tool call the backend parser left unsurfaced — a `<tool_call>…</tool_call>` tag the model
+    /// emitted but mlx's per-format parser didn't match. Two real cases: GLM's bare-name no-arg
+    /// `<tool_call>name</tool_call>`, and Qwen/Hermes JSON-in-tags `<tool_call>{"name":…,"arguments":…}</tool_call>`
+    /// (mlx hardcodes Qwen → `.xmlFunction`, whose parser can't read the JSON body, so the call leaks as text).
+    /// `recoverToolCallTag` returns nil when there's no tag, so a true raw-JSON model (bare JSON, no tags) is
+    /// unaffected — making this safe to attempt for ANY family, not just `.taggedReasoning`.
     public func recoverMissedToolCall(_ text: String) -> (name: String, argsJSON: String)? {
-        toolCallStyle == .taggedReasoning ? recoverToolCallTag(text) : nil
+        recoverToolCallTag(text)
     }
 
     /// Safe default for an unknown model: non-reasoning, raw-JSON, middle-of-the-road budget.
     public static let generic = ModelProfile(
         family: .generic, emitsReasoning: false, toolCallStyle: .rawJSON,
-        budget: GenerationBudget(latencyTargetSeconds: 25, assumedTokensPerSecond: 60,
-                                 floorTokens: 1024, ceilTokens: 4096))
+        budget: GenerationBudget.forWindow(8192))
 
     /// The registry (the ONE place families are enumerated): build a profile from `model_type` (config.json),
     /// the tool-call style (already inferred by mlx-swift-lm), and id substrings — the reasoning tie-break,
@@ -113,32 +113,28 @@ public struct ModelProfile: Sendable {
         let isR1 = id.contains("distill") || id.contains("-r1") || id.contains("deepseek-r1")
         let ctx = ContextBudget.forWindow(contextWindow)   // compaction budget from the model's window
 
-        // GLM-4 family: reasoning + TAGGED tool calls. MoE decode is slower → larger latency budget.
+        // The OUTPUT backstop is the SAME for every family — run to EOS, capped only by the runaway backstop
+        // (GenerationBudget.forWindow). Families still differ in what's real: reasoning, tool-call style. (The
+        // old per-family "latency budget" capped a coder model at ~1000 tokens, which truncated a write_file
+        // call mid-file → invalid JSON → no dispatch → the agent narrated but never built.)
+        let budget = GenerationBudget.forWindow(contextWindow)
+        // GLM-4 family: reasoning + TAGGED tool calls.
         if type.hasPrefix("glm4") || toolCallStyle == .taggedReasoning {
-            return ModelProfile(
-                family: .glm4, emitsReasoning: true, toolCallStyle: .taggedReasoning,
-                budget: GenerationBudget(latencyTargetSeconds: 120, assumedTokensPerSecond: 40,
-                                         floorTokens: 4096, ceilTokens: 8192),
-                contextBudget: ctx)
+            return ModelProfile(family: .glm4, emitsReasoning: true, toolCallStyle: .taggedReasoning,
+                                 budget: budget, contextBudget: ctx)
         }
-        // R1-distill: reasoning, raw-JSON tools. Long CoT → high reasoning floor.
+        // R1-distill: reasoning, raw-JSON tools.
         if isR1 {
-            return ModelProfile(
-                family: .deepseekR1, emitsReasoning: true, toolCallStyle: .rawJSON,
-                budget: GenerationBudget(latencyTargetSeconds: 120, assumedTokensPerSecond: 60,
-                                         floorTokens: 4096, ceilTokens: 8192),
-                contextBudget: ctx)
+            return ModelProfile(family: .deepseekR1, emitsReasoning: true, toolCallStyle: .rawJSON,
+                                 budget: budget, contextBudget: ctx)
         }
-        // Instruct / coder model (no reasoning): tight budget — an answer doesn't need a CoT-sized floor.
+        // Instruct / coder model (no reasoning).
         if type.hasPrefix("qwen") || type.hasPrefix("llama") || type.hasPrefix("mistral")
             || type.hasPrefix("gemma") || type.hasPrefix("phi") {
-            return ModelProfile(
-                family: .qwen, emitsReasoning: false, toolCallStyle: toolCallStyle,
-                budget: GenerationBudget(latencyTargetSeconds: 10, assumedTokensPerSecond: 100,
-                                         floorTokens: 512, ceilTokens: 2048),
-                contextBudget: ctx)
+            return ModelProfile(family: .qwen, emitsReasoning: false, toolCallStyle: toolCallStyle,
+                                 budget: budget, contextBudget: ctx)
         }
         return ModelProfile(family: .generic, emitsReasoning: false, toolCallStyle: .rawJSON,
-                            budget: ModelProfile.generic.budget, contextBudget: ctx)
+                            budget: budget, contextBudget: ctx)
     }
 }
