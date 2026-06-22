@@ -56,6 +56,15 @@ struct Agent {
             return
         }
 
+        // TRAITBANK_CHECK=1: C1 correctness gate — the Resident Trait-Bank must be byte-identical to base when no
+        // trait is active (empty/inactive/B=0), apply a measurable delta when a live trait IS active, and keep two
+        // CONCURRENT agents' trait-sets isolated (the @TaskLocal interleave proof). Do NOT also set SWIFTLM_TRAIT_BANK
+        // (the check installs the bank itself so it can measure the pre-install base first).
+        if ProcessInfo.processInfo.environment["TRAITBANK_CHECK"] != nil {
+            print(try await model.residentTraitBankCheck())
+            return
+        }
+
         // Default: run the FROZEN BASE (per the "useful agent first" pivot). The champion adapter is
         // OPT-IN (CHAMPION=1) — it belongs to the offline-R&D loop, not the interactive default path.
         if ProcessInfo.processInfo.environment["CHAMPION"] != nil {

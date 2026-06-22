@@ -56,7 +56,8 @@ extension MLXLanguageModel {
     /// knowledge) exactly as the live REPL loop does, so a room agent gets constrained valid tool calls.
     /// `batchGenerator` (B2 co-batching) is forwarded into the round's CompactingSession with the model's
     /// own tool-call parser; nil ⇒ the serial incremental-KV ChatSession path (B1), byte-for-byte the loop.
-    public func makeAgentBackend(host: MCPHost, batchGenerator: BatchGenerator? = nil) async -> any AgentTurnBackend {
+    public func makeAgentBackend(host: MCPHost, batchGenerator: BatchGenerator? = nil,
+                                 activeTraits: Set<TraitID> = []) async -> any AgentTurnBackend {
         let specs = await host.specs
         let toolNames = await host.toolNames
         let adapter = await self.localAdapter   // config-driven (replaces forModelType `profile`): format/reasoning/stops/sampling from the model's own files
@@ -69,9 +70,14 @@ extension MLXLanguageModel {
         // misinference; `.deferToMLX` falls back to mlx's own inference, so a model is never made worse.
         let needsParser = batchGenerator != nil || adapter.requiresOwnedRender   // owned render parses the call from text too
         let parser = needsParser ? await makeToolCallParser(adapter) : nil
+        // Part C: the trait @TaskLocal only propagates on the owned-render decode path (streamFromTokens). Gate the
+        // role trait-set to owned-render models HERE (the one place `requiresOwnedRender` is known) so a non-owned
+        // model (e.g. the 80B ChatSession path) carries an EMPTY set and never silently serves base. (122B-first;
+        // the loud `assertCarriable` in CompactingSession is the belt-and-suspenders for any future leak.)
+        let effectiveTraits = adapter.requiresOwnedRender ? activeTraits : []
         return ChatSessionTurnBackend(model: self, host: host, specs: specs, toolNames: toolNames,
                                       params: params, profile: adapter, grammarTokenizer: grammarTok,
-                                      batchGenerator: batchGenerator, toolCallParser: parser)
+                                      batchGenerator: batchGenerator, toolCallParser: parser, activeTraits: effectiveTraits)
     }
 
     /// Map the adapter's template-derived format choice → an mlx `ToolCallFormat` parser. `.deferToMLX` (and any
@@ -102,15 +108,18 @@ final class ChatSessionTurnBackend: AgentTurnBackend, @unchecked Sendable {
     let grammarTokenizer: (any GrammarTokenizer)?
     let batchGenerator: BatchGenerator?          // B2 co-batch DI seam (nil ⇒ serial incremental-KV path)
     let toolCallParser: (any ToolCallParser)?    // standalone parser for the batched path (nil on serial)
+    let activeTraits: Set<TraitID>               // Part C: role trait-set (gated to owned-render; bound around the decode)
     private var compacting: CompactingSession?   // persistent conversation + Claude-Code-style compaction
     private var basePrompt = ""   // the original user prompt — used to constrain regenerated tool args
 
     init(model: MLXLanguageModel, host: MCPHost, specs: [ToolSpec], toolNames: [String],
          params: GenerateParameters, profile: ModelProfile, grammarTokenizer: (any GrammarTokenizer)?,
-         batchGenerator: BatchGenerator? = nil, toolCallParser: (any ToolCallParser)? = nil) {
+         batchGenerator: BatchGenerator? = nil, toolCallParser: (any ToolCallParser)? = nil,
+         activeTraits: Set<TraitID> = []) {
         self.model = model; self.host = host; self.specs = specs; self.toolNames = toolNames
         self.params = params; self.profile = profile; self.grammarTokenizer = grammarTokenizer
         self.batchGenerator = batchGenerator; self.toolCallParser = toolCallParser
+        self.activeTraits = activeTraits
     }
 
     /// The real running context size (last round's prompt+gen tokens, from `Generation.info`) — honest
@@ -124,7 +133,8 @@ final class ChatSessionTurnBackend: AgentTurnBackend, @unchecked Sendable {
         if compacting == nil {
             compacting = CompactingSession(model: model, instructions: instructions, params: params,
                                            specs: specs, tokenizer: grammarTokenizer, budget: profile.contextBudget,
-                                           adapter: profile, batchGen: batchGenerator, toolCallParser: toolCallParser)
+                                           adapter: profile, batchGen: batchGenerator, toolCallParser: toolCallParser,
+                                           activeTraits: activeTraits)
         }
         let comp = compacting!
         return AsyncThrowingStream { continuation in

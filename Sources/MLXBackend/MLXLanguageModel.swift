@@ -47,7 +47,15 @@ public final class MLXLanguageModel: Sendable {
         // stays bounded — small caches typically match unconstrained throughput.
         let cacheGB = ProcessInfo.processInfo.environment["SWIFTLM_MLX_CACHE_LIMIT_GB"].flatMap(Int.init) ?? 4
         MLX.Memory.cacheLimit = cacheGB << 30
-        return MLXLanguageModel(modelId: id, container: container)
+        let m = MLXLanguageModel(modelId: id, container: container)
+        // Part C: install the Resident Trait-Bank once per container, gated by env (default OFF in C1 — there are
+        // no trained traits yet, so live rooms stay byte-identical to base). When on, base Linear/QuantizedLinear
+        // leaves are swapped to resident layers with EMPTY stores ⇒ still byte-identical until a trait is
+        // registered AND made active via `LoRARuntime.activeTraits`. The capture+bind plumbing runs either way.
+        if ProcessInfo.processInfo.environment["SWIFTLM_TRAIT_BANK"] != nil {
+            await m.installResidentTraitBank()
+        }
+        return m
     }
 
     /// Text completion. A repetition penalty is on by default — LoRA adapters overfit to

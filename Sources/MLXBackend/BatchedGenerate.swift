@@ -298,11 +298,17 @@ extension MLXLanguageModel {
     /// backstop the penalty can't promise: a degenerate run aborts in milliseconds instead of running to the
     /// turn watchdog. `params` carries temp + rep-pen + min/top-p (built once in SwiftLMServe from the adapter).
     public func streamFromTokens(_ row: [Int32], maxTokens: Int, adapter: ModelProfile,
-                                 params: GenerateParameters, kvBox: OwnedKVCacheBox? = nil)
+                                 params: GenerateParameters, kvBox: OwnedKVCacheBox? = nil,
+                                 activeTraits: Set<TraitID> = [])
         -> AsyncThrowingStream<Generation, Error> {
         AsyncThrowingStream { cont in
             let task = Task {
                 await container.perform { ctx in
+                    // Part C: bind this agent's role trait-set for THIS decode. `perform`→`read`→`withLock` are
+                    // inline continuations in this SAME Task (no hop), so the @TaskLocal reaches every resident
+                    // layer's `callAsFunction` below; an EMPTY set ⇒ the resident forward returns base unchanged
+                    // (byte-identical). This is the single owned-render bind site verified to propagate.
+                    LoRARuntime.$activeTraits.withValue(activeTraits) {
                     let model = ctx.model, tok = ctx.tokenizer
                     let stops = self.batchStops(tok, adapter: adapter)
                     let promptArr = MLXArray(row).reshaped([1, row.count])
@@ -386,6 +392,7 @@ extension MLXLanguageModel {
                         if cancelled { kvBox.reset() }
                         else { kvBox.cache = cache; kvBox.cachedRow = row + genIds.map { Int32($0) } }
                     }
+                    }   // close LoRARuntime.$activeTraits.withValue
                 }
                 cont.finish()
             }

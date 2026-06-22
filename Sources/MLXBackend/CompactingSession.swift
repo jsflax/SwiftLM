@@ -43,6 +43,8 @@ final class CompactingSession: @unchecked Sendable {
     private let batchGen: BatchGenerator?
     private let toolCallParser: (any ToolCallParser)?
     private let adapter: ModelProfile           // the per-model harness (drives owned render / stops / reasoning)
+    private let activeTraits: Set<TraitID>      // Part C: this agent's role trait-set, bound around the owned-render
+                                                // decode (gated to owned-render upstream ⇒ empty on ChatSession/co-batch)
     private var session: ChatSession
     private var messages: [Chat.Message] = []   // tracked conversation (excludes the system instructions)
     private var structuredTurns: [TurnMessage] = []   // OWNED-RENDER transcript (carries reasoning_content + tool_calls)
@@ -53,9 +55,11 @@ final class CompactingSession: @unchecked Sendable {
     init(model: MLXLanguageModel, instructions: String?, params: GenerateParameters,
          specs: [ToolSpec], tokenizer: (any GrammarTokenizer)?, budget: ContextBudget,
          adapter: ModelProfile = .generic,
-         batchGen: BatchGenerator? = nil, toolCallParser: (any ToolCallParser)? = nil) {
+         batchGen: BatchGenerator? = nil, toolCallParser: (any ToolCallParser)? = nil,
+         activeTraits: Set<TraitID> = []) {
         var p = params
         if let kv = budget.maxKVSize { p.maxKVSize = kv }   // L3: RotatingKVCache memory floor
+        self.activeTraits = activeTraits
         self.model = model
         self.instructions = instructions
         self.params = p
@@ -80,6 +84,11 @@ final class CompactingSession: @unchecked Sendable {
         // restart (which drops the user query → "No user query found") and instead re-render the WHOLE
         // structured transcript each round through the model's real template, decoding live via streamFromTokens.
         if adapter.requiresOwnedRender { return await ownedRound(input, toolsEnabled: toolsEnabled) }
+        // Past here = a NON-owned-render decode path (co-batch `batchGen` / ChatSession `streamDetails`), each of
+        // which decodes inside nested unstructured Task{}s the activeTraits @TaskLocal cannot cross. Traits are
+        // gated to owned-render upstream so this set is normally empty; if one ever leaks here, fail loud rather
+        // than silently serve base (Part C "never silently serve base" tripwire).
+        LoRARuntime.assertCarriable(activeTraits, path: batchGen != nil ? "co-batch BatchGenerator" : "ChatSession.streamDetails")
         if contextTokens > budget.maxContextTokens { await compact() }
         messages.append(contentsOf: input)
         // SLICE 3 batched path: render the WHOLE conversation (+ tools) to tokens, generate through the
@@ -163,7 +172,8 @@ final class CompactingSession: @unchecked Sendable {
                 var text = ""
                 var firstChunk = true
                 do {
-                    for try await g in model.streamFromTokens(tokens, maxTokens: maxTok, adapter: adapter, params: params, kvBox: kvBox) {
+                    for try await g in model.streamFromTokens(tokens, maxTokens: maxTok, adapter: adapter,
+                                                              params: params, kvBox: kvBox, activeTraits: activeTraits) {
                         if case .chunk(let c) = g {
                             let piece = (firstChunk && primeThink) ? openTag + c : c
                             firstChunk = false
