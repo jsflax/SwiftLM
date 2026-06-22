@@ -297,36 +297,51 @@ extension MLXLanguageModel {
     /// spiral root cause), plus min-p/top-p when configured. A `DegenerateRunDetector` is the UNCONDITIONAL
     /// backstop the penalty can't promise: a degenerate run aborts in milliseconds instead of running to the
     /// turn watchdog. `params` carries temp + rep-pen + min/top-p (built once in SwiftLMServe from the adapter).
-    public func streamFromTokens(_ row: [Int32], maxTokens: Int, adapter: ModelProfile, params: GenerateParameters)
+    public func streamFromTokens(_ row: [Int32], maxTokens: Int, adapter: ModelProfile,
+                                 params: GenerateParameters, kvBox: OwnedKVCacheBox? = nil)
         -> AsyncThrowingStream<Generation, Error> {
         AsyncThrowingStream { cont in
             let task = Task {
                 await container.perform { ctx in
                     let model = ctx.model, tok = ctx.tokenizer
                     let stops = self.batchStops(tok, adapter: adapter)
-                    let cache = model.newCache(parameters: nil)
                     let promptArr = MLXArray(row).reshaped([1, row.count])
-                    // mlx's own decode chain — fresh per round (per-stream rep-pen ring + RNG state).
+                    // B2 incremental KV: reuse the cache carried from the prior round IFF its tokens are an exact
+                    // prefix of `row` (the recurrent layers can't rewind, so reuse must be forward-only +
+                    // prefix-exact; any divergence ⇒ full re-prefill into a fresh cache — correct, just slow). The
+                    // box is `@unchecked Sendable` and read/written ONLY here inside the serialized `perform`, so
+                    // the non-Sendable `[KVCache]` never makes an unsafe hop across an isolation boundary.
+                    let reuse = (kvBox?.cache != nil) && isReusablePrefix(cached: kvBox!.cachedRow, fresh: row)
+                    let cache = reuse ? kvBox!.cache! : model.newCache(parameters: nil)
+                    let prefixLen = reuse ? kvBox!.cachedRow.count : 0
+                    if ProcessInfo.processInfo.environment["SWIFTLM_CTX_DEBUG"] != nil, kvBox != nil {
+                        FileHandle.standardError.write(Data(("[incr-kv] reuse=\(reuse) prefix=\(prefixLen)/"
+                            + "\(row.count) (tail=\(row.count - prefixLen) tok)\n").utf8))
+                    }
+                    // mlx's own decode chain — fresh per round (per-stream rep-pen ring + RNG state). Seed the
+                    // rep-pen ring from the FULL row even when reusing the cache, for ChatSession parity.
                     var processor = params.processor()    // PenaltyProcessor? (rep/presence/freq) — nil if none set
                     let sampler = params.sampler()         // ArgMax (temp 0) / TopP (min-p/top-p) / Categorical
-                    processor?.prompt(promptArr)           // seed the rep-pen ring from the prompt (ChatSession parity)
+                    processor?.prompt(promptArr)
                     var tripwire = DegenerateRunDetector()
                     // Battle-test ONLY: force a pathological distribution to reproduce a spiral through the REAL
                     // path. Read once (inert in production — the env var is unset).
                     let injectId = ProcessInfo.processInfo.environment["SWIFTLM_SPIRAL_INJECT"].flatMap { Int32($0) }
-                    // CHUNKED PREFILL — process the prompt in `prefillStepSize` windows with an eval between each.
-                    // A single [1,L] forward's self-attention activation is O(L²): MEASURED on the 122B, peak
-                    // working set is ~65GB (weights) at L≤512 but 76.8GB at L=8192 and climbs with L — stacked on
-                    // a loaded desktop, a large single-shot prefill (e.g. a ~30k-token tool-heavy prompt) crosses
-                    // the system memory-pressure threshold and freezes the machine (the confirmed freeze cause —
-                    // NOT GPU/compositor starvation, which the log RCA refuted). Chunking makes each step's
-                    // attention [step, totalSoFar], so peak stays ≈ weights+small REGARDLESS of L (measured:
-                    // 16384 chunked = 66.1GB vs 8192 single-shot = 76.8GB). The last window's final-position
-                    // logits ARE the first-generation logits. Short prompts (≤ step) are a single forward, as before.
+                    // CHUNKED PREFILL of row[prefixLen...] — process the new tail in `prefillStepSize` windows with
+                    // an eval between each. A single [1,L] forward's self-attention activation is O(L²): MEASURED
+                    // on the 122B, peak working set is ~65GB (weights) at L≤512 but 76.8GB at L=8192 and climbs
+                    // with L — a large single-shot prefill on a loaded desktop crosses the memory-pressure
+                    // threshold and freezes the machine (the confirmed freeze cause — NOT GPU/compositor
+                    // starvation, which the log RCA refuted). Chunking makes each step's attention [step,
+                    // totalSoFar], so peak stays ≈ weights+small REGARDLESS of L (measured: 16384 chunked = 66.1GB
+                    // vs 8192 single-shot = 76.8GB). The last window's final-position logits ARE the first-
+                    // generation logits. With B2 reuse, only the new tail is prefilled (cache.ropeOffset already
+                    // equals prefixLen, so the appended tokens get correct absolute RoPE).
                     let stepSize = max(64, params.prefillStepSize)
-                    var logits = model(promptArr[0..., 0..<min(stepSize, row.count)], cache: cache)[0..., -1, 0...]
+                    var logits = model(promptArr[0..., prefixLen..<min(prefixLen + stepSize, row.count)],
+                                       cache: cache)[0..., -1, 0...]
                     eval(logits)
-                    var pStart = stepSize
+                    var pStart = prefixLen + stepSize
                     while pStart < row.count {
                         if Task.isCancelled { break }
                         let pEnd = min(pStart + stepSize, row.count)
@@ -336,8 +351,9 @@ extension MLXLanguageModel {
                     }
                     var genIds: [Int] = []
                     var emitted = ""
+                    var cancelled = false
                     for _ in 0..<max(1, maxTokens) {
-                        if Task.isCancelled { break }   // A1: a watchdog/supersession cancel stops the decode
+                        if Task.isCancelled { cancelled = true; break }   // A1: a watchdog/supersession cancel stops the decode
                         if let injectId { logits = Self.spikeLogits(like: logits, at: injectId) }
                         let processed = processor?.process(logits: logits) ?? logits
                         let nextTok = sampler.sample(logits: processed)          // [1]
@@ -360,6 +376,15 @@ extension MLXLanguageModel {
                         }
                         logits = model(nextTok.reshaped([1, 1]), cache: cache)[0..., -1, 0...]
                         eval(logits)
+                    }
+                    // B2: carry the cache for the next round. The cache now contains EXACTLY `row` (prefilled) +
+                    // `genIds` (each decoded token was forwarded into it) — a stop token is NOT forwarded. The
+                    // NEXT round reuses this iff its render starts with `row + genIds` (guaranteed prefix-stable by
+                    // storing the assistant turn VERBATIM in CompactingSession, never re-serialized). A cancelled
+                    // decode left the cache in a partial state ⇒ drop it (the box is reset so next round full-prefills).
+                    if let kvBox {
+                        if cancelled { kvBox.reset() }
+                        else { kvBox.cache = cache; kvBox.cachedRow = row + genIds.map { Int32($0) } }
                     }
                 }
                 cont.finish()

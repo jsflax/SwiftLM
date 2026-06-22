@@ -20,7 +20,20 @@ import Serving
 /// batching — cheap because sub-agent turns are short.
 public typealias BatchGenerator = @Sendable ([Int32], Int) async -> String
 
+/// B2 incremental-KV carrier: holds the OWNED-RENDER KV cache (and the exact token row in it) ACROSS rounds, so
+/// a round can REUSE the prior round's cache and prefill only the new tail instead of re-prefilling the whole
+/// transcript. `@unchecked Sendable` because the non-Sendable `[KVCache]` is only ever read/written INSIDE
+/// `streamFromTokens`'s serialized `container.perform` (the sequencer drives a session's rounds strictly
+/// sequentially), mirroring how mlx-swift-lm's ChatSession holds its cache in a `SerialAccessContainer<Cache>`.
+public final class OwnedKVCacheBox: @unchecked Sendable {
+    public var cache: [KVCache]? = nil
+    public var cachedRow: [Int32] = []   // EXACTLY the tokens the cache encodes (prefilled row + decoded gen ids)
+    public init() {}
+    public func reset() { cache = nil; cachedRow = [] }
+}
+
 final class CompactingSession: @unchecked Sendable {
+    private let kvBox = OwnedKVCacheBox()        // B2: persistent owned-render cache across this session's rounds
     private let model: MLXLanguageModel
     private let instructions: String?
     private let params: GenerateParameters
@@ -150,7 +163,7 @@ final class CompactingSession: @unchecked Sendable {
                 var text = ""
                 var firstChunk = true
                 do {
-                    for try await g in model.streamFromTokens(tokens, maxTokens: maxTok, adapter: adapter, params: params) {
+                    for try await g in model.streamFromTokens(tokens, maxTokens: maxTok, adapter: adapter, params: params, kvBox: kvBox) {
                         if case .chunk(let c) = g {
                             let piece = (firstChunk && primeThink) ? openTag + c : c
                             firstChunk = false
@@ -190,6 +203,7 @@ final class CompactingSession: @unchecked Sendable {
 
     /// Summarize the oldest messages and re-seed a fresh session with `[summary + recent verbatim]`.
     private func compact() async {
+        kvBox.reset()                         // B2: a rebuilt transcript invalidates the carried KV cache
         guard let tokenizer else { return }   // can't measure → degrade to no-compaction (no crash)
         let perMsg = messages.map { tokenizer.tokenize(text: render($0)).count }
         let split = compactionSplitIndex(messageTokens: perMsg, keepTokens: budget.keepRecentTokens)

@@ -49,6 +49,13 @@ struct Agent {
             return
         }
 
+        // INCR_KV_CHECK=1: B2 correctness gate — incremental KV (reuse carried cache + prefill the tail) must
+        // produce token-identical output to a full re-prefill of the same row.
+        if ProcessInfo.processInfo.environment["INCR_KV_CHECK"] != nil {
+            print(try await model.incrementalKVEquivalenceCheck())
+            return
+        }
+
         // Default: run the FROZEN BASE (per the "useful agent first" pivot). The champion adapter is
         // OPT-IN (CHAMPION=1) — it belongs to the offline-R&D loop, not the interactive default path.
         if ProcessInfo.processInfo.environment["CHAMPION"] != nil {
