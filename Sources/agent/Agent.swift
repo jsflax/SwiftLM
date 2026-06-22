@@ -42,6 +42,13 @@ struct Agent {
             return
         }
 
+        // OWNED_RENDER_BENCH=1: Part B investigation — cache trimmability + the re-prefill cost curve + the
+        // incremental-advance potential, on THIS model. Decides whether incremental KV is feasible/worth it.
+        if ProcessInfo.processInfo.environment["OWNED_RENDER_BENCH"] != nil {
+            print(await model.ownedRenderBench())
+            return
+        }
+
         // Default: run the FROZEN BASE (per the "useful agent first" pivot). The champion adapter is
         // OPT-IN (CHAMPION=1) — it belongs to the offline-R&D loop, not the interactive default path.
         if ProcessInfo.processInfo.environment["CHAMPION"] != nil {

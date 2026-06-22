@@ -131,6 +131,10 @@ final class CompactingSession: @unchecked Sendable {
     /// preserved by `continuationMessages`) through the model's real template, decode live, and parse the tool
     /// call from the accumulated text (the xmlFunction/json parser the 122B needs; recover handles the rest).
     private func ownedRound(_ input: [Chat.Message], toolsEnabled: Bool) async -> AsyncThrowingStream<Generation, Error> {
+        // B1: owned-render re-prefills the WHOLE transcript every round and the cost is SUPERLINEAR (122B bench:
+        // 8k→29s, 16k→225s), so bound the transcript before it reaches the catastrophic regime. `contextTokens`
+        // is the prior round's rendered size; compact when it crosses the perf cap (NOT the window budget).
+        if contextTokens > ownedRenderMaxTokens { await compactOwned() }
         structuredTurns.append(contentsOf: input.map(Self.turnMessage))
         let turns = adapter.continuationMessages(structuredTurns)
         let tokens = (try? await model.renderTurnMessages(turns, tools: toolsEnabled ? specs : nil,
@@ -215,6 +219,44 @@ final class CompactingSession: @unchecked Sendable {
     }
 
     private func render(_ m: Chat.Message) -> String { "\(m.role.rawValue): \(m.content)" }
+
+    /// B1 — owned-render perf cap. Re-prefill is per-round and SUPERLINEAR in transcript length, and owned-render
+    /// has no incremental KV yet, so the transcript must be bounded to keep per-round prefill in the fast band.
+    /// The window-sized context budget is useless here (70% of the 122B's 262k window is ~183k tokens =
+    /// hours/round); THIS is a separate, perf-driven cap. Env-tunable; B2's incremental KV will relax it.
+    private var ownedRenderMaxTokens: Int {
+        Int(ProcessInfo.processInfo.environment["SWIFTLM_OWNED_RENDER_MAX_TOKENS"] ?? "") ?? 8192
+    }
+
+    /// Compact the OWNED-RENDER transcript (`structuredTurns`): summarize the oldest turns into a single user
+    /// boundary, keep the recent ones verbatim. The boundary is a real `.user` turn, so it ALSO satisfies the
+    /// strict template's surviving-user-query precondition (`continuationMessages`). Mirrors `compact()` but over
+    /// the structured transcript instead of the ChatSession `messages`.
+    private func compactOwned() async {
+        guard let tokenizer, structuredTurns.count > 2 else { return }   // need something worth summarizing
+        let perTurn = structuredTurns.map { tokenizer.tokenize(text: Self.renderTurn($0)).count }
+        let keep = max(1024, ownedRenderMaxTokens / 2)                   // recent turns kept verbatim
+        let split = compactionSplitIndex(messageTokens: perTurn, keepTokens: keep)
+        guard split > 0 else { return }
+        if ProcessInfo.processInfo.environment["SWIFTLM_CTX_DEBUG"] != nil {
+            FileHandle.standardError.write(Data(("[compact-owned #\(compactions + 1)] context=\(contextTokens) > "
+                + "\(ownedRenderMaxTokens); summarizing \(split) of \(structuredTurns.count) turns\n").utf8))
+        }
+        let transcript = structuredTurns[0..<split].map(Self.renderTurn).joined(separator: "\n")
+        let recent = Array(structuredTurns[split...])
+        let summary = (try? await model.generate(
+            "Summarize the conversation so far for an agent that must CONTINUE the task. Preserve the goal, key "
+            + "decisions, facts, file paths, and tool results needed to proceed. Be concise.\n\n\(transcript)",
+            maxTokens: 600)) ?? "(summary unavailable)"
+        let boundary = TurnMessage(role: .user,
+                                   content: "[Earlier conversation compacted to save context:\n\(stripReasoning(summary))]")
+        structuredTurns = [boundary] + recent
+        contextTokens = 0
+        compactions += 1
+    }
+
+    /// Flatten a structured turn for the compaction summarizer / token measure (role: content).
+    static func renderTurn(_ t: TurnMessage) -> String { "\(t.role.rawValue): \(t.content)" }
 
     /// Strip ONLY `<think>…</think>` spans (KEEP `<tool_call>`) — for the batched tool-call parse of a
     /// reasoning model, whose leading reasoning otherwise confuses the standalone parser into reading the
