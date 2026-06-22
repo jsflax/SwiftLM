@@ -38,6 +38,15 @@ public final class MLXLanguageModel: Sendable {
             ?? "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
         let container = try await #huggingFaceLoadModelContainer(
             configuration: ModelConfiguration(id: id))
+        // Bound MLX's GPU buffer-cache pool. By default mlx-swift's cacheLimit == the memoryLimit
+        // (~1.5× the device working-set size ≈ effectively unbounded on a high-RAM box), and on free() a
+        // buffer is RECYCLED INTO the pool instead of returned to the OS — so over a long/heavy serving run
+        // the in-process working set balloons well past the model weights (mlx's own docs warn of "several GB
+        // of cached memory from accumulated buffers"). The TRAINING path already calls clearCache(); the
+        // SERVING path never bounded it. Cap the pool (env-tunable; 0 disables the cache) so the working set
+        // stays bounded — small caches typically match unconstrained throughput.
+        let cacheGB = ProcessInfo.processInfo.environment["SWIFTLM_MLX_CACHE_LIMIT_GB"].flatMap(Int.init) ?? 4
+        MLX.Memory.cacheLimit = cacheGB << 30
         return MLXLanguageModel(modelId: id, container: container)
     }
 

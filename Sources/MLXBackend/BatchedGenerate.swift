@@ -314,12 +314,15 @@ extension MLXLanguageModel {
                     // Battle-test ONLY: force a pathological distribution to reproduce a spiral through the REAL
                     // path. Read once (inert in production — the env var is unset).
                     let injectId = ProcessInfo.processInfo.environment["SWIFTLM_SPIRAL_INJECT"].flatMap { Int32($0) }
-                    // CHUNKED PREFILL — process the prompt in `prefillStepSize` windows with an eval between each,
-                    // so the GPU scheduler gets a PREEMPTION POINT for the window compositor between chunks. A
-                    // single whole-transcript forward is one un-preemptable Metal command buffer; on a large model
-                    // (the 122B) it monopolizes the GPU long enough to starve WindowServer and FREEZE the UI. The
-                    // last window's final-position logits ARE the first-generation logits (cache now holds the
-                    // whole prompt). Short prompts (≤ step) are a single forward, exactly as before.
+                    // CHUNKED PREFILL — process the prompt in `prefillStepSize` windows with an eval between each.
+                    // A single [1,L] forward's self-attention activation is O(L²): MEASURED on the 122B, peak
+                    // working set is ~65GB (weights) at L≤512 but 76.8GB at L=8192 and climbs with L — stacked on
+                    // a loaded desktop, a large single-shot prefill (e.g. a ~30k-token tool-heavy prompt) crosses
+                    // the system memory-pressure threshold and freezes the machine (the confirmed freeze cause —
+                    // NOT GPU/compositor starvation, which the log RCA refuted). Chunking makes each step's
+                    // attention [step, totalSoFar], so peak stays ≈ weights+small REGARDLESS of L (measured:
+                    // 16384 chunked = 66.1GB vs 8192 single-shot = 76.8GB). The last window's final-position
+                    // logits ARE the first-generation logits. Short prompts (≤ step) are a single forward, as before.
                     let stepSize = max(64, params.prefillStepSize)
                     var logits = model(promptArr[0..., 0..<min(stepSize, row.count)], cache: cache)[0..., -1, 0...]
                     eval(logits)
