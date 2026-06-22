@@ -68,13 +68,16 @@ extension MLXLanguageModel {
         // Only the batched path needs a standalone parser (ChatSession parses inline on the serial path). The
         // format is the ADAPTER's template-derived choice — corrects mlx's `qwen3_next → .xmlFunction`
         // misinference; `.deferToMLX` falls back to mlx's own inference, so a model is never made worse.
-        let needsParser = batchGenerator != nil || adapter.requiresOwnedRender   // owned render parses the call from text too
+        // C1.5: when the bank is live (`bankEnabled`), EVERY local agent decodes via owned-render (CompactingSession
+        // routes it there) so the activeTraits @TaskLocal propagates — so the standalone parser (which owned-render
+        // needs to read the tool call from text) is required THEN too, not only for natively-owned-render models.
+        let needsParser = batchGenerator != nil || adapter.requiresOwnedRender || LoRARuntime.bankEnabled
         let parser = needsParser ? await makeToolCallParser(adapter) : nil
-        // Part C: the trait @TaskLocal only propagates on the owned-render decode path (streamFromTokens). Gate the
-        // role trait-set to owned-render models HERE (the one place `requiresOwnedRender` is known) so a non-owned
-        // model (e.g. the 80B ChatSession path) carries an EMPTY set and never silently serves base. (122B-first;
-        // the loud `assertCarriable` in CompactingSession is the belt-and-suspenders for any future leak.)
-        let effectiveTraits = adapter.requiresOwnedRender ? activeTraits : []
+        // Part C: the trait @TaskLocal only propagates on the owned-render decode path (streamFromTokens). Keep the
+        // role trait-set when this agent WILL decode via owned-render — natively (`requiresOwnedRender`) OR because
+        // the bank is live and C1.5 routes everyone through owned-render. Otherwise (bank OFF + non-owned, i.e. the
+        // 80B in production today) carry an EMPTY set so it never silently serves base on the ChatSession path.
+        let effectiveTraits = (adapter.requiresOwnedRender || LoRARuntime.bankEnabled) ? activeTraits : []
         return ChatSessionTurnBackend(model: self, host: host, specs: specs, toolNames: toolNames,
                                       params: params, profile: adapter, grammarTokenizer: grammarTok,
                                       batchGenerator: batchGenerator, toolCallParser: parser, activeTraits: effectiveTraits)

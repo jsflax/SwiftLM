@@ -52,7 +52,7 @@ public final class MLXLanguageModel: Sendable {
         // no trained traits yet, so live rooms stay byte-identical to base). When on, base Linear/QuantizedLinear
         // leaves are swapped to resident layers with EMPTY stores ⇒ still byte-identical until a trait is
         // registered AND made active via `LoRARuntime.activeTraits`. The capture+bind plumbing runs either way.
-        if ProcessInfo.processInfo.environment["SWIFTLM_TRAIT_BANK"] != nil {
+        if LoRARuntime.bankEnabled {
             await m.installResidentTraitBank()
         }
         return m

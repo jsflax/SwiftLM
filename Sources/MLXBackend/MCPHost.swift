@@ -274,7 +274,11 @@ extension MLXLanguageModel {
         // SLICE 3: when a batched generator is supplied (sub-agent fan-out), generation routes through the
         // coalescing pool; build the model's own tool-call parser so the round loop still gets `.toolCall`s
         // (the live/Orbital path passes nil → ChatSession streams + parses inline, unchanged).
-        let toolCallParser = (batchGenerator != nil || profile.requiresOwnedRender)
+        // C1.5: when the bank is live, every local agent is routed through owned-render (CompactingSession), which
+        // reads the tool call from text — so the standalone parser is needed THEN too, not only for natively-owned
+        // models. (This is the live-REPL / subagent / self-loop loop; it carries no role trait-set, so its
+        // CompactingSession's activeTraits stays [] — it gets owned-render routing + a parser, base behavior.)
+        let toolCallParser = (batchGenerator != nil || profile.requiresOwnedRender || LoRARuntime.bankEnabled)
             ? (await container.configuration.toolCallFormat)?.createParser() : nil
         let compacting = CompactingSession(model: self, instructions: instr, params: params, specs: specs,
                                            tokenizer: grammarTokenizer, budget: profile.contextBudget,

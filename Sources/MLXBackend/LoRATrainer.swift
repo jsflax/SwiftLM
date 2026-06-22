@@ -67,6 +67,12 @@ extension MLXLanguageModel {
             let beforeRet = eval(retention)
 
             // Apply LoRA (initially a no-op: B=0) and train on the curriculum.
+            // Part C contract: the resident trait-bank and the LoRA trainer must NOT co-reside on one container —
+            // LoRAContainer.from→replaceLayers casts `child as? Linear`, and a resident layer IS-A Linear, so it
+            // would wrap a trainable LoRA AROUND the resident leaf (corrupting both). Fail fast on misconfig.
+            precondition(!LoRABank.isInstalled(in: ctx.model),
+                "LoRA training on a container with the resident trait-bank installed — mutually exclusive (resident "
+                + "layers would be double-wrapped). Train without SWIFTLM_TRAIT_BANK set.")
             let loraConfig = LoRAConfiguration(numLayers: config.numLayers)
             _ = try LoRAContainer.from(model: ctx.model, configuration: loraConfig)
             let optimizer = AdamW(learningRate: config.learningRate)
@@ -107,6 +113,9 @@ extension MLXLanguageModel {
                                    batchSize: config.batchSize, batchCount: 0)
             }
             let beforeHeld = eval(heldout); let beforeRet = eval(retention)
+            precondition(!LoRABank.isInstalled(in: ctx.model),   // Part C contract: trait-bank ⊥ LoRA trainer (see trainLoRA)
+                "LoRA/DPO training on a container with the resident trait-bank installed — mutually exclusive. "
+                + "Train without SWIFTLM_TRAIT_BANK set.")
             let loraConfig = LoRAConfiguration(numLayers: config.numLayers)
             _ = try LoRAContainer.from(model: ctx.model, configuration: loraConfig)
             let optimizer = AdamW(learningRate: config.learningRate)

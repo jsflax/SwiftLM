@@ -83,7 +83,10 @@ final class CompactingSession: @unchecked Sendable {
         // OWNED RENDER (strict reasoning+tool templates, e.g. the 122B): bypass ChatSession's lossy incremental
         // restart (which drops the user query → "No user query found") and instead re-render the WHOLE
         // structured transcript each round through the model's real template, decoding live via streamFromTokens.
-        if adapter.requiresOwnedRender { return await ownedRound(input, toolsEnabled: toolsEnabled) }
+        // C1.5: route via owned-render natively (`requiresOwnedRender`) OR whenever the bank is live — owned-render
+        // is the ONLY decode path the activeTraits @TaskLocal propagates through, so when traits are in play every
+        // local agent (incl. a normally-ChatSession model like the 80B) must use it. Bank OFF ⇒ unchanged.
+        if adapter.requiresOwnedRender || LoRARuntime.bankEnabled { return await ownedRound(input, toolsEnabled: toolsEnabled) }
         // Past here = a NON-owned-render decode path (co-batch `batchGen` / ChatSession `streamDetails`), each of
         // which decodes inside nested unstructured Task{}s the activeTraits @TaskLocal cannot cross. Traits are
         // gated to owned-render upstream so this set is normally empty; if one ever leaks here, fail loud rather

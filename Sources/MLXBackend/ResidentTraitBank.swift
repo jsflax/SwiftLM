@@ -39,6 +39,14 @@ public enum TraitID: String, Sendable, Hashable, Comparable, CaseIterable {
 public enum LoRARuntime {
     @TaskLocal public static var activeTraits: Set<TraitID> = []
 
+    /// Whether the Resident Trait-Bank is enabled for this process (env `SWIFTLM_TRAIT_BANK`). Read ONCE — the
+    /// single source of truth for both the once-per-container install AND (C1.5) routing every local agent
+    /// through the owned-render decode. Owned-render (`streamFromTokens`) is the ONLY path the `activeTraits`
+    /// @TaskLocal propagates (mlx-swift-lm's ChatSession spawns Task hops it can't cross), so when the bank is
+    /// LIVE even a normally-ChatSession model (e.g. the 80B `qwen3_next`) must decode via owned-render for its
+    /// traits to apply. Default OFF ⇒ production is unchanged (native decode path, no resident layers).
+    public static let bankEnabled = ProcessInfo.processInfo.environment["SWIFTLM_TRAIT_BANK"] != nil
+
     /// Loud tripwire for a non-empty trait-set on a decode path that CANNOT carry the `@TaskLocal`: mlx-swift-lm's
     /// ChatSession (`session.streamDetails`) and the co-batch pool both spawn nested unstructured `Task{}` between
     /// the bind and the forward — the bound value does not cross them, so such a set would SILENTLY serve base
