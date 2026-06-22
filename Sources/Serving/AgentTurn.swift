@@ -230,7 +230,12 @@ public func streamAgentTurn(
                         let callName = call.name, callArgs = call.argsJSON
                         var outcome: (result: String, isError: Bool)
                         // `Task` runs a whole nested sub-agent turn (self-bounded) — exempt from the wall-clock bound.
-                        let dispatchTimeout = callName == "Task" ? 0 : config.toolTimeoutSeconds
+                        // `consult` is a deliberate fan-out BARRIER that blocks until the whole panel replies; a LOCAL
+                        // panel (N×122B serialized on one shared container) legitimately takes MINUTES, far past the
+                        // 90s tool timeout — so it must be exempt too, else the consulting agent gives up and the
+                        // panel's replies come back orphaned/unused (found in the chess stress test). The panel is
+                        // bounded by the panelists' own per-turn limits + the room autopilot, so no-timeout can't hang.
+                        let dispatchTimeout = (callName == "Task" || callName == "consult") ? 0 : config.toolTimeoutSeconds
                         if let r = await withToolTimeout(seconds: dispatchTimeout,
                                                          { await backend.dispatch(name: callName, argsJSON: callArgs) }) {
                             outcome = r

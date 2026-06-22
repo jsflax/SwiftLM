@@ -72,6 +72,14 @@ struct Agent {
             return
         }
 
+        // WRITE_DIAG=1: diagnose the chess-stress-test builder failure — a single builder turn (real native tool
+        // schema, owned-render) asked to write a file, dumping the RAW decode so we can see whether it emits a
+        // well-formed write_file call, a truncated/malformed one (large-body failure), or pure narration.
+        if ProcessInfo.processInfo.environment["WRITE_DIAG"] != nil {
+            print(try await model.writeReliabilityDiag())
+            return
+        }
+
         // Default: run the FROZEN BASE (per the "useful agent first" pivot). The champion adapter is
         // OPT-IN (CHAMPION=1) — it belongs to the offline-R&D loop, not the interactive default path.
         if ProcessInfo.processInfo.environment["CHAMPION"] != nil {
