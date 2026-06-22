@@ -314,8 +314,23 @@ extension MLXLanguageModel {
                     // Battle-test ONLY: force a pathological distribution to reproduce a spiral through the REAL
                     // path. Read once (inert in production — the env var is unset).
                     let injectId = ProcessInfo.processInfo.environment["SWIFTLM_SPIRAL_INJECT"].flatMap { Int32($0) }
-                    var logits = model(promptArr, cache: cache)[0..., -1, 0...]   // [1, vocab]
+                    // CHUNKED PREFILL — process the prompt in `prefillStepSize` windows with an eval between each,
+                    // so the GPU scheduler gets a PREEMPTION POINT for the window compositor between chunks. A
+                    // single whole-transcript forward is one un-preemptable Metal command buffer; on a large model
+                    // (the 122B) it monopolizes the GPU long enough to starve WindowServer and FREEZE the UI. The
+                    // last window's final-position logits ARE the first-generation logits (cache now holds the
+                    // whole prompt). Short prompts (≤ step) are a single forward, exactly as before.
+                    let stepSize = max(64, params.prefillStepSize)
+                    var logits = model(promptArr[0..., 0..<min(stepSize, row.count)], cache: cache)[0..., -1, 0...]
                     eval(logits)
+                    var pStart = stepSize
+                    while pStart < row.count {
+                        if Task.isCancelled { break }
+                        let pEnd = min(pStart + stepSize, row.count)
+                        logits = model(promptArr[0..., pStart..<pEnd], cache: cache)[0..., -1, 0...]
+                        eval(logits)
+                        pStart = pEnd
+                    }
                     var genIds: [Int] = []
                     var emitted = ""
                     for _ in 0..<max(1, maxTokens) {
