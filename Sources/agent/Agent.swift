@@ -65,6 +65,13 @@ struct Agent {
             return
         }
 
+        // SYSPROMPT_CHECK=1: BUG-2 gate + before/after demo — the owned-render decode must now honor the agent's
+        // system prompt (it used to drop it). Decodes the SAME question with vs without a directive system turn.
+        if ProcessInfo.processInfo.environment["SYSPROMPT_CHECK"] != nil {
+            print(try await model.systemPromptCheck())
+            return
+        }
+
         // Default: run the FROZEN BASE (per the "useful agent first" pivot). The champion adapter is
         // OPT-IN (CHAMPION=1) — it belongs to the offline-R&D loop, not the interactive default path.
         if ProcessInfo.processInfo.environment["CHAMPION"] != nil {

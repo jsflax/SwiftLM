@@ -157,7 +157,16 @@ final class CompactingSession: @unchecked Sendable {
     /// call from the accumulated text (the xmlFunction/json parser the 122B needs; recover handles the rest).
     private func ownedRound(_ input: [Chat.Message], toolsEnabled: Bool) async -> AsyncThrowingStream<Generation, Error> {
         structuredTurns.append(contentsOf: input.map(Self.turnMessage))
-        let turns = adapter.continuationMessages(structuredTurns)
+        // BUG-2 fix: owned-render must carry the system prompt too. The ChatSession path applies it via
+        // `ChatSession(instructions:)`, but the owned-render transcript is built ONLY from `structuredTurns` — so
+        // the persona / role instructions / plan-mode note / memory-hook grounding were silently DROPPED (the 122B
+        // ran its agents WITHOUT their system prompt). Prepend it as a leading system turn AFTER continuationMessages'
+        // user-query scan (which keys on the first `.user` turn), so the system stays first and the scan is
+        // unperturbed. The prompt is constant across rounds ⇒ a stable head ⇒ B2 KV prefix-reuse still holds.
+        let body = adapter.continuationMessages(structuredTurns)
+        let turns = (instructions?.isEmpty == false)
+            ? [TurnMessage(role: .system, content: instructions!)] + body
+            : body
         let tokens = (try? await model.renderTurnMessages(turns, tools: toolsEnabled ? specs : nil,
                                                           enableThinking: toolsEnabled)) ?? []
         contextTokens = tokens.count
