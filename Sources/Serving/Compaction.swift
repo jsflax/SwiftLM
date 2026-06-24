@@ -12,8 +12,12 @@ import MiniBPE
 public func truncateToTokens(_ text: String, maxTokens: Int, tokenizer: any GrammarTokenizer) -> String {
     let toks = tokenizer.tokenize(text: text)
     guard toks.count > maxTokens else { return text }
-    let kept = toks.prefix(maxTokens).joined()
-    return kept + "\n[truncated: \(toks.count - maxTokens) tokens omitted]"
+    // DECODE the kept tokens back to text. `tokenize` returns BYTE-LEVEL BPE strings (space→"Ġ", newline→"Ċ");
+    // `.joined()` ALONE leaves that garble in the model's context — it reads "ĠkingĠsafety" as corruption.
+    // (Found live: a critic agent declared a perfectly clean file "CORRUPTED — severe encoding corruption" because
+    // a truncated read_file was fed to it byte-level-encoded instead of decoded.) `decodedToken` reverses the map.
+    let kept = tokenizer.decodedToken(toks.prefix(maxTokens).joined())
+    return kept + "\n[truncated: \(toks.count - maxTokens) tokens omitted — re-read a narrower range if you need more]"
 }
 
 /// Decide the compaction split: keep the most-recent messages whose combined token count fits within

@@ -6,7 +6,18 @@ import Foundation
 public struct TrainPair: Sendable, Hashable {
     public let user: String
     public let assistant: String
-    public init(user: String, assistant: String) { self.user = user; self.assistant = assistant }
+    /// Pre-rendered (prefix + completion + im_end) token row for the TRAIN==SERVE path. When set, the DPO
+    /// trainer scores THESE tokens directly and skips the bare `applyChatTemplate([user])` render — so training
+    /// matches the owned-render serve format (system prompt + tool schemas + reasoning, the 122B's xmlFunction
+    /// completion). `completionStart` is the prefix token count (the assistant-only masking boundary). Both nil ⇒
+    /// the legacy bare-render path (the domain flywheel) is byte-for-byte unchanged.
+    public let renderedTokens: [Int32]?
+    public let completionStart: Int?
+    public init(user: String, assistant: String,
+                renderedTokens: [Int32]? = nil, completionStart: Int? = nil) {
+        self.user = user; self.assistant = assistant
+        self.renderedTokens = renderedTokens; self.completionStart = completionStart
+    }
 }
 
 /// A training curriculum harvested from Claude Code transcripts: clean (user, assistant)

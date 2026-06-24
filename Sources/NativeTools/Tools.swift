@@ -44,13 +44,14 @@ public struct WriteFileTool: NativeTool {
     public let cwd: String
     public init(cwd: String = FileManager.default.currentDirectoryPath) { self.cwd = cwd }
     public let name = "write_file"
-    public let description = "Write (create or overwrite) a UTF-8 text file at an absolute path."
+    public let description = "Write (create or overwrite) a UTF-8 text file. Prefer a path RELATIVE to the working directory (e.g. \"engine.py\"); an absolute path must be INSIDE the working directory."
     public var parameters: JSONSchemaObject {
-        .init([("path", .init("string", "Absolute path to write")),
+        .init([("path", .init("string", "File path — RELATIVE to the working directory (preferred), or an absolute path inside it. Do not invent paths like /workspace.")),
                ("content", .init("string", "Full file contents"))], required: ["path", "content"])
     }
     public func run(_ args: ToolArguments) async throws -> String {
-        let path = resolveToolPath(try args.requireString("path"), cwd: cwd)
+        let rawPath = try args.requireString("path")
+        let path = resolveToolPath(rawPath, cwd: cwd)
         let content = try args.requireString("content")
         let url = URL(fileURLWithPath: path)
         do {
@@ -58,7 +59,20 @@ public struct WriteFileTool: NativeTool {
                                                     withIntermediateDirectories: true)
             try content.write(to: url, atomically: true, encoding: .utf8)
             return "wrote \(content.utf8.count) bytes to \(path)"
-        } catch { throw NativeToolError.io("cannot write \(path): \(error.localizedDescription)") }
+        } catch {
+            // ACTIONABLE failure. A small model often invents an absolute path (e.g. /workspace/engine.py) that
+            // lives OUTSIDE — and can't be created under — the working directory; the write then fails and NOTHING
+            // lands, and the model hands a silent empty dir to the next agent. Say exactly what went wrong AND
+            // where to write instead, so it can recover THIS turn instead of proceeding as if it succeeded.
+            let leaf = url.lastPathComponent
+            let outside = rawPath.hasPrefix("/") && !path.hasPrefix(cwd)
+            let hint = outside
+                ? " The path you gave (\(path)) is OUTSIDE your working directory and could not be created there. "
+                    + "Your working directory is \(cwd). Re-issue write_file with a RELATIVE path \"\(leaf)\" "
+                    + "(it resolves to \(cwd)/\(leaf)), or the absolute path \(cwd)/\(leaf)."
+                : " Your working directory is \(cwd); use a path relative to it, or a writable absolute path inside it."
+            throw NativeToolError.io("write_file FAILED — could not write \(path): \(error.localizedDescription).\(hint)")
+        }
     }
 }
 

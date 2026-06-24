@@ -16,6 +16,9 @@ public enum AgentStreamEvent: Sendable, Equatable {
     case systemInit(model: String, sessionID: String, tools: [String], cwd: String)
     /// One streamed text chunk (live-rendered as it arrives).
     case textDelta(String)
+    /// A chunk of the model's REASONING (the `<think>` content) — surfaced separately so the UI can render it
+    /// as a specially-formatted "thinking" block instead of dropping it. Mirrors claude's `thinking_delta` wire.
+    case reasoningDelta(String)
     /// The model invoked a tool (`inputJSON` embedded as a JSON object when it parses, else a string).
     case toolUse(id: String, name: String, inputJSON: String)
     /// A dispatched tool's result, keyed back to its `toolUse` by `id`.
@@ -34,6 +37,10 @@ public enum AgentStreamEvent: Sendable, Equatable {
             obj = ["type": "stream_event",
                    "event": ["type": "content_block_delta", "index": 0,
                              "delta": ["type": "text_delta", "text": text]]]
+        case .reasoningDelta(let text):
+            obj = ["type": "stream_event",
+                   "event": ["type": "content_block_delta", "index": 0,
+                             "delta": ["type": "thinking_delta", "thinking": text]]]
         case .toolUse(let id, let name, let inputJSON):
             obj = ["type": "assistant",
                    "message": ["role": "assistant",

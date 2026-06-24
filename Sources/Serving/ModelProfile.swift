@@ -20,19 +20,20 @@ public enum ModelFamily: String, Sendable { case glm4, qwen, deepseekR1, generic
 /// full-file write, a long reasoning chain) stops well under this. The cap exists ONLY because WE run the
 /// local decode loop and a local model can spin forever without ever emitting EOS — there is no provider to
 /// stop it (unlike the claude/codex/gemini CLIs, which own their own loop and get NO cap from us). Local
-/// generation therefore runs to EOS like a hosted model; this only bounds a non-terminating runaway. Derived
-/// from the model's REAL context window, clamped by ONE global runaway ceiling so a no-EOS loop in a
-/// huge-window model can't burn the whole window. No latency target, no tok/s guess, no floor/ceiling pair,
+/// generation therefore runs to EOS like a hosted model. Bounded ONLY by the model's REAL context window (the
+/// physical limit) — NO arbitrary ceiling. A real no-EOS spiral is caught by the DegenerateRunDetector tripwire
+/// (entropy/repetition), not by a hand-set token cap. No latency target, no tok/s guess, no floor/ceiling pair,
 /// no per-family tuning.
 public struct GenerationBudget: Sendable {
-    /// No legitimate single turn needs more output than this (~800 lines of code / a very long CoT); past it
-    /// is a repetition loop. The ONE hand-set constant — a safety ceiling, not a tuned budget.
-    public static let runawayCeiling = 16384
     public let maxTokens: Int
     public init(maxTokens: Int) { self.maxTokens = maxTokens }
-    /// Backstop from the model's real context window, clamped by the global runaway ceiling.
+    /// The ONLY bound on a turn's output is the model's PHYSICAL context window — NO arbitrary token ceiling.
+    /// A hand-set cap (the former 16384 "runawayCeiling") masks model problems instead of fixing them and
+    /// truncates legitimate long output (it cut a correct 122B build mid-file, which read as a model failure).
+    /// Real degeneracy is bounded by the DegenerateRunDetector tripwire (entropy/repetition), natural completion
+    /// by EOS, and the hard upper bound is the window itself — not a magic number.
     public static func forWindow(_ contextWindow: Int) -> GenerationBudget {
-        GenerationBudget(maxTokens: min(runawayCeiling, max(2048, contextWindow)))
+        GenerationBudget(maxTokens: max(2048, contextWindow))
     }
 }
 
@@ -51,12 +52,14 @@ public struct ContextBudget: Sendable {
         self.maxToolOutputTokens = maxToolOutputTokens
         self.maxKVSize = maxKVSize
     }
-    /// Derive from a model's context window: compact at 70%, keep the most recent 25% verbatim, cap one tool
-    /// output at 2K tokens, KV floor 70%.
+    /// Derive from a model's context window: compact at 70%, keep the most recent 25% verbatim, KV floor 70%.
+    /// A SINGLE tool output may use up to HALF the window (min 4K tokens) — a code file / long grep must FIT, not
+    /// get chopped to a fixed 2K that ignores the model's actual capacity. Truncation now only guards a genuinely
+    /// huge (>½ window) read, and `truncateToTokens` DECODES what it keeps (no byte-level garble).
     public static func forWindow(_ contextWindow: Int) -> ContextBudget {
         ContextBudget(maxContextTokens: Int(Double(contextWindow) * 0.70),
                       keepRecentTokens: Int(Double(contextWindow) * 0.25),
-                      maxToolOutputTokens: 2048,
+                      maxToolOutputTokens: max(4096, Int(Double(contextWindow) * 0.5)),
                       maxKVSize: Int(Double(contextWindow) * 0.70))
     }
 }

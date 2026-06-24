@@ -25,7 +25,41 @@ public func stripReasoning(_ text: String) -> String {
     }
     removeSpans(open: "<think>", close: "</think>")
     removeSpans(open: "<tool_call>", close: "</tool_call>")
+    s = stripResidualWireTags(s)
     return s.trimmingCharacters(in: .whitespacesAndNewlines)
+}
+
+/// Remove any ORPHANED tool-call wire tags left in display text. The 122B owned-render parses a tool call out
+/// of band (consuming the `<tool_call><function=…>` opening as the call) but can leave the closing `</tool_call>`
+/// — or a stray `<function=…>`/`<parameter=…>` — behind, which then renders as junk ("</tool_call>" fragments
+/// leaking between tool cards in the transcript). Span removal above only catches MATCHED pairs; this sweeps the
+/// standalone remainder. Safe for non-122B models (the tags simply don't occur).
+public func stripResidualWireTags(_ text: String) -> String {
+    var s = text
+    for tag in ["<tool_call>", "</tool_call>", "</function>", "</parameter>"] {
+        s = s.replacingOccurrences(of: tag, with: "")
+    }
+    s = s.replacingOccurrences(of: "<function=[^>]*>", with: "", options: .regularExpression)
+    s = s.replacingOccurrences(of: "<parameter=[^>]*>", with: "", options: .regularExpression)
+    return s
+}
+
+/// Extract the REASONING channel — the concatenated content INSIDE `<think>…</think>` spans (the inverse of
+/// `stripReasoning`). Empty for non-reasoning output. Surfaced to Orbital as a separate `reasoningDelta` so a
+/// reasoning model's analysis can render as a specially-formatted "thinking" block instead of being dropped.
+/// Handles multiple spans and a dangling unclosed `<think>` (truncation → take to end).
+public func extractReasoning(_ text: String) -> String {
+    var out: [String] = []
+    var s = Substring(text)
+    while let o = s.range(of: "<think>") {
+        let after = s[o.upperBound...]
+        if let c = after.range(of: "</think>") {
+            out.append(String(after[..<c.lowerBound])); s = after[c.upperBound...]
+        } else {
+            out.append(String(after)); break   // unclosed (truncated) → to end
+        }
+    }
+    return out.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
 }
 
 /// The user-facing answer for (possibly reasoning) output: the text OUTSIDE `<think>` when present, else the

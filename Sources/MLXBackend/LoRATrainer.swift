@@ -116,7 +116,28 @@ extension MLXLanguageModel {
             precondition(!LoRABank.isInstalled(in: ctx.model),   // Part C contract: trait-bank ⊥ LoRA trainer (see trainLoRA)
                 "LoRA/DPO training on a container with the resident trait-bank installed — mutually exclusive. "
                 + "Train without SWIFTLM_TRAIT_BANK set.")
-            let loraConfig = LoRAConfiguration(numLayers: config.numLayers)
+            // MoE TRAINABILITY FIX: stop_gradient the expert-routing indices (the mlx-swift-lm port dropped the
+            // `mx.stop_gradient(argpartition(...))` Python mlx-lm has). Without it, the integer routing indices stay
+            // a differentiable descendant of the trainable LoRA below the MoE layer and `GatherQMM::vjp` aborts the
+            // first backward. Hot-swap each `switch_mlp` for a stop-grad subclass (no mlx-swift-lm patch; 0 on a
+            // dense model). MUST run before `LoRAContainer.from`.
+            let moeWrapped = MoEStopGrad.install(into: ctx.model)              // detach MoE router → no GatherQMM vjp
+            let linWrapped = LinearAttnStopGrad.install(into: ctx.model)       // detach linear-attn input → no CustomKernel vjp
+            if moeWrapped > 0 || linWrapped > 0 {
+                FileHandle.standardError.write(Data(
+                    "MoE stop-grad: \(moeWrapped) router gates + \(linWrapped) linear-attn input_layernorms wrapped\n".utf8))
+            }
+
+            // LoRA TARGETS: self_attn projections ONLY. Two reasons. (1) The default keys (`loraDefaultKeys` = every
+            // Linear) would wrap the MoE router `mlp.gate`, making routing trainable ⇒ the `argPartition` indices
+            // become a differentiable descendant of a trained param ⇒ `GatherQMM::vjp` aborts (already also guarded
+            // by `MoEStopGrad`). (2) The hybrid `linear_attn` (GatedDeltaNet) layers are now detached at their input
+            // (`LinearAttnStopGrad`) so their projections would receive no gradient — and targeting them would put
+            // trainable params inside a branch whose CustomKernel has no vjp. So train the full-attention layers'
+            // self_attn only; gradient reaches them through the residual highway. (mlx-lm's standard attention LoRA.)
+            let attnOnlyKeys = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj"]
+            let loraConfig = LoRAConfiguration(numLayers: config.numLayers,
+                                               loraParameters: .init(keys: attnOnlyKeys))
             _ = try LoRAContainer.from(model: ctx.model, configuration: loraConfig)
             let optimizer = AdamW(learningRate: config.learningRate)
             DPOTraining.train(model: ctx.model, pairs: pairs, optimizer: optimizer,

@@ -34,8 +34,11 @@ public enum DPOTraining {
         // Reference seq-logprobs (frozen base = LoRA B=0 no-op), computed ONCE before training.
         // MUST use the SAME maxLen truncation as the policy batches below, else lp and ref cover
         // different token spans and the DPO logit (lp−ref) is garbage.
+        func dlog(_ s: String) { FileHandle.standardError.write(Data((s + "\n").utf8)) }
+        dlog("DPO: computing reference logprobs for \(pairs.count) pairs (\(pairs.count * 2) forwards)…")
         let refC = pairs.map { refLogProb(model, $0.chosen, tokenizer, maxLen) }
         let refR = pairs.map { refLogProb(model, $0.rejected, tokenizer, maxLen) }
+        dlog("DPO: reference logprobs done — starting \(iterations) iters (batch=\(batchSize), \(pairs.count) pairs)")
 
         let lossVG = valueAndGrad(model: model) { (m: Module, a: [MLXArray]) -> [MLXArray] in
             let lpC = seqLogProb(m, inputs: a[0], targets: a[1], mask: a[2])   // [B]
@@ -59,7 +62,11 @@ public enum DPOTraining {
                                              MLXArray(rc), MLXArray(rr)])
             optimizer.update(model: model, gradients: grad)
             eval(model, optimizer, res[0])
-            if (iter + 1) % 20 == 0 { report(iter + 1, res[0].item(Float.self)) }
+            if (iter + 1) % 5 == 0 || iter == 0 {
+                let l = res[0].item(Float.self)
+                dlog("DPO: iter \(iter + 1)/\(iterations)  loss=\(String(format: "%.4f", l))")
+                report(iter + 1, l)
+            }
         }
     }
 
@@ -81,6 +88,12 @@ public enum DPOTraining {
     private struct Batch { let inputs: MLXArray; let targets: MLXArray; let mask: MLXArray }
 
     private static func renderOne(_ p: TrainPair, _ tokenizer: any MLXLMCommon.Tokenizer) -> (full: [Int], start: Int)? {
+        // TRAIN==SERVE fast path: a pre-rendered (prefix + completion + im_end) row already matches the
+        // owned-render serve format (system + tool schemas + reasoning + xmlFunction). Score it directly;
+        // `makeBatch`'s start>=2 / start<count guards still apply. (Populated by RoleDisciplineTrainer.)
+        if let toks = p.renderedTokens, let s = p.completionStart, toks.count >= 2 {
+            return (toks.map(Int.init), s)
+        }
         let user: [String: any Sendable] = ["role": "user", "content": p.user]
         guard let prefix = try? tokenizer.applyChatTemplate(messages: [user]), prefix.count >= 2 else { return nil }
         let content = tokenizer.encode(text: p.assistant, addSpecialTokens: false)

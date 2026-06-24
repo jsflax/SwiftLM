@@ -54,15 +54,22 @@ public struct AgentTurnConfig: Sendable {
     public var approvePlan: PlanApprover?
     /// Per-dispatch wall-clock bound so one wedged tool can't stall the turn (`<= 0` disables it).
     public var toolTimeoutSeconds: Double
+    /// TERMINAL/ROUTING tools (Orbital: `handoff`/`consult`/`done`) that completion-pressure must NEVER drop.
+    /// A room agent's "final answer" IS a routing call — so when the round loop disables WORK tools to force a
+    /// conclusion, these stay live, and the backend keeps offering them. Empty for non-room callers (CLI/serve),
+    /// which preserves the old "drop all tools on the last round" behavior exactly. See the round loop below.
+    public var terminalTools: Set<String>
     public init(modelLabel: String = "swiftlm-mlx", sessionID: String = UUID().uuidString,
                 cwd: String = FileManager.default.currentDirectoryPath,
                 toolNames: [String] = [], maxRounds: Int = 8,
                 permission: ToolPermissionPolicy = .init(),
                 approvePlan: PlanApprover? = nil,
-                toolTimeoutSeconds: Double = defaultToolDispatchTimeoutSeconds) {
+                toolTimeoutSeconds: Double = defaultToolDispatchTimeoutSeconds,
+                terminalTools: Set<String> = []) {
         self.modelLabel = modelLabel; self.sessionID = sessionID; self.cwd = cwd
         self.toolNames = toolNames; self.maxRounds = maxRounds; self.permission = permission
         self.approvePlan = approvePlan; self.toolTimeoutSeconds = toolTimeoutSeconds
+        self.terminalTools = terminalTools
     }
 }
 
@@ -72,10 +79,32 @@ public struct AgentTurnConfig: Sendable {
 /// refine-on-error loop keeps its full budget. Generous enough for normal multi-step work, well below maxRounds.
 public let defaultMaxQuietToolRounds = 4
 
+/// MUTATION tools — the work product of a builder. These are PROGRESS, never "rambling": completion pressure
+/// must never drop them (dropping a builder's `write_file`/`edit_file` discards the actual fix and loops the
+/// room — the chess battletest), and a round that mutates RESETS the quiet-round counter (real new direction).
+/// A read-only verifier never calls these, so verifiers are unaffected — they still conclude under pressure.
+public let mutationToolNames: Set<String> = ["write_file", "edit_file", "Write", "Edit", "create_file", "apply_patch"]
+
 /// Identity of a tool call for duplicate detection: name + whitespace-normalized arguments. A repeated key
 /// means the model re-issued an identical call (zero new information) — a non-progress signal.
 public func toolCallKey(name: String, argsJSON: String) -> String {
     name + "|" + argsJSON.components(separatedBy: .whitespacesAndNewlines).joined()
+}
+
+/// Per-round turn tracing for live diagnosis (env `ORBITAL_TURN_TRACE=<path>`). Off by default (nil env ⇒
+/// no-op, no file). Captures exactly what the round loop decided each round — the signal that distinguishes a
+/// model that won't conclude from a harness that won't LET it (e.g. `hasToolTag=true parsed=0` ⇒ the model
+/// emitted a tool call the parser/render dropped; the `</tool_call>` residual). Append-per-line (low volume).
+private let turnTracePath = ProcessInfo.processInfo.environment["ORBITAL_TURN_TRACE"]
+func turnTrace(_ line: @autoclosure () -> String) {
+    guard let path = turnTracePath else { return }
+    let stamp = ISO8601DateFormatter().string(from: Date())
+    let data = Data(("[\(stamp)] " + line() + "\n").utf8)
+    if let fh = FileHandle(forWritingAtPath: path) {
+        fh.seekToEndOfFile(); fh.write(data); try? fh.close()
+    } else {
+        try? data.write(to: URL(fileURLWithPath: path))
+    }
 }
 
 /// Pull the `plan` field out of an `ExitPlanMode` argument JSON (falls back to the raw string).
@@ -126,13 +155,32 @@ public func streamAgentTurn(
                 var toolsCalled: [String] = []
                 var seenCalls = Set<String>()    // (name+args) already dispatched → a repeat is non-progress
                 var quietToolRounds = 0          // consecutive error-free tool rounds → completion pressure
-                // Tools persist ACROSS rounds so a room agent can iterate (write→compile→fix); the last round
-                // reserves no tools to force an answer; maxRounds bounds any runaway. Matches the live loop.
+                // A ROOM agent (terminalTools non-empty) can ALWAYS conclude its turn by routing — its routing
+                // tools stay live even under completion pressure (the backend never drops them). So "no work-tool
+                // budget" no longer means "must end with whatever text it has (even empty)"; it means "now route
+                // or state a verdict." `concludedThisTurn` = the agent already emitted a turn-ending/routing call
+                // (handoff/done/consult/ExitPlanMode) ⇒ an empty follow-up round is a clean wind-down, NOT a turn
+                // to nudge (the user's ExitPlanMode concern). Both empty for CLI/serve ⇒ old behavior preserved.
+                let canRoute = !config.terminalTools.isEmpty
+                var concludedThisTurn = false
+                // Tools persist ACROSS rounds so a room agent can iterate (write→compile→fix); under completion
+                // pressure WORK tools drop to force a conclusion, but routing tools stay (canRoute); maxRounds
+                // bounds any runaway. Matches the live loop.
                 let maxToolRounds = max(1, config.maxRounds - 1)
                 while round < config.maxRounds {
-                    // Tools stay on until the round budget OR the model has called tools error-free for a
-                    // while without finishing (over-eager rambling) — then drop tools to force a final answer.
-                    let toolsOn = round < maxToolRounds && quietToolRounds < defaultMaxQuietToolRounds
+                    // A BUILDER (its permission ALLOWS file mutation) must work freely across many rounds — read,
+                    // edit, test, re-edit — so completion pressure must NOT apply to it: dropping its edits, or
+                    // route-nudging it mid-write ("conclude, don't call other tools"), truncates a file rewrite to
+                    // a broken stub and loops the room (the chess battletest). Read-only agents (critic/referee in
+                    // plan/verify mode — write is denied) keep pressure so they conclude. Recomputed per round
+                    // because an approved ExitPlanMode flips a planner from .plan (read-only) to .auto (builder).
+                    let isBuilder = mutationToolNames.contains { tool in
+                        if case .deny = permission.decide(tool: tool) { return false } else { return true }
+                    }
+                    // Work tools stay on until the round budget OR (non-builders only) the model called tools
+                    // error-free for a while without finishing (over-eager rambling) — then drop WORK tools to
+                    // force a conclusion. Routing tools ride through (the backend keeps offering them when canRoute).
+                    let toolsOn = round < maxToolRounds && (isBuilder || quietToolRounds < defaultMaxQuietToolRounds)
                     let stream = backend.round(instructions: instr, prompt: prompt,
                                                resume: resume, toolsEnabled: toolsOn)
                     resume = []
@@ -152,15 +200,72 @@ public func streamAgentTurn(
                     let tail = thinkFilter.flush()
                     if !tail.isEmpty { continuation.yield(.textDelta(tail)) }
                     round += 1
+                    turnTrace("turn=\(config.sessionID) round=\(round) toolsOn=\(toolsOn) canRoute=\(canRoute) "
+                        + "parsedCalls=\(toolCalls.count)[\(toolCalls.map(\.name).joined(separator: ","))] "
+                        + "hasToolTag=\(text.contains("tool_call")) textLen=\(text.count) "
+                        + "concluded=\(concludedThisTurn) nudges=\(consecutiveNudges)")
+
+                    // Surface THIS round's reasoning (the <think> content) on its own channel so the UI can show
+                    // it as a specially-formatted "thinking" block — it's otherwise stripped from the visible
+                    // deltas AND the final answer, so the model's analysis (the critic's real reasoning) is lost.
+                    let roundReasoning = extractReasoning(text)
+                    if !roundReasoning.isEmpty { continuation.yield(.reasoningDelta(roundReasoning)) }
+
+                    // Completion-pressure ENFORCEMENT: rendering terminal-only specs (the backend) tells the model
+                    // work tools are paused, but the xmlFunction parser still surfaces any <function=…> by NAME —
+                    // so a 122B verifier keeps running perft past the budget and never concludes (it runs to the
+                    // round cap → "(hit round cap without final text)"). DROP the non-terminal calls here so the
+                    // turn falls into the conclusion branch below; routing calls (terminalTools) still pass, so the
+                    // agent can always route. `!toolsOn` ⇒ this agent already spent ≥4 tool rounds (a verifier/
+                    // builder), never a consult panelist (which answers in ≤1 round and never reaches pressure).
+                    if !toolsOn, canRoute, !toolCalls.isEmpty {
+                        // Keep routing tools (so the agent can conclude) AND mutation tools (a builder's edits are
+                        // PROGRESS, not rambling — dropping them discards the fix and loops the room). Only the
+                        // read-only "rambling" calls (read/bash/grep) are dropped, which is what steers a verifier
+                        // to conclude; a builder mid-edit sails through.
+                        let kept = toolCalls.filter { config.terminalTools.contains($0.name) || mutationToolNames.contains($0.name) }
+                        if kept.count != toolCalls.count {
+                            turnTrace("turn=\(config.sessionID) round=\(round) pressure-drop \(toolCalls.count - kept.count) read-only call(s)")
+                        }
+                        toolCalls = kept
+                    }
 
                     if toolCalls.isEmpty {
                         let clean = stripReasoning(text)
-                        // A real answer, or no tool budget / nudge cap → finish; else nudge the model (it
-                        // narrated intent inside <think> without acting). Bounded by ≤2 nudges + maxRounds.
-                        if !clean.isEmpty || !toolsOn || consecutiveNudges >= 2 { finalText = text; break }
+                        if !clean.isEmpty { finalText = text }   // SALVAGE: keep the latest verdict text as the answer
+                        // Under completion pressure (`!toolsOn`) a room agent should conclude IN ROLE — state its
+                        // verdict AND route (handoff/done) — not just trail off with text. Give it up to the nudge
+                        // cap to emit the routing call before we end the turn on text alone. Gated on `!toolsOn`, so
+                        // it only fires for an agent that spent a full work budget (verifier/builder), not a panelist.
+                        if !toolsOn, canRoute, !concludedThisTurn, consecutiveNudges < 2 {
+                            consecutiveNudges += 1
+                            turnTrace("turn=\(config.sessionID) round=\(round) route-nudge \(consecutiveNudges)")
+                            resume = [.user("Work tools are paused — you've investigated enough. State your verdict "
+                                + "in plain text, then call handoff (or done, if you are the referee and the "
+                                + "objective is fully met) to pass control. Do not call any other tool.")]
+                            continue
+                        }
+                        // Finish when: a real text answer exists; OR the agent already concluded via a routing call
+                        // this turn (empty prose after handoff/done is a clean wind-down — the ExitPlanMode concern);
+                        // OR we've nudged twice; OR (non-room callers only) there's no tool budget AND no routing
+                        // path to conclude through (the old last-round force-answer). Bounded by ≤2 nudges + maxRounds.
+                        if !clean.isEmpty || concludedThisTurn || consecutiveNudges >= 2 || (!toolsOn && !canRoute) {
+                            turnTrace("turn=\(config.sessionID) BREAK round=\(round) finalLen=\(clean.count) reason="
+                                + (!clean.isEmpty ? "answer" : concludedThisTurn ? "routed"
+                                   : consecutiveNudges >= 2 ? "nudgeCap" : "noBudget"))
+                            // Don't clobber a salvaged verdict with an empty round: only adopt THIS round's text
+                            // when it has visible prose; otherwise keep the best text salvaged from a prior round.
+                            if !clean.isEmpty || finalText.isEmpty { finalText = text }
+                            break
+                        }
                         consecutiveNudges += 1
-                        resume = [.user("Continue. If you intended to run or check something, call that tool "
-                                        + "now. If the task is complete, reply with a brief plain-text summary.")]
+                        resume = [.user(canRoute
+                            ? "You ended your turn without concluding. If your work or verification is finished, "
+                              + "state your result/verdict in plain text AND pass control now by calling handoff "
+                              + "(or done, if you are the referee and the objective is fully met). If a step "
+                              + "remains, call that tool now."
+                            : "Continue. If you intended to run or check something, call that tool now. If the "
+                              + "task is complete, reply with a brief plain-text summary.")]
                         continue
                     }
                     consecutiveNudges = 0
@@ -254,8 +359,17 @@ public func streamAgentTurn(
                     }
                     // Completion pressure: a clean (error-free) tool round with no new direction ticks toward
                     // forcing an answer; an error or a fresh plan-approval resets the budget (real progress).
-                    if roundHadError || roundApproved { quietToolRounds = 0 }
+                    // A mutation (write_file/edit_file) is real new direction — reset the quiet budget like an
+                    // error/plan-approval does, so an actively-building agent never hits completion pressure.
+                    let didMutate = toolCalls.contains { mutationToolNames.contains($0.name) }
+                    if roundHadError || roundApproved || didMutate { quietToolRounds = 0 }
                     else if roundProgressed { quietToolRounds += 1 }
+                    // A routing/terminal call (handoff/done/consult) — or an ExitPlanMode — means the agent has
+                    // concluded this turn; an empty follow-up round is then a clean wind-down, not a turn to
+                    // nudge (#2's guard against forcing an extra round after a tool that legitimately ends one).
+                    if toolCalls.contains(where: { config.terminalTools.contains($0.name) || $0.name == exitPlanModeToolName }) {
+                        concludedThisTurn = true
+                    }
                     resume = results
                 }
 

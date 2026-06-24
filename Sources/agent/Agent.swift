@@ -27,6 +27,13 @@ func log(_ s: String) { FileHandle.standardError.write(Data((s + "\n").utf8)) }
 @main
 struct Agent {
     static func main() async throws {
+        // ROOM_HARVEST=1: Track 2 — mine Orbital room .lattice files for role-discipline DPO data (WON strong-model
+        // role turns / LOST local failures). Model-FREE, so run it BEFORE loading any model.
+        if ProcessInfo.processInfo.environment["ROOM_HARVEST"] != nil {
+            print(RoomTranscriptHarvester.runReport())
+            return
+        }
+
         // The default model is a CONFIG choice only — the family (reasoning?, tool-call style, generation
         // budget) is AUTO-DETECTED from the loaded model via ModelProfile, so any MODEL=… works unchanged.
         let modelId = ProcessInfo.processInfo.environment["MODEL"]
@@ -77,6 +84,41 @@ struct Agent {
         // well-formed write_file call, a truncated/malformed one (large-body failure), or pure narration.
         if ProcessInfo.processInfo.environment["WRITE_DIAG"] != nil {
             print(try await model.writeReliabilityDiag())
+            return
+        }
+
+        // TRAIT_CALIB=1: Part D Stage 1 — measure the ROLE-DISCIPLINE in-band rate. Reproduces a HEAVY
+        // multi-agent builder turn (owned-render, real native tool schema) across task domains × a context
+        // heaviness ladder, scores each best-of-N rollout via the REAL tool-call parser (acted-in-role vs
+        // narrated), and reports the per-cell/overall in-band rate + trainability verdict. TRAIT_DATAGEN=1
+        // additionally persists the won×lost rollouts as DPO pairs for the later DPO-train stage.
+        if ProcessInfo.processInfo.environment["TRAIT_CALIB"] != nil
+            || ProcessInfo.processInfo.environment["TRAIT_DATAGEN"] != nil
+            || ProcessInfo.processInfo.environment["TRAIT_REAL_CONTEXT"] != nil {
+            print(try await model.traitCalibration())
+            return
+        }
+
+        // TRAIT_TRAIN_SELFTEST=1: Stage-2 train==serve eyeball gate — render the FIRST builder pair via the
+        // owned-render path (system + tool schema + xmlFunction completion) and dump prefix tail + wire
+        // completions + prefix-is-prefix/boundary asserts. NO training, NO decode.
+        if ProcessInfo.processInfo.environment["TRAIT_TRAIN_SELFTEST"] != nil {
+            print(try await model.roleDisciplineSelftest())
+            return
+        }
+
+        // TRAIT_TRAIN=1: Stage-2 — DPO-train the BUILDER role-discipline trait on the synthesized data, rendered
+        // SERVE-IDENTICALLY (renderTurnMessages prefix + the 122B xmlFunction completion, cached on TrainPair so
+        // renderOne scores them directly). Trains on a BARE container, writes the adapter + reports the gates.
+        if ProcessInfo.processInfo.environment["TRAIT_TRAIN"] != nil {
+            print(try await model.roleDisciplineTrain())
+            return
+        }
+
+        // TRAIT_DEMO=1: the "show me it working" gate — decode a heavy builder context adapter-OFF then adapter-ON
+        // (Hotswap.loadAdapter), reporting the acted-in-role RATE delta + greedy completions side by side.
+        if ProcessInfo.processInfo.environment["TRAIT_DEMO"] != nil {
+            print(try await model.roleDisciplineDemo())
             return
         }
 

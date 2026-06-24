@@ -57,7 +57,8 @@ extension MLXLanguageModel {
     /// `batchGenerator` (B2 co-batching) is forwarded into the round's CompactingSession with the model's
     /// own tool-call parser; nil ⇒ the serial incremental-KV ChatSession path (B1), byte-for-byte the loop.
     public func makeAgentBackend(host: MCPHost, batchGenerator: BatchGenerator? = nil,
-                                 activeTraits: Set<TraitID> = []) async -> any AgentTurnBackend {
+                                 activeTraits: Set<TraitID> = [],
+                                 terminalTools: Set<String> = []) async -> any AgentTurnBackend {
         let specs = await host.specs
         let toolNames = await host.toolNames
         let adapter = await self.localAdapter   // config-driven (replaces forModelType `profile`): format/reasoning/stops/sampling from the model's own files
@@ -80,7 +81,8 @@ extension MLXLanguageModel {
         let effectiveTraits = (adapter.requiresOwnedRender || LoRARuntime.bankEnabled) ? activeTraits : []
         return ChatSessionTurnBackend(model: self, host: host, specs: specs, toolNames: toolNames,
                                       params: params, profile: adapter, grammarTokenizer: grammarTok,
-                                      batchGenerator: batchGenerator, toolCallParser: parser, activeTraits: effectiveTraits)
+                                      batchGenerator: batchGenerator, toolCallParser: parser,
+                                      activeTraits: effectiveTraits, terminalTools: terminalTools)
     }
 
     /// Map the adapter's template-derived format choice → an mlx `ToolCallFormat` parser. `.deferToMLX` (and any
@@ -112,17 +114,18 @@ final class ChatSessionTurnBackend: AgentTurnBackend, @unchecked Sendable {
     let batchGenerator: BatchGenerator?          // B2 co-batch DI seam (nil ⇒ serial incremental-KV path)
     let toolCallParser: (any ToolCallParser)?    // standalone parser for the batched path (nil on serial)
     let activeTraits: Set<TraitID>               // Part C: role trait-set (gated to owned-render; bound around the decode)
+    let terminalTools: Set<String>              // routing/terminal tools kept live under completion pressure (room agents)
     private var compacting: CompactingSession?   // persistent conversation + Claude-Code-style compaction
     private var basePrompt = ""   // the original user prompt — used to constrain regenerated tool args
 
     init(model: MLXLanguageModel, host: MCPHost, specs: [ToolSpec], toolNames: [String],
          params: GenerateParameters, profile: ModelProfile, grammarTokenizer: (any GrammarTokenizer)?,
          batchGenerator: BatchGenerator? = nil, toolCallParser: (any ToolCallParser)? = nil,
-         activeTraits: Set<TraitID> = []) {
+         activeTraits: Set<TraitID> = [], terminalTools: Set<String> = []) {
         self.model = model; self.host = host; self.specs = specs; self.toolNames = toolNames
         self.params = params; self.profile = profile; self.grammarTokenizer = grammarTokenizer
         self.batchGenerator = batchGenerator; self.toolCallParser = toolCallParser
-        self.activeTraits = activeTraits
+        self.activeTraits = activeTraits; self.terminalTools = terminalTools
     }
 
     /// The real running context size (last round's prompt+gen tokens, from `Generation.info`) — honest
@@ -137,7 +140,7 @@ final class ChatSessionTurnBackend: AgentTurnBackend, @unchecked Sendable {
             compacting = CompactingSession(model: model, instructions: instructions, params: params,
                                            specs: specs, tokenizer: grammarTokenizer, budget: profile.contextBudget,
                                            adapter: profile, batchGen: batchGenerator, toolCallParser: toolCallParser,
-                                           activeTraits: activeTraits)
+                                           activeTraits: activeTraits, terminalTools: terminalTools)
         }
         let comp = compacting!
         return AsyncThrowingStream { continuation in
@@ -168,8 +171,11 @@ final class ChatSessionTurnBackend: AgentTurnBackend, @unchecked Sendable {
                         if case .info(let info) = g { ctxTokens = info.promptTokenCount + info.generationTokenCount }
                     }
                     comp.finishRound(assistantText: text, contextTokens: ctxTokens)
-                    // GLM bare-name `<tool_call>` the parser didn't surface (profile-driven; only with tools on).
-                    if raw.isEmpty, toolsEnabled, let tag = profile.recoverMissedToolCall(text) {
+                    // A `<tool_call>` the parser didn't surface (profile-driven). Fire when tools were offered —
+                    // INCLUDING a routing-only round under completion pressure (terminalTools live): that recovers
+                    // a missed `done()`/`handoff()` the 122B emitted but the owned-render parse dropped (the
+                    // bare `</tool_call>` residual → empty referee turn). Off only when no tools at all were offered.
+                    if raw.isEmpty, toolsEnabled || !terminalTools.isEmpty, let tag = profile.recoverMissedToolCall(text) {
                         raw.append((tag.name, tag.argsJSON))
                     }
                     for (n0, a0) in raw {

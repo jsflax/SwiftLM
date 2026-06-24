@@ -22,6 +22,7 @@ public enum PermissionMode: String, Sendable, Codable, Equatable, CaseIterable {
     case auto       // dispatch all tool calls
     case approval   // require approval per call (clamped to allow under autopilot — no human in the loop)
     case plan       // planning only: read-only tools allowed, mutating/unknown denied
+    case verify     // read-only REVIEW: read-only tools + `bash` (run tests/perft) allowed; write_file/edit_file denied
 }
 
 /// The Claude-faithful tool a planning agent calls to present its finished plan for approval. Named/shaped
@@ -88,6 +89,16 @@ public struct ToolPermissionPolicy: Sendable, Equatable {
                 ? .allow
                 : .deny(reason: "plan mode: '\(tool)' is not a read-only tool. Describe this step in your "
                         + "plan and hand off for execution instead of calling it now.")
+        case .verify:
+            // Read-only VERIFICATION: the read-only tools + `bash` (run perft/tests/lint yourself), but NEVER
+            // write_file/edit_file (a reviewer inspects + runs, it does not build). `bash` is dual-use (it CAN
+            // mutate), so the prompt + denying the file-mutators is the contract — the model is trusted not to
+            // `echo >` a file, exactly as the referee is.
+            return (readOnlyTools.contains(tool) || tool == "bash")
+                ? .allow
+                : .deny(reason: "verify mode: '\(tool)' is not allowed — you are a READ-ONLY reviewer. Inspect "
+                        + "with read_file/grep and RUN read-only checks via bash (e.g. perft); do NOT write/edit. "
+                        + "Hand off for any fix.")
         }
     }
 
@@ -103,16 +114,24 @@ public struct ToolPermissionPolicy: Sendable, Equatable {
     /// A system-context note injected in plan mode so the model PLANS rather than flailing against denied
     /// write/exec tools. `nil` outside plan mode (no behavior change for .auto/.approval).
     public var instructionPrefix: String? {
-        guard mode == .plan else { return nil }
-        let readers = readOnlyTools.sorted().joined(separator: ", ")
-        // The closing action depends on whether this environment HAS an exit-plan step. The CLI does
-        // (ExitPlanMode → approve → implement); Orbital rooms do not — a planner hands off to the builder.
-        let close = allowsPlanExit
-            ? "call the \(exitPlanModeToolName) tool with your plan to request approval before making any changes."
-            : "call `handoff` to pass your plan to the next agent for execution — handing off IS the approval "
-              + "(there is no separate exit-plan step)."
-        return "[Plan mode] You are PLANNING ONLY. You may inspect with read-only tools (\(readers)) but "
-            + "must NOT modify files or run commands — those tools are blocked. Produce a concise, numbered "
-            + "plan of the steps you WOULD take, then " + close
+        switch mode {
+        case .plan:
+            let readers = readOnlyTools.sorted().joined(separator: ", ")
+            // The closing action depends on whether this environment HAS an exit-plan step. The CLI does
+            // (ExitPlanMode → approve → implement); Orbital rooms do not — a planner hands off to the builder.
+            let close = allowsPlanExit
+                ? "call the \(exitPlanModeToolName) tool with your plan to request approval before making any changes."
+                : "call `handoff` to pass your plan to the next agent for execution — handing off IS the approval "
+                  + "(there is no separate exit-plan step)."
+            return "[Plan mode] You are PLANNING ONLY. You may inspect with read-only tools (\(readers)) but "
+                + "must NOT modify files or run commands — those tools are blocked. Produce a concise, numbered "
+                + "plan of the steps you WOULD take, then " + close
+        case .verify:
+            return "[Verify mode] You are a READ-ONLY REVIEWER. Inspect with read-only tools AND run read-only "
+                + "checks YOURSELF via `bash` (e.g. run the engine's own perft/tests — do not trust a builder's "
+                + "'PASSED'). You must NOT write or edit files. Write a crisp verdict, then `handoff` for any fix."
+        case .auto, .approval:
+            return nil
+        }
     }
 }

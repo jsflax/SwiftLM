@@ -42,6 +42,9 @@ final class CompactingSession: @unchecked Sendable {
     private let budget: ContextBudget
     private let batchGen: BatchGenerator?
     private let toolCallParser: (any ToolCallParser)?
+    private let terminalTools: Set<String>      // routing/terminal tools that survive completion-pressure (never
+                                                // dropped) so a room agent can always conclude by routing. Empty ⇒
+                                                // unchanged: the last round reserves NO tools (the old behavior).
     private let adapter: ModelProfile           // the per-model harness (drives owned render / stops / reasoning)
     private let activeTraits: Set<TraitID>      // Part C: this agent's role trait-set, bound around the owned-render
                                                 // decode (gated to owned-render upstream ⇒ empty on ChatSession/co-batch)
@@ -56,10 +59,11 @@ final class CompactingSession: @unchecked Sendable {
          specs: [ToolSpec], tokenizer: (any GrammarTokenizer)?, budget: ContextBudget,
          adapter: ModelProfile = .generic,
          batchGen: BatchGenerator? = nil, toolCallParser: (any ToolCallParser)? = nil,
-         activeTraits: Set<TraitID> = []) {
+         activeTraits: Set<TraitID> = [], terminalTools: Set<String> = []) {
         var p = params
         if let kv = budget.maxKVSize { p.maxKVSize = kv }   // L3: RotatingKVCache memory floor
         self.activeTraits = activeTraits
+        self.terminalTools = terminalTools
         self.model = model
         self.instructions = instructions
         self.params = p
@@ -71,6 +75,21 @@ final class CompactingSession: @unchecked Sendable {
         self.toolCallParser = toolCallParser
         self.session = ChatSession(model.container, instructions: instructions,
                                    generateParameters: p, tools: specs)
+    }
+
+    /// Specs to advertise this round. Work tools ON ⇒ ALL specs. Under completion pressure (`toolsEnabled` =
+    /// false) ⇒ only the TERMINAL/routing specs, so a room agent can still conclude by routing (the referee can
+    /// always `done()`); `nil` when there are none (no terminal tools ⇒ the old "last round reserves no tools").
+    /// Parsing is then done against the SAME set, so a dropped work tool can't sneak back in mid-pressure.
+    private func renderSpecs(toolsEnabled: Bool) -> [ToolSpec]? {
+        if toolsEnabled { return specs }
+        // ToolSpec is [String: any Sendable] = {"type":"function","function":{"name":…}} — extract the name the
+        // same way the rest of MLXBackend does (MCPHost/GrammarConstraint) to keep only the terminal/routing tools.
+        let terminal = specs.filter {
+            guard let n = ($0["function"] as? [String: any Sendable])?["name"] as? String else { return false }
+            return terminalTools.contains(n)
+        }
+        return terminal.isEmpty ? nil : terminal
     }
 
     /// Prepare a round and return the model's generation stream for the caller to CONSUME directly (so it
@@ -101,7 +120,8 @@ final class CompactingSession: @unchecked Sendable {
         if let batchGen {
             let convo = (instructions.map { [Chat.Message.system($0)] } ?? []) + messages
             let pairs = convo.map { (role: $0.role.rawValue, content: $0.content) }
-            let tokens = (try? await model.renderConversationTokens(pairs, tools: toolsEnabled ? specs : nil)) ?? []
+            let render = renderSpecs(toolsEnabled: toolsEnabled)   // terminal-only under completion pressure
+            let tokens = (try? await model.renderConversationTokens(pairs, tools: render)) ?? []
             contextTokens = tokens.count
             let maxTok = params.maxTokens ?? 512
             let text = await batchGen(tokens, maxTok)
@@ -115,7 +135,7 @@ final class CompactingSession: @unchecked Sendable {
             // name = the whole think blob → bogus dispatch → "wrong tool name" retry loop, loop never advances).
             // Strip ONLY `<think>` (keep `<tool_call>`) before parsing, and reject an obviously-garbage name so
             // the round loop's recoverMissedToolCall(text) recovers the real `<tool_call>` call instead.
-            var call = toolsEnabled ? toolCallParser?.parse(content: Self.stripThinkSpans(text), tools: specs) : nil
+            var call = render != nil ? toolCallParser?.parse(content: Self.stripThinkSpans(text), tools: render!) : nil
             if let c = call, c.function.name.contains("<") || c.function.name.contains("\n") || c.function.name.count > 64 {
                 call = nil
             }
@@ -130,7 +150,7 @@ final class CompactingSession: @unchecked Sendable {
                 cont.finish()
             }
         }
-        session.tools = toolsEnabled ? specs : nil
+        session.tools = renderSpecs(toolsEnabled: toolsEnabled)   // terminal/routing tools survive completion pressure
         return session.streamDetails(to: input)
     }
 
@@ -167,17 +187,23 @@ final class CompactingSession: @unchecked Sendable {
         let turns = (instructions?.isEmpty == false)
             ? [TurnMessage(role: .system, content: instructions!)] + body
             : body
-        let tokens = (try? await model.renderTurnMessages(turns, tools: toolsEnabled ? specs : nil,
-                                                          enableThinking: toolsEnabled)) ?? []
+        // Under completion pressure (`toolsEnabled` false) advertise only the terminal/routing specs, not nil —
+        // so the model can STILL conclude by routing (the referee's `done()`/the builder's `handoff()`); `nil`
+        // only when there are no terminal tools (the old last-round force-answer). `anyTools` drives thinking +
+        // parsing: a routing-only round still reasons (to DECIDE the route) and still parses (to catch the call).
+        let render = renderSpecs(toolsEnabled: toolsEnabled)
+        let anyTools = render != nil
+        let tokens = (try? await model.renderTurnMessages(turns, tools: render,
+                                                          enableThinking: anyTools)) ?? []
         contextTokens = tokens.count
         let maxTok = params.maxTokens ?? 512
-        // The owned-render generation prompt PRIMES `<think>` (enableThinking == toolsEnabled) — the open tag is
+        // The owned-render generation prompt PRIMES `<think>` (enableThinking == anyTools) — the open tag is
         // in the PROMPT, not the output — so a reasoning model's generated text begins INSIDE the think span.
         // Re-insert the open tag on the first chunk so every downstream stripper (the live display filter, the
         // tool-call parse, and finishRound's reasoning split) sees a COMPLETE <think>…</think> span. Without it
         // the whole reasoning block + a dangling </think> leak to the chat, and a tool the model calls WHILE
         // reasoning renders mid-thought.
-        let primeThink = toolsEnabled && adapter.emitsReasoning
+        let primeThink = anyTools && adapter.emitsReasoning
         let openTag = adapter.reasoningTags.open
         return AsyncThrowingStream { cont in
             let task = Task {
@@ -195,7 +221,7 @@ final class CompactingSession: @unchecked Sendable {
                 } catch { cont.finish(throwing: error); return }
                 // Parse the tool call from the full text (think stripped so the parser doesn't read reasoning as
                 // the name); reject an obviously-garbage name. A parser miss falls to the round loop's recover.
-                if toolsEnabled, let call = toolCallParser?.parse(content: Self.stripThinkSpans(text), tools: specs),
+                if anyTools, let call = toolCallParser?.parse(content: Self.stripThinkSpans(text), tools: render ?? specs),
                    !(call.function.name.contains("<") || call.function.name.contains("\n") || call.function.name.count > 64) {
                     self.lastOwnedToolCalls = [Serving.ToolCall(name: call.function.name,
                                                                 argsJSON: MLXLanguageModel.argsJSON(call.function.arguments))]
