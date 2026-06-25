@@ -41,9 +41,16 @@ public struct TurnMessage: Sendable, Equatable {
     /// Structured calls for an assistant turn — filled ONLY after the routed call is validated (`constrain`),
     /// so a parser miss is stored as plain `content`, never a malformed structured turn that poisons later rounds.
     public var toolCalls: [ToolCall]?
-    public init(role: Role, content: String, reasoningContent: String? = nil, toolCalls: [ToolCall]? = nil) {
+    /// VLM input: file URLs of images attached to this turn (a user turn carrying pictures). Carried on the turn
+    /// (not a side channel) so the OWNED transcript re-emits the `<|vision_start|>…<|vision_end|>` markers on
+    /// EVERY round — keeping the token-row prefix stable so the image's KV (encoded once on the cold prefill)
+    /// is reused on later rounds instead of re-encoded. Empty for the overwhelming text-only majority.
+    public var imageURLs: [URL] = []
+    public init(role: Role, content: String, reasoningContent: String? = nil, toolCalls: [ToolCall]? = nil,
+                imageURLs: [URL] = []) {
         self.role = role; self.content = content
         self.reasoningContent = reasoningContent; self.toolCalls = toolCalls
+        self.imageURLs = imageURLs
     }
 }
 

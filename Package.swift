@@ -101,6 +101,7 @@ let package = Package(
                 "Serving",
                 "NativeTools",
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
+                .product(name: "MLXVLM", package: "mlx-swift-lm"),   // vision models (Qwen3.5-MoE VLM) — auto-routed at load
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "MLXHuggingFace", package: "mlx-swift-lm"),
                 .product(name: "MLX", package: "mlx-swift"),

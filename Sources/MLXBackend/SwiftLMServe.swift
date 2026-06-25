@@ -33,17 +33,18 @@ extension MLXLanguageModel {
         hooks: HookChain? = nil,
         permission: ToolPermissionPolicy = .init(),
         approvePlan: PlanApprover? = nil,
-        toolTimeoutSeconds: Double = defaultToolDispatchTimeoutSeconds
+        toolTimeoutSeconds: Double = defaultToolDispatchTimeoutSeconds,
+        images: [URL] = []
     ) async -> AsyncThrowingStream<AgentStreamEvent, Error> {
         // One-shot convenience: build a FRESH backend per call (no persistence). Long-lived callers that
         // need per-agent KV + compaction continuity across turns (Orbital's SharedMLXScheduler) hold a
-        // `makeAgentBackend(...)` themselves and drive `streamAgentTurn` directly.
+        // `makeAgentBackend(...)` themselves and drive `streamAgentTurn` directly (passing `images:` there).
         let backend = await makeAgentBackend(host: host)
         let config = AgentTurnConfig(modelLabel: modelLabel, sessionID: sessionID, cwd: cwd,
                                      toolNames: await host.toolNames, maxRounds: maxRounds, permission: permission,
                                      approvePlan: approvePlan, toolTimeoutSeconds: toolTimeoutSeconds)
         return streamAgentTurn(prompt: prompt, instructions: instructions, hooks: hooks,
-                               config: config, backend: backend)
+                               config: config, backend: backend, images: images)
     }
 
     /// Build a PERSISTENT agent-turn backend (ChatSession + MCPHost) the CALLER holds across turns, so a
@@ -133,7 +134,13 @@ final class ChatSessionTurnBackend: AgentTurnBackend, @unchecked Sendable {
     /// the first round measures it.
     func finalContextTokens() -> Int? { compacting?.contextTokens }
 
+    // 4-arg requirement (text-only): forward to the image-aware overload with no images.
     func round(instructions: String?, prompt: String, resume: [ResumeMessage], toolsEnabled: Bool)
+        -> AsyncThrowingStream<GenStep, Error> {
+        round(instructions: instructions, prompt: prompt, resume: resume, toolsEnabled: toolsEnabled, images: [])
+    }
+
+    func round(instructions: String?, prompt: String, resume: [ResumeMessage], toolsEnabled: Bool, images: [URL])
         -> AsyncThrowingStream<GenStep, Error> {
         if resume.isEmpty { basePrompt = prompt }   // remember the user prompt for arg constraining
         if compacting == nil {
@@ -148,7 +155,7 @@ final class ChatSessionTurnBackend: AgentTurnBackend, @unchecked Sendable {
                 do {
                     // Build the round's input here (not captured) — Chat.Message isn't Sendable; resume/prompt are.
                     let input: [Chat.Message] = resume.isEmpty
-                        ? [.user(prompt)]
+                        ? [.user(prompt, images: images.map { .url($0) })]
                         : resume.map { msg -> Chat.Message in
                             switch msg {
                             case .toolResult(let s): return .tool(s)

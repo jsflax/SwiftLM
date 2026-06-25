@@ -32,6 +32,14 @@ public final class OwnedKVCacheBox: @unchecked Sendable {
     public func reset() { cache = nil; cachedRow = [] }
 }
 
+/// Crosses a VLM's processed image (non-Sendable `MLXArray` pixels) into the owned-render decode Task and its
+/// serialized `container.perform`. `@unchecked Sendable` for the SAME reason as `OwnedKVCacheBox`: the pixels are
+/// only ever READ inside `streamFromTokens`'s serialized model-actor context. An empty box ⇒ a text-only round.
+public struct OwnedImageBox: @unchecked Sendable {
+    public let image: LMInput.ProcessedImage?
+    public init(_ image: LMInput.ProcessedImage?) { self.image = image }
+}
+
 final class CompactingSession: @unchecked Sendable {
     private let kvBox = OwnedKVCacheBox()        // B2: persistent owned-render cache across this session's rounds
     private let model: MLXLanguageModel
@@ -193,8 +201,21 @@ final class CompactingSession: @unchecked Sendable {
         // parsing: a routing-only round still reasons (to DECIDE the route) and still parses (to catch the call).
         let render = renderSpecs(toolsEnabled: toolsEnabled)
         let anyTools = render != nil
-        let tokens = (try? await model.renderTurnMessages(turns, tools: render,
-                                                          enableThinking: anyTools)) ?? []
+        // VLM: collect image attachments across the transcript IN TURN ORDER (to match the per-turn
+        // `<|image_pad|>` markers `turnDicts` emits). If any, render through the overload that ALSO returns the
+        // processed pixels for the vision-merge cold prefill; else the text overload (zero vision work). The image
+        // markers stay in every round's row, so `streamFromTokens` encodes the image once and reuses its KV after.
+        let imageURLs: [URL] = turns.flatMap { $0.imageURLs }
+        let tokens: [Int32]
+        let imageBox: OwnedImageBox
+        if imageURLs.isEmpty {
+            tokens = (try? await model.renderTurnMessages(turns, tools: render, enableThinking: anyTools)) ?? []
+            imageBox = OwnedImageBox(nil)
+        } else {
+            let r = try? await model.renderTurnMessages(turns, tools: render, enableThinking: anyTools, imageURLs: imageURLs)
+            tokens = r?.tokens ?? []
+            imageBox = r?.image ?? OwnedImageBox(nil)
+        }
         contextTokens = tokens.count
         let maxTok = params.maxTokens ?? 512
         // The owned-render generation prompt PRIMES `<think>` (enableThinking == anyTools) — the open tag is
@@ -211,7 +232,8 @@ final class CompactingSession: @unchecked Sendable {
                 var firstChunk = true
                 do {
                     for try await g in model.streamFromTokens(tokens, maxTokens: maxTok, adapter: adapter,
-                                                              params: params, kvBox: kvBox, activeTraits: activeTraits) {
+                                                              params: params, kvBox: kvBox, activeTraits: activeTraits,
+                                                              image: imageBox) {
                         if case .chunk(let c) = g {
                             let piece = (firstChunk && primeThink) ? openTag + c : c
                             firstChunk = false
@@ -234,8 +256,12 @@ final class CompactingSession: @unchecked Sendable {
     }
 
     /// Convert an mlx `Chat.Message` (user/tool/system input) → a Sendable `TurnMessage` for the owned transcript.
+    /// Image attachments arrive as `Chat.Message.images` (`.url` file refs in Orbital's flow); carry their URLs
+    /// onto the TurnMessage so the owned re-render re-emits the vision markers each round (KV-prefix stable).
     static func turnMessage(_ m: Chat.Message) -> TurnMessage {
-        TurnMessage(role: TurnMessage.Role(rawValue: m.role.rawValue) ?? .user, content: m.content)
+        let urls: [URL] = m.images.compactMap { if case .url(let u) = $0 { return u } else { return nil } }
+        return TurnMessage(role: TurnMessage.Role(rawValue: m.role.rawValue) ?? .user, content: m.content,
+                           imageURLs: urls)
     }
 
     /// Split an assistant turn into (reasoning span, visible content). Reasoning = the text inside the model's

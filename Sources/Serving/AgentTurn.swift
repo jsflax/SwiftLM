@@ -28,6 +28,11 @@ public protocol AgentTurnBackend: Sendable {
     /// force a text answer. `instructions` is the hook-augmented system text (used when the session is built).
     func round(instructions: String?, prompt: String, resume: [ResumeMessage], toolsEnabled: Bool)
         -> AsyncThrowingStream<GenStep, Error>
+    /// VLM variant: `images` are file URLs attached to the FIRST (user) round — the agent's turn carries
+    /// pictures for a vision model. The default impl (text backends, test stubs) ignores them and forwards to
+    /// the text `round`; only the MLX `ChatSessionTurnBackend` consumes them (attaches to the user `Chat.Message`).
+    func round(instructions: String?, prompt: String, resume: [ResumeMessage], toolsEnabled: Bool, images: [URL])
+        -> AsyncThrowingStream<GenStep, Error>
     /// Dispatch a tool call; return its result text + whether it errored.
     func dispatch(name: String, argsJSON: String) async -> (result: String, isError: Bool)
     /// The real running context size (prompt+gen tokens) after the final round, for honest result telemetry
@@ -38,6 +43,12 @@ public protocol AgentTurnBackend: Sendable {
 
 public extension AgentTurnBackend {
     func finalContextTokens() -> Int? { nil }
+    /// Default: drop images and run the text round. Lets non-VLM backends and the test stubs satisfy the new
+    /// requirement unchanged; only `ChatSessionTurnBackend` overrides it to feed pixels to the model.
+    func round(instructions: String?, prompt: String, resume: [ResumeMessage], toolsEnabled: Bool, images: [URL])
+        -> AsyncThrowingStream<GenStep, Error> {
+        round(instructions: instructions, prompt: prompt, resume: resume, toolsEnabled: toolsEnabled)
+    }
 }
 
 public struct AgentTurnConfig: Sendable {
@@ -123,7 +134,8 @@ public func streamAgentTurn(
     instructions: String?,
     hooks: HookChain?,
     config: AgentTurnConfig,
-    backend: any AgentTurnBackend
+    backend: any AgentTurnBackend,
+    images: [URL] = []
 ) -> AsyncThrowingStream<AgentStreamEvent, Error> {
     AsyncThrowingStream { continuation in
         let task = Task {
@@ -181,8 +193,11 @@ public func streamAgentTurn(
                     // error-free for a while without finishing (over-eager rambling) — then drop WORK tools to
                     // force a conclusion. Routing tools ride through (the backend keeps offering them when canRoute).
                     let toolsOn = round < maxToolRounds && (isBuilder || quietToolRounds < defaultMaxQuietToolRounds)
+                    // Images ride the FIRST (user) round only — the owned transcript then carries them forward
+                    // across rounds (TurnMessage.imageURLs), so later rounds must not re-attach them.
                     let stream = backend.round(instructions: instr, prompt: prompt,
-                                               resume: resume, toolsEnabled: toolsOn)
+                                               resume: resume, toolsEnabled: toolsOn,
+                                               images: resume.isEmpty ? images : [])
                     resume = []
                     var text = ""
                     var toolCalls: [(name: String, argsJSON: String)] = []

@@ -244,21 +244,54 @@ extension MLXLanguageModel {
     /// `container.perform` (the dicts are Sendable values that cross the boundary).
     public func renderTurnMessages(_ turns: [TurnMessage], tools: [ToolSpec]?, enableThinking: Bool) async throws -> [Int32] {
         try await container.perform { ctx in
-            let dicts: [[String: any Sendable]] = turns.map { t in
-                var d: [String: any Sendable] = ["role": t.role.rawValue, "content": t.content]
-                if let rc = t.reasoningContent, !rc.isEmpty { d["reasoning_content"] = rc }
-                if let calls = t.toolCalls, !calls.isEmpty {
-                    d["tool_calls"] = calls.map { c -> [String: any Sendable] in
-                        ["type": "function",
-                         "function": ["name": c.name, "arguments": Self.argsDict(c.argsJSON)] as [String: any Sendable]]
-                    }
-                }
-                return d
-            }
             let input = try await ctx.processor.prepare(
-                input: UserInput(messages: dicts, tools: tools,
+                input: UserInput(messages: Self.turnDicts(turns), tools: tools,
                                  additionalContext: ["enable_thinking": enableThinking]))
             return input.text.tokens.asType(.int32).asArray(Int32.self)
+        }
+    }
+
+    /// VLM variant of `renderTurnMessages`: also carries image inputs and returns the processed pixels the
+    /// vision-merge prefill needs. A turn with `imageURLs` renders its content as the model's multimodal content
+    /// array (image markers + text — see `turnDicts`), so the chat template emits the `<|vision_start|>…
+    /// <|vision_end|>` placeholders; the flat `images` (top-level, in turn order) become the pixel grid those
+    /// placeholders bind to. Returns `(tokens, image)` — `image` is nil if the model/processor produced none.
+    public func renderTurnMessages(_ turns: [TurnMessage], tools: [ToolSpec]?, enableThinking: Bool,
+                                   imageURLs: [URL]) async throws -> (tokens: [Int32], image: OwnedImageBox) {
+        // Take `[URL]` (Sendable) not `[UserInput.Image]` (non-Sendable: its `.ciImage`/`.array` cases hold
+        // CIImage/MLXArray) so the params can cross into `perform`'s `@Sendable` closure; build the `.url` images
+        // INSIDE. The processed pixels are boxed in `OwnedImageBox` (also inside) so the Sendable
+        // `([Int32], OwnedImageBox)` tuple satisfies `perform`'s `R: Sendable`.
+        try await container.perform { ctx in
+            let input = try await ctx.processor.prepare(
+                input: UserInput(messages: Self.turnDicts(turns), images: imageURLs.map { .url($0) }, tools: tools,
+                                 additionalContext: ["enable_thinking": enableThinking]))
+            return (input.text.tokens.asType(.int32).asArray(Int32.self), OwnedImageBox(input.image))
+        }
+    }
+
+    /// Build the owned-render chat-template dicts from the structured transcript. Shared by both
+    /// `renderTurnMessages` overloads. A turn with `imageURLs` becomes the Qwen multimodal content array
+    /// (`[{"type":"image"}×N, {"type":"text","text": …}]`) so the template inserts the vision placeholders;
+    /// every other turn keeps the plain-string content (the text-only majority — unchanged shape).
+    static func turnDicts(_ turns: [TurnMessage]) -> [[String: any Sendable]] {
+        turns.map { t in
+            var d: [String: any Sendable] = ["role": t.role.rawValue]
+            if t.imageURLs.isEmpty {
+                d["content"] = t.content
+            } else {
+                var parts: [[String: any Sendable]] = t.imageURLs.map { _ in ["type": "image"] }
+                parts.append(["type": "text", "text": t.content])
+                d["content"] = parts
+            }
+            if let rc = t.reasoningContent, !rc.isEmpty { d["reasoning_content"] = rc }
+            if let calls = t.toolCalls, !calls.isEmpty {
+                d["tool_calls"] = calls.map { c -> [String: any Sendable] in
+                    ["type": "function",
+                     "function": ["name": c.name, "arguments": Self.argsDict(c.argsJSON)] as [String: any Sendable]]
+                }
+            }
+            return d
         }
     }
 
@@ -299,7 +332,8 @@ extension MLXLanguageModel {
     /// turn watchdog. `params` carries temp + rep-pen + min/top-p (built once in SwiftLMServe from the adapter).
     public func streamFromTokens(_ row: [Int32], maxTokens: Int, adapter: ModelProfile,
                                  params: GenerateParameters, kvBox: OwnedKVCacheBox? = nil,
-                                 activeTraits: Set<TraitID> = [])
+                                 activeTraits: Set<TraitID> = [],
+                                 image imageBox: OwnedImageBox = .init(nil))
         -> AsyncThrowingStream<Generation, Error> {
         AsyncThrowingStream { cont in
             let task = Task {
@@ -344,16 +378,50 @@ extension MLXLanguageModel {
                     // generation logits. With B2 reuse, only the new tail is prefilled (cache.ropeOffset already
                     // equals prefixLen, so the appended tokens get correct absolute RoPE).
                     let stepSize = max(64, params.prefillStepSize)
-                    var logits = model(promptArr[0..., prefixLen..<min(prefixLen + stepSize, row.count)],
-                                       cache: cache)[0..., -1, 0...]
-                    eval(logits)
-                    var pStart = prefixLen + stepSize
-                    while pStart < row.count {
-                        if Task.isCancelled { break }
-                        let pEnd = min(pStart + stepSize, row.count)
-                        logits = model(promptArr[0..., pStart..<pEnd], cache: cache)[0..., -1, 0...]
+                    // VLM-COMPATIBLE FORWARD: drive the model through the universal `LMInput.Text` overload, never
+                    // the bare `model(MLXArray, cache:)` overload. The bare overload has a `fatalError` DEFAULT in
+                    // the LanguageModel protocol (LanguageModel.swift:242) — only text model classes (e.g. the LLM
+                    // Qwen35Model) override it; VLM classes (e.g. Qwen35MoE, loaded once MLXVLM is linked) override
+                    // the `LMInput.Text` overload instead. For text models the `LMInput.Text` default impl forwards
+                    // straight to the bare overload they implement, so this is byte-identical for them — but it is
+                    // REQUIRED for the VLM (the bare path would crash every 122B turn, text or image). `fwd` keeps
+                    // the chunked prefill below intact (the 122B memory-freeze guard); only the call shape changes.
+                    func fwd(_ tokens: MLXArray) -> MLXArray {
+                        model(LMInput.Text(tokens: tokens), cache: cache, state: nil).logits[0..., -1, 0...]
+                    }
+                    var logits: MLXArray
+                    if let image = imageBox.image, !reuse {
+                        // COLD image round: the vision encoder must run and merge image embeddings at the
+                        // `<|image_pad|>` placeholder positions — that happens ONLY through `model.prepare`, not the
+                        // bare text forward. The image round's prompt is short (image tokens + a brief user turn), so
+                        // a single-shot prepare stays under the 122B freeze threshold. The resulting KV holds the
+                        // image-encoded prefix; because the row KEEPS its image markers on later rounds, the existing
+                        // `reuse` path below reuses that KV and prefills only the text tail — the vision encoder runs
+                        // ONCE per image, never on reuse. (Mirrors MLXLMCommon.TokenIterator.prepare.)
+                        let lmInput = LMInput(text: .init(tokens: promptArr), image: image)
+                        switch try? model.prepare(lmInput, cache: cache, windowSize: stepSize) {
+                        case .some(.logits(let out)):
+                            logits = out.logits[0..., -1, 0...]
+                        case .some(.tokens(let t)):
+                            logits = model(t[text: .newAxis], cache: cache, state: nil).logits[0..., -1, 0...]
+                        case .none:
+                            cont.yield(.chunk("⚠️ vision prefill failed (model.prepare)")); cont.finish(); return
+                        }
                         eval(logits)
-                        pStart = pEnd
+                    } else {
+                        // TEXT prefill (or image-round REUSE): chunk `row[prefixLen...]` so peak attention stays
+                        // bounded regardless of L (the freeze guard). On reuse the image already lives in the reused
+                        // KV prefix, so this tail is pure text — no vision work here.
+                        logits = fwd(promptArr[0..., prefixLen..<min(prefixLen + stepSize, row.count)])
+                        eval(logits)
+                        var pStart = prefixLen + stepSize
+                        while pStart < row.count {
+                            if Task.isCancelled { break }
+                            let pEnd = min(pStart + stepSize, row.count)
+                            logits = fwd(promptArr[0..., pStart..<pEnd])
+                            eval(logits)
+                            pStart = pEnd
+                        }
                     }
                     var genIds: [Int] = []
                     var emitted = ""
@@ -380,7 +448,7 @@ extension MLXLanguageModel {
                             }
                             break
                         }
-                        logits = model(nextTok.reshaped([1, 1]), cache: cache)[0..., -1, 0...]
+                        logits = fwd(nextTok.reshaped([1, 1]))
                         eval(logits)
                     }
                     // B2: carry the cache for the next round. The cache now contains EXACTLY `row` (prefilled) +

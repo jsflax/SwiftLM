@@ -1,5 +1,6 @@
 import Foundation
 import MLXLLM
+import MLXVLM            // vision model factory (Qwen35MoE etc.) — registered via the trampoline below
 import MLXLMCommon
 import MLXHuggingFace
 import MLX
@@ -36,8 +37,19 @@ public final class MLXLanguageModel: Sendable {
         let id = modelId
             ?? ProcessInfo.processInfo.environment["SWIFTLM_MODEL"]
             ?? "mlx-community/Qwen2.5-Coder-7B-Instruct-4bit"
+        // Register the VLM model factory so a vision model (e.g. Qwen3.5-122B's `qwen3_5_moe`) routes to MLXVLM's
+        // `Qwen35MoE` instead of the text factory. `#huggingFaceLoadModelContainer` resolves the factory via a
+        // DYNAMIC `NSClassFromString("MLXVLM.TrampolineModelFactory")` lookup in `ModelFactoryRegistry`, which only
+        // succeeds when MLXVLM's object code is present in the binary — so reference the trampoline CLASS here to
+        // stop the linker dead-stripping it (referencing `VLMTypeRegistry` is NOT enough). Text-only models throw
+        // `unsupportedModelType` in the VLM factory and fall through to the LLM factory. Proven by the P0 spike.
+        _ = MLXVLM.TrampolineModelFactory.self
         let container = try await #huggingFaceLoadModelContainer(
             configuration: ModelConfiguration(id: id))
+        // Guard the silent-text-only regression: if MLXVLM ever fails to register, a vision model loads through the
+        // text factory with NO error and just never sees pixels. Log the resolved model class so that's visible.
+        let loadedClass = await container.perform { ctx in String(describing: type(of: ctx.model)) }
+        FileHandle.standardError.write(Data("[mlx-load] \(id) → \(loadedClass)\n".utf8))
         // Bound MLX's GPU buffer-cache pool. By default mlx-swift's cacheLimit == the memoryLimit
         // (~1.5× the device working-set size ≈ effectively unbounded on a high-RAM box), and on free() a
         // buffer is RECYCLED INTO the pool instead of returned to the OS — so over a long/heavy serving run
