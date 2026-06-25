@@ -391,9 +391,13 @@ extension MLXLanguageModel {
                         continue
                     }
                 }
-                // Duplicate call → no new information. Don't re-dispatch; push toward finishing.
+                // Duplicate call → no new information. Don't re-dispatch; push toward finishing. BUT a state-
+                // changing tool (a file mutation or `bash`) is never a duplicate — it always runs and CLEARS the
+                // seen-set so a prior read/search re-runs against the now-changed state (edit → re-run the test).
                 roundProgressed = true
-                if !seenCalls.insert(toolCallKey(name: callName, argsJSON: argsJSON)).inserted {
+                if stateChangingToolNames.contains(callName) {
+                    seenCalls.removeAll(keepingCapacity: true)
+                } else if !seenCalls.insert(toolCallKey(name: callName, argsJSON: argsJSON)).inserted {
                     msgs.append(.tool("You already called `\(callName)` with these arguments; the result is "
                                       + "unchanged. Do not repeat it. If the task is complete, give your final answer."))
                     continue

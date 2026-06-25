@@ -96,6 +96,14 @@ public let defaultMaxQuietToolRounds = 4
 /// A read-only verifier never calls these, so verifiers are unaffected — they still conclude under pressure.
 public let mutationToolNames: Set<String> = ["write_file", "edit_file", "Write", "Edit", "create_file", "apply_patch"]
 
+/// Tools whose result is NOT idempotent — file mutations PLUS `bash`. These are NEVER treated as duplicate
+/// calls, and running one CLEARS the duplicate-call set, because they change the environment: re-running
+/// `python3 engine.py` after an edit is the build-test-fix loop (a real new result), not a no-op, and a prior
+/// `read_file`/`grep` is legitimately re-issuable once the files have changed. (A past bug: the chess Builder
+/// rewrote engine.py then re-ran the test, but the duplicate-call guard blocked it with "the result is
+/// unchanged" — false — and the build stalled. `bash` is also non-deterministic in general: time, env, RNG.)
+public let stateChangingToolNames: Set<String> = mutationToolNames.union(["bash", "Bash"])
+
 /// Identity of a tool call for duplicate detection: name + whitespace-normalized arguments. A repeated key
 /// means the model re-issued an identical call (zero new information) — a non-progress signal.
 public func toolCallKey(name: String, argsJSON: String) -> String {
@@ -335,9 +343,14 @@ public func streamAgentTurn(
                                 continue
                             }
                         }
-                        // Duplicate call → no new information. Don't re-dispatch; push toward finishing.
+                        // Duplicate call → no new information. Don't re-dispatch; push toward finishing. BUT a
+                        // state-changing tool (a file mutation or `bash`) is never a duplicate — it always runs,
+                        // and CLEARS the seen-set so a prior read/search re-runs against the now-changed state
+                        // (the build-test-fix loop: edit → re-run the test). Only idempotent reads get deduped.
                         roundProgressed = true
-                        if !seenCalls.insert(toolCallKey(name: call.name, argsJSON: call.argsJSON)).inserted {
+                        if stateChangingToolNames.contains(call.name) {
+                            seenCalls.removeAll(keepingCapacity: true)
+                        } else if !seenCalls.insert(toolCallKey(name: call.name, argsJSON: call.argsJSON)).inserted {
                             let dup = "You already called `\(call.name)` with these arguments; the result is "
                                 + "unchanged. Do not repeat it. If the task is complete, give your final answer."
                             continuation.yield(.toolResult(id: id, content: dup, isError: false))
