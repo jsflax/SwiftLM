@@ -76,16 +76,21 @@ public struct WriteFileTool: NativeTool {
     }
 }
 
-/// Exact-string replace in a file. Refuses an ambiguous edit (old_string non-unique) unless replace_all.
+/// Replace a string in a file. Tries an EXACT match first; if that misses (the #1 reason a small model gives
+/// up and rewrites the whole file — it got the indentation or trailing whitespace slightly wrong) it falls back
+/// to a WHITESPACE-TOLERANT line match. Refuses an ambiguous edit (multiple matches) unless replace_all.
 public struct EditFileTool: NativeTool {
     public let cwd: String
     public init(cwd: String = FileManager.default.currentDirectoryPath) { self.cwd = cwd }
     public let name = "edit_file"
-    public let description = "Replace an exact string in a file. Fails if old_string is absent, or "
-        + "(unless replace_all) is not unique. Returns the number of replacements."
+    public let description = "Make a TARGETED change to an existing file by replacing old_string with "
+        + "new_string. PREFER THIS over write_file when fixing or tweaking a file — do NOT rewrite the whole "
+        + "file to change a few lines. The match tolerates small indentation/whitespace differences, so copy the "
+        + "lines roughly. Fails only if old_string isn't found at all, or (unless replace_all) matches more than "
+        + "one place. Returns the number of replacements."
     public var parameters: JSONSchemaObject {
-        .init([("path", .init("string", "Absolute path")),
-               ("old_string", .init("string", "Exact text to replace")),
+        .init([("path", .init("string", "File path — RELATIVE to the working directory (e.g. \"engine.py\") is preferred, or an absolute path inside it.")),
+               ("old_string", .init("string", "The existing text to replace (a few lines is enough; exact indentation not required).")),
                ("new_string", .init("string", "Replacement text")),
                ("replace_all", .init("boolean", "Replace every occurrence (default false)"))],
               required: ["path", "old_string", "new_string"])
@@ -99,18 +104,55 @@ public struct EditFileTool: NativeTool {
         do { content = try String(contentsOfFile: path, encoding: .utf8) }
         catch { throw NativeToolError.io("cannot read \(path): \(error.localizedDescription)") }
 
+        // 1) EXACT match — the strict, unambiguous path.
         let count = content.components(separatedBy: oldS).count - 1
-        guard count > 0 else { throw NativeToolError.io("old_string not found in \(path)") }
-        if !all && count > 1 {
-            throw NativeToolError.io("old_string is not unique in \(path) (\(count) matches); "
-                + "add surrounding context or set replace_all")
+        if count > 0 {
+            if !all && count > 1 {
+                throw NativeToolError.io("old_string is not unique in \(path) (\(count) matches); "
+                    + "add surrounding context or set replace_all")
+            }
+            let updated = all ? content.replacingOccurrences(of: oldS, with: newS)
+                              : content.replacingCharacters(in: content.range(of: oldS)!, with: newS)
+            try Self.writeBack(updated, path: path)
+            return "replaced \(all ? count : 1) occurrence(s) in \(path)"
         }
-        let updated: String
-        if all { updated = content.replacingOccurrences(of: oldS, with: newS) }
-        else { let r = content.range(of: oldS)!; updated = content.replacingCharacters(in: r, with: newS) }
-        do { try updated.write(toFile: path, atomically: true, encoding: .utf8) }
+
+        // 2) WHITESPACE-TOLERANT fallback — match by lines with leading/trailing whitespace ignored, then splice
+        //    in new_string verbatim. Lets a near-miss edit LAND instead of forcing a full-file rewrite.
+        if let (updated, n) = Self.fuzzyLineReplace(content: content, oldS: oldS, newS: newS, replaceAll: all) {
+            try Self.writeBack(updated, path: path)
+            return "replaced \(n) occurrence(s) in \(path) (whitespace-tolerant match)"
+        }
+        throw NativeToolError.io("old_string not found in \(path), even ignoring whitespace. read_file the "
+            + "current contents and copy the exact lines you want to change — do NOT rewrite the whole file.")
+    }
+
+    private static func writeBack(_ s: String, path: String) throws {
+        do { try s.write(toFile: path, atomically: true, encoding: .utf8) }
         catch { throw NativeToolError.io("cannot write \(path): \(error.localizedDescription)") }
-        return "replaced \(all ? count : 1) occurrence(s) in \(path)"
+    }
+
+    /// Match `oldS` against `content` by comparing lines with leading/trailing whitespace stripped (the common
+    /// near-miss). Replaces the matched ORIGINAL lines with `newS` verbatim. Unique-or-replaceAll; nil if no
+    /// match. Trailing blank lines of `oldS` are ignored (a frequent model artifact).
+    static func fuzzyLineReplace(content: String, oldS: String, newS: String, replaceAll: Bool) -> (String, Int)? {
+        let fileLines = content.components(separatedBy: "\n")
+        var oldLines = oldS.components(separatedBy: "\n")
+        while oldLines.count > 1, oldLines.last!.trimmingCharacters(in: .whitespaces).isEmpty { oldLines.removeLast() }
+        let k = oldLines.count
+        guard k >= 1, !(k == 1 && oldLines[0].trimmingCharacters(in: .whitespaces).isEmpty), fileLines.count >= k else { return nil }
+        let oldTrim = oldLines.map { $0.trimmingCharacters(in: .whitespaces) }
+        var starts: [Int] = []
+        var i = 0
+        while i + k <= fileLines.count {
+            if fileLines[i..<i+k].map({ $0.trimmingCharacters(in: .whitespaces) }) == oldTrim { starts.append(i); i += k }
+            else { i += 1 }
+        }
+        guard !starts.isEmpty, replaceAll || starts.count == 1 else { return nil }
+        let newLines = newS.components(separatedBy: "\n")
+        var out = fileLines
+        for s in starts.reversed() { out.replaceSubrange(s..<s+k, with: newLines) }   // end-first keeps indices valid
+        return (out.joined(separator: "\n"), starts.count)
     }
 }
 
