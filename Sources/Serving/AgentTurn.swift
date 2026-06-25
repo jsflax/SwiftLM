@@ -209,12 +209,17 @@ public func streamAgentTurn(
                     resume = []
                     var text = ""
                     var toolCalls: [(name: String, argsJSON: String)] = []
-                    var thinkFilter = ReasoningStreamFilter()   // hide <think> content from the streamed deltas
+                    var thinkFilter = ReasoningStreamFilter()   // split <think> off the visible deltas
                     for try await step in stream {
                         switch step {
                         case .chunk(let ch):
                             text += ch; outputChars += ch.count
-                            let vis = thinkFilter.feed(ch)
+                            var rsn = ""
+                            let vis = thinkFilter.feed(ch, reasoning: &rsn)
+                            // Stream the model's thinking LIVE (per chunk) so the UI's "Reasoning" block fills in
+                            // as it reasons — instead of staying blank for the whole (long) round, then dumping
+                            // the reasoning at round-end. The reasoning rides the SAME toolIndex as this round.
+                            if !rsn.isEmpty { continuation.yield(.reasoningDelta(rsn)) }
                             if !vis.isEmpty { continuation.yield(.textDelta(vis)) }   // live render, no <think>
                         case .toolCall(let name, let argsJSON):
                             toolCalls.append((name, argsJSON))
@@ -228,11 +233,8 @@ public func streamAgentTurn(
                         + "hasToolTag=\(text.contains("tool_call")) textLen=\(text.count) "
                         + "concluded=\(concludedThisTurn) nudges=\(consecutiveNudges)")
 
-                    // Surface THIS round's reasoning (the <think> content) on its own channel so the UI can show
-                    // it as a specially-formatted "thinking" block — it's otherwise stripped from the visible
-                    // deltas AND the final answer, so the model's analysis (the critic's real reasoning) is lost.
-                    let roundReasoning = extractReasoning(text)
-                    if !roundReasoning.isEmpty { continuation.yield(.reasoningDelta(roundReasoning)) }
+                    // (Reasoning is now streamed LIVE in the chunk loop above — no round-end batch, which would
+                    // double it. The UI's "Reasoning" block fills in as the model thinks.)
 
                     // Completion-pressure ENFORCEMENT: rendering terminal-only specs (the backend) tells the model
                     // work tools are paused, but the xmlFunction parser still surfaces any <function=…> by NAME —

@@ -83,24 +83,41 @@ public func displayAnswer(_ raw: String) -> String {
 /// Feed each chunk, emit the returned visible text; call `flush()` at end-of-stream for any held-back tail.
 public struct ReasoningStreamFilter {
     private let spans: [(open: String, close: String)]
+    private let reasoningSpanIdx: Set<Int>   // spans whose dropped content is REASONING (`<think>`), not noise
     private var current: Int? = nil   // index of the span we're inside, or nil when outside
     private var buf = ""
 
     public init(spans: [(open: String, close: String)] =
                 [("<think>", "</think>"), ("<tool_call>", "</tool_call>")]) {
         self.spans = spans
+        // A think-style span's content is the model's reasoning — capturable for live streaming to its own UI
+        // channel. Other spans (`<tool_call>`) are parser noise and stay dropped.
+        self.reasoningSpanIdx = Set(spans.indices.filter { spans[$0].open.lowercased().contains("think") })
     }
 
     public mutating func feed(_ chunk: String) -> String {
+        var reasoning = ""
+        return feed(chunk, reasoning: &reasoning)
+    }
+
+    /// Like `feed`, but ALSO returns (via `reasoning`) the inside-`<think>` content this chunk contributed — so
+    /// the caller can stream the model's thinking to its own channel LIVE, instead of waiting for the round to
+    /// end and emitting it in one batch (which leaves the UI blank during a long reasoning pass). `<tool_call>`
+    /// span content is dropped from BOTH the visible text and the reasoning.
+    public mutating func feed(_ chunk: String, reasoning: inout String) -> String {
         buf += chunk
         var out = ""
         while true {
             if let cur = current {                        // inside a span: drop until its close tag
                 let close = spans[cur].close
+                let capture = reasoningSpanIdx.contains(cur)
                 if let r = buf.range(of: close) {
+                    if capture { reasoning += String(buf[..<r.lowerBound]) }   // reasoning up to the close tag
                     buf = String(buf[r.upperBound...]); current = nil
                 } else {                                  // hold a possible split close tag
-                    buf = String(buf.suffix(partialTailLen(buf, of: close))); break
+                    let keep = partialTailLen(buf, of: close)
+                    if capture { reasoning += String(buf.dropLast(keep)) }     // stream the reasoning we can commit
+                    buf = String(buf.suffix(keep)); break
                 }
             } else {                                      // outside a span
                 // earliest OPEN across spans
