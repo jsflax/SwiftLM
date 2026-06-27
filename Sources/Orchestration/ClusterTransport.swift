@@ -22,12 +22,13 @@ func clog(_ s: String) { FileHandle.standardError.write(Data((s + "\n").utf8)) }
 struct JobRequest: Codable, Sendable { let job: GenJob }
 struct JobResponse: Codable, Sendable { let id: String; let completions: [String]; let error: String? }
 
-/// Async, length-prefixed Codable channel over one NWConnection.
-final class FramedChannel: @unchecked Sendable {
+/// Async, length-prefixed Codable channel over one NWConnection. Public so the MLXBackend
+/// distributed-inference side-channel (M4d follower feed) reuses the same framing/transport.
+public final class FramedChannel: @unchecked Sendable {
     private let conn: NWConnection
-    init(_ conn: NWConnection) { self.conn = conn }
+    public init(_ conn: NWConnection) { self.conn = conn }
 
-    func send<T: Encodable>(_ msg: T) async throws {
+    public func send<T: Encodable>(_ msg: T) async throws {
         let payload = try JSONEncoder().encode(msg)
         var len = UInt32(payload.count).bigEndian
         var frame = Data(bytes: &len, count: 4)
@@ -39,7 +40,7 @@ final class FramedChannel: @unchecked Sendable {
         }
     }
 
-    func receive<T: Decodable>(_ type: T.Type) async throws -> T {
+    public func receive<T: Decodable>(_ type: T.Type) async throws -> T {
         let header = try await recvExactly(4)
         let len = UInt32(bigEndian: header.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) })
         guard len > 0, len < 64_000_000 else { throw ClusterError.badFrame }
@@ -57,7 +58,7 @@ final class FramedChannel: @unchecked Sendable {
         }
     }
 
-    func cancel() { conn.cancel() }
+    public func cancel() { conn.cancel() }
 }
 
 /// Serves a local `TracePool` (this box's LocalPool) over TCP. One server per box.

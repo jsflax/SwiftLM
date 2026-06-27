@@ -218,6 +218,15 @@ final class CompactingSession: @unchecked Sendable {
         }
         contextTokens = tokens.count
         let maxTok = params.maxTokens ?? 512
+        // M4d LEADER HOOK: feed this round's input row to the follower BEFORE decoding, so the peer's shard
+        // mirrors the forward in lockstep (the only thing it can't derive — it has no Lattice/messages).
+        // `reset` = our KV is empty (compaction / first round) ⇒ the follower must drop its KV too; otherwise
+        // both KV boxes track identically (same row + same broadcast tokens ⇒ same reuse decision). Gated on
+        // the leader's distributed context — nil on single-machine, so the normal path pays nothing.
+        if let dctx = model.distributedContext {
+            try? await dctx.sendRoundInput(FollowerRoundInput(
+                tokens: tokens, maxTokens: maxTok, reset: kvBox.cache == nil))
+        }
         // The owned-render generation prompt PRIMES `<think>` (enableThinking == anyTools) — the open tag is
         // in the PROMPT, not the output — so a reasoning model's generated text begins INSIDE the think span.
         // Re-insert the open tag on the first chunk so every downstream stripper (the live display filter, the

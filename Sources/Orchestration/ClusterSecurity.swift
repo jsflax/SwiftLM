@@ -11,7 +11,8 @@ import Network
 // a loud warning — keeps the existing loopback tests and single-box runs working unchanged.
 
 /// Build `NWParameters` for the cluster wire. `psk` nil/empty → plain TCP (warned); else TLS-PSK.
-func clusterParameters(psk: String?) -> NWParameters {
+/// Public so the MLXBackend distributed-inference side-channel reuses the same PSK/plaintext policy.
+public func clusterParameters(psk: String?) -> NWParameters {
     guard let psk, !psk.isEmpty else {
         clog("[cluster] ⚠️  no SWIFTLM_CLUSTER_PSK — wire is UNAUTHENTICATED plaintext TCP (loopback/dev only)")
         return NWParameters(tls: nil, tcp: NWProtocolTCP.Options())

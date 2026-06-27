@@ -345,6 +345,10 @@ extension MLXLanguageModel {
                     LoRARuntime.$activeTraits.withValue(activeTraits) {
                     let model = ctx.model, tok = ctx.tokenizer
                     let stops = self.batchStops(tok, adapter: adapter)
+                    // Pipeline-distributed (M4d): the ring group when this model is sharded across
+                    // ≥2 machines, else nil. Used below to broadcast rank 0's sampled token to every
+                    // rank each step so a sampling turn stays in lockstep (greedy: a no-op).
+                    let ringGroup = (model as? PipelineParallel)?.ringGroup
                     let promptArr = MLXArray(row).reshaped([1, row.count])
                     // B2 incremental KV: reuse the cache carried from the prior round IFF its tokens are an exact
                     // prefix of `row` (the recurrent layers can't rewind, so reuse must be forward-only +
@@ -430,7 +434,15 @@ extension MLXLanguageModel {
                         if Task.isCancelled { cancelled = true; break }   // A1: a watchdog/supersession cancel stops the decode
                         if let injectId { logits = Self.spikeLogits(like: logits, at: injectId) }
                         let processed = processor?.process(logits: logits) ?? logits
-                        let nextTok = sampler.sample(logits: processed)          // [1]
+                        var nextTok = sampler.sample(logits: processed)          // [1]
+                        if let g = ringGroup {
+                            // Every rank uses RANK 0's sampled token (all-gather concatenates in rank
+                            // order; index 0 is rank 0's). The follower discards its own RNG sample —
+                            // this is what keeps a temp>0 turn byte-identical across the ring. CPU stream
+                            // (the default GPU stream parks a cross-machine wait inside a Metal command
+                            // buffer and trips the watchdog).
+                            nextTok = g.allGather(nextTok, stream: .cpu)[0 ..< 1]
+                        }
                         eval(nextTok)
                         processor?.didSample(token: nextTok)
                         let t = nextTok.asArray(Int.self)[0]

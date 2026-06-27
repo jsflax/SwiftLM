@@ -22,10 +22,16 @@ import MiniBPE
 public final class MLXLanguageModel: Sendable {
     public let modelId: String
     let container: ModelContainer
+    /// Set only on the LEADER (rank 0) of a pipeline-distributed load — carries the ring group + the
+    /// side-channel to the follower. The turn loop (`CompactingSession.ownedRound`) reads it to feed each
+    /// round's input row to the follower. nil ⇒ single-machine (the normal path).
+    public let distributedContext: DistributedContext?
 
-    private init(modelId: String, container: ModelContainer) {
+    private init(modelId: String, container: ModelContainer,
+                 distributedContext: DistributedContext? = nil) {
         self.modelId = modelId
         self.container = container
+        self.distributedContext = distributedContext
     }
 
     /// Load an mlx-community model and return a ready backend. The base is overridable via the
@@ -80,7 +86,8 @@ public final class MLXLanguageModel: Sendable {
     public static func loadDistributed(
         modelId: String,
         group: DistributedGroup,
-        boundary: Int? = nil
+        boundary: Int? = nil,
+        distributedContext: DistributedContext? = nil
     ) async throws -> MLXLanguageModel {
         _ = MLXVLM.TrampolineModelFactory.self    // keep the VLM factory linked (see load())
         PipelineLoad.active = PipelineLoad.Config(group: group, boundary: boundary)
@@ -104,7 +111,8 @@ public final class MLXLanguageModel: Sendable {
         let cacheGB = ProcessInfo.processInfo.environment["SWIFTLM_MLX_CACHE_LIMIT_GB"]
             .flatMap(Int.init) ?? 4
         MLX.Memory.cacheLimit = cacheGB << 30
-        return MLXLanguageModel(modelId: modelId, container: container)
+        return MLXLanguageModel(modelId: modelId, container: container,
+                                distributedContext: distributedContext)
     }
 
     /// Form the MLX ring from the environment (`MLX_HOSTFILE` / `MLX_RANK`, the proven Track-A
