@@ -70,6 +70,98 @@ public final class MLXLanguageModel: Sendable {
         return m
     }
 
+    /// Load a model **pipeline-sharded across the ring** in `group` (M3). Same path as ``load``,
+    /// but brackets the factory weight-load with `PipelineLoad` so each rank loads ONLY its shard
+    /// (and warms it up) — the model is too big for one machine. Orbital stays agnostic: the
+    /// returned `MLXLanguageModel` generates via the same `.generate(...)`. `boundary` (2-rank only)
+    /// is the number of leading layers placed on the LAST rank (the memory-constrained peer); pass
+    /// identically on every rank. Run the SAME binary+args on every Mac; the ring (env `MLX_RANK` /
+    /// `MLX_HOSTFILE`) distinguishes ranks and the forward's collectives keep them lock-step.
+    public static func loadDistributed(
+        modelId: String,
+        group: DistributedGroup,
+        boundary: Int? = nil
+    ) async throws -> MLXLanguageModel {
+        _ = MLXVLM.TrampolineModelFactory.self    // keep the VLM factory linked (see load())
+        PipelineLoad.active = PipelineLoad.Config(group: group, boundary: boundary)
+        defer { PipelineLoad.active = nil }
+        // Load from the LOCAL HF snapshot dir when present, so a partially-cached rank loads ONLY the
+        // shard files it already has — never a full-repo re-download (`resolve()` skips download for a
+        // `.directory` config). Each rank holds exactly its own pipeline shard (Python sharded_load did
+        // the same partial download). Falls back to the Hub `id` path if nothing is cached.
+        let config: ModelConfiguration
+        if let snapshot = Self.localHFSnapshot(modelId: modelId) {
+            FileHandle.standardError.write(
+                Data("[mlx-load-dist rank \(group.rank)] local snapshot \(snapshot.path) (no download)\n".utf8))
+            config = ModelConfiguration(directory: snapshot)
+        } else {
+            config = ModelConfiguration(id: modelId)
+        }
+        let container = try await #huggingFaceLoadModelContainer(configuration: config)
+        let loadedClass = await container.perform { ctx in String(describing: type(of: ctx.model)) }
+        FileHandle.standardError.write(
+            Data("[mlx-load-dist rank \(group.rank)/\(group.size)] \(modelId) → \(loadedClass)\n".utf8))
+        let cacheGB = ProcessInfo.processInfo.environment["SWIFTLM_MLX_CACHE_LIMIT_GB"]
+            .flatMap(Int.init) ?? 4
+        MLX.Memory.cacheLimit = cacheGB << 30
+        return MLXLanguageModel(modelId: modelId, container: container)
+    }
+
+    /// Form the MLX ring from the environment (`MLX_HOSTFILE` / `MLX_RANK`, the proven Track-A
+    /// contract — listener rank 0 first) and load the model pipeline-sharded across it. The group
+    /// is retained by the loaded model. Returns the rank/size so a caller can print rank-aware
+    /// (rank 0 is the output rank). This keeps Orbital free of any direct MLX/`DistributedGroup`
+    /// import — the two-machine detail lives entirely in SwiftLM. (M4 will form the ring from the
+    /// Lattice roster instead of env; this env path is the M3 bring-up vehicle.)
+    public static func loadDistributedFromRingEnv(
+        modelId: String,
+        boundary: Int? = nil
+    ) async throws -> (model: MLXLanguageModel, rank: Int, size: Int) {
+        let group = try DistributedGroup(strict: .ring)
+        let model = try await loadDistributed(modelId: modelId, group: group, boundary: boundary)
+        return (model, group.rank, group.size)
+    }
+
+    /// Form the ring from an EXPLICIT host list (no environment) and load the model pipeline-sharded
+    /// across it. This is the no-env path M4 uses: `hosts` come from the Lattice cluster roster, not
+    /// `MLX_HOSTFILE`. `hosts` is one `"ip:port"` per rank in rank order (rank 0 = listener, first);
+    /// `rank` is this machine's index. Otherwise identical to ``loadDistributedFromRingEnv``.
+    public static func loadDistributedFromHosts(
+        modelId: String,
+        hosts: [String],
+        rank: Int,
+        boundary: Int? = nil
+    ) async throws -> (model: MLXLanguageModel, rank: Int, size: Int) {
+        let group = try DistributedGroup(ringHosts: hosts, rank: rank)
+        let model = try await loadDistributed(modelId: modelId, group: group, boundary: boundary)
+        return (model, group.rank, group.size)
+    }
+
+    /// Resolve a Hugging Face repo id to its local snapshot directory in the HF hub cache, or `nil`
+    /// if not cached. Honors `HF_HUB_CACHE` / `HF_HOME`, else `~/.cache/huggingface/hub`. Picks the
+    /// snapshot that actually has a `config.json` (skips incomplete/blob-only dirs).
+    static func localHFSnapshot(modelId: String) -> URL? {
+        let env = ProcessInfo.processInfo.environment
+        let hubCache: URL
+        if let c = env["HF_HUB_CACHE"], !c.isEmpty {
+            hubCache = URL(fileURLWithPath: c)
+        } else if let h = env["HF_HOME"], !h.isEmpty {
+            hubCache = URL(fileURLWithPath: h).appendingPathComponent("hub")
+        } else {
+            hubCache = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent(".cache/huggingface/hub")
+        }
+        let munged = "models--" + modelId.replacingOccurrences(of: "/", with: "--")
+        let snapshots = hubCache.appendingPathComponent("\(munged)/snapshots")
+        guard let dirs = try? FileManager.default.contentsOfDirectory(
+            at: snapshots, includingPropertiesForKeys: nil) else { return nil }
+        for d in dirs where FileManager.default.fileExists(
+            atPath: d.appendingPathComponent("config.json").path) {
+            return d
+        }
+        return nil
+    }
+
     /// Text completion. A repetition penalty is on by default — LoRA adapters overfit to
     /// a narrow style and degenerate into loops under pure-greedy decoding without it. BUT for
     /// R1-distill reasoning bases, DeepSeek's recommended setup is temp 0.6 / top_p 0.95 / NO
