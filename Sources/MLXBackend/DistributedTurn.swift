@@ -158,6 +158,40 @@ extension MLXLanguageModel {
         }
         return FramedChannel(conn)
     }
+
+    /// M5 Phase-0 spike: probe whether THIS process can reach a follower's recruit listener, returning the
+    /// terminal NWConnection state as a string — WITHOUT loading a model or sending a Recruit (serveFollower
+    /// only loads a shard AFTER a Recruit, `DistributedTurn.serveFollower`, so the follower stays clean). The
+    /// connection is cancelled before returning so the follower's accept→receive(Recruit) doesn't dangle.
+    /// Used to settle the headless-leader macOS Local-Network-Privacy question (does a DETACHED orbital-loop
+    /// keep local-network access?) before building any ensureFollower machinery. `.ready` ⇒ reachable.
+    public static func recruitProbe(host: String, port: UInt16, timeoutSec: Double = 6.0) async -> String {
+        let psk = ProcessInfo.processInfo.environment["SWIFTLM_CLUSTER_PSK"]
+        guard let p = NWEndpoint.Port(rawValue: port) else { return "bad-port" }
+        let conn = NWConnection(host: NWEndpoint.Host(host), port: p, using: clusterParameters(psk: psk))
+        let once = OnceGuard()
+        let q = DispatchQueue(label: "io.orbital.recruit-probe")   // Network.start(queue:) mandate only
+        let result: String = await withCheckedContinuation { (cont: CheckedContinuation<String, Never>) in
+            conn.stateUpdateHandler = { state in
+                switch state {
+                case .ready:          once.run { cont.resume(returning: "ready") }
+                case .failed(let e):  once.run { cont.resume(returning: "failed: \(e)") }
+                case .waiting(let e): once.run { cont.resume(returning: "waiting: \(e)") }
+                case .cancelled:      once.run { cont.resume(returning: "cancelled") }
+                default: break
+                }
+            }
+            conn.start(queue: q)
+            // A TCC Local-Network DENY can manifest as a silent packet drop with NO terminal state — which
+            // would hang forever. Time it out on the same mandated net queue (probe-only; not production logic).
+            q.asyncAfter(deadline: .now() + timeoutSec) {
+                once.run { cont.resume(returning:
+                    "timeout(\(timeoutSec)s — no terminal state; consistent with a silent Local-Network drop)") }
+            }
+        }
+        conn.cancel()
+        return result
+    }
 }
 
 /// One-shot guard so a multi-firing NWConnection state handler resumes its continuation exactly once.
