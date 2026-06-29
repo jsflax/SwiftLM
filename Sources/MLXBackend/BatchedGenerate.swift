@@ -412,11 +412,23 @@ extension MLXLanguageModel {
                     // it now runs INSIDE withWiredLimit so the re-faulted weights stay pinned for the turn.
                     // Distributed-leader only (the follower goes load→serve with a small gap, like the smoke).
                     let distDbg = ProcessInfo.processInfo.environment["SWIFTLM_DIST_DEBUG"] != nil
-                    if distDbg { FileHandle.standardError.write(Data("[dist-turn] streamFromTokens reached: ringGroup=\(ringGroup != nil) distCtx=\(self.distributedContext != nil) row=\(row.count)\n".utf8)) }
-                    if ringGroup != nil {
-                        if distDbg { FileHandle.standardError.write(Data("[dist-turn r\(ringGroup?.rank ?? -1)] re-warmup start\n".utf8)) }
+                    let tStream = Date()
+                    func dlog(_ s: String) {
+                        if distDbg { FileHandle.standardError.write(Data(
+                            "[dist-turn +\(String(format: "%.1f", Date().timeIntervalSince(tStream)))s] \(s)\n".utf8)) }
+                    }
+                    dlog("streamFromTokens reached: ringGroup=\(ringGroup != nil) distCtx=\(self.distributedContext != nil) row=\(row.count)")
+                    if let g = ringGroup {
+                        dlog("r\(g.rank) re-warmup start")
                         (model as? PipelineParallel)?.warmup()
-                        if distDbg { FileHandle.standardError.write(Data("[dist-turn r\(ringGroup?.rank ?? -1)] re-warmup done; prefill start (tail=\(row.count - prefixLen), step=\(stepSize))\n".utf8)) }
+                        dlog("r\(g.rank) re-warmup done")
+                        // Per-turn RENDEZVOUS: both ranks finish re-warmup before EITHER enters the first prefill
+                        // collective, so the leader's pipeline send/recv never waits on a still-warming follower
+                        // past the ~45s GPU watchdog (the intermittent kIOGPUCommandBufferCallbackErrorTimeout).
+                        // The post-LOAD barrier syncs the cold start; this syncs every turn's warm start. allSum on
+                        // the CPU stream — the GPU stream would park the cross-machine wait in a command buffer.
+                        eval(g.allSum(MLXArray(Float(1)), stream: .cpu))
+                        dlog("r\(g.rank) barrier passed; prefill start (tail=\(row.count - prefixLen), step=\(stepSize))")
                     }
                     var logits: MLXArray
                     if let image = imageBox.image, !reuse {
@@ -443,7 +455,7 @@ extension MLXLanguageModel {
                         // KV prefix, so this tail is pure text — no vision work here.
                         logits = fwd(promptArr[0..., prefixLen..<min(prefixLen + stepSize, row.count)])
                         eval(logits)
-                        if ringGroup != nil, distDbg { FileHandle.standardError.write(Data("[dist-turn r\(ringGroup?.rank ?? -1)] first prefill chunk OK\n".utf8)) }
+                        if ringGroup != nil { dlog("r\(ringGroup?.rank ?? -1) first prefill chunk OK") }
                         var pStart = prefixLen + stepSize
                         while pStart < row.count {
                             if Task.isCancelled { break }
@@ -453,6 +465,7 @@ extension MLXLanguageModel {
                             pStart = pEnd
                         }
                     }
+                    if ringGroup != nil { dlog("prefill done; decode start") }
                     var genIds: [Int] = []
                     var cancelled = false
                     // Detok placement. SOLO (ringGroup == nil): decode inline — cheap vs the small-model forward,
