@@ -55,7 +55,14 @@ public struct FollowerRoundInput: Codable, Sendable {
     public let tokens: [Int32]
     public let maxTokens: Int
     public let reset: Bool
-    public init(tokens: [Int32], maxTokens: Int, reset: Bool) {
+    /// The LEADER's decode temperature for this round. The follower MUST decode with the SAME value so it takes
+    /// the SAME decode branch (greedy → asyncEval double-buffer; temp>0 → synchronous + token broadcast). The
+    /// follower's own Recruit-time temperature (a load-time default) can differ from the leader's per-turn
+    /// temperature, and a mismatch makes the two ranks run DIFFERENT per-token forward/collective sequences →
+    /// pipeline desync → GPU watchdog. (Defaults to 0 so older leaders that omit it stay greedy/lockstep.)
+    public let temperature: Float
+    public init(tokens: [Int32], maxTokens: Int, reset: Bool, temperature: Float = 0) {
+        self.temperature = temperature
         self.tokens = tokens; self.maxTokens = maxTokens; self.reset = reset
     }
 }
@@ -79,8 +86,12 @@ public func serveFollower(channel: FramedChannel) async throws {
         do { input = try await channel.receive(FollowerRoundInput.self) }
         catch { break }   // channel closed ⇒ leader done/gone ⇒ release the shard
         if input.reset { kvBox.reset() }
+        // Decode with the LEADER's temperature (not our load-time default) so we take the IDENTICAL decode
+        // branch and run the same per-token forward/collective sequence — otherwise the ranks desync.
+        var roundParams = params
+        roundParams.temperature = input.temperature
         for try await _ in model.streamFromTokens(
-            input.tokens, maxTokens: input.maxTokens, adapter: profile, params: params, kvBox: kvBox) {}
+            input.tokens, maxTokens: input.maxTokens, adapter: profile, params: roundParams, kvBox: kvBox) {}
     }
     distLog("[follower] channel closed; shard released.")
 }

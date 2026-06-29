@@ -188,6 +188,58 @@ public final class MLXLanguageModel: Sendable {
             params.repetitionContextSize = 20
         }
         let session = ChatSession(container, generateParameters: params)
-        return try await session.respond(to: prompt)
+        // Keep the (100+ GB) weights GPU-resident during decode — mirrors mlx_lm's
+        // `with wired_limit(model)` (mlx_lm/generate.py). WITHOUT this, on a memory-tight box the
+        // routed-expert weight pages get evicted and EVERY gather_qmm re-faults them — measured ~40x
+        // slower MoE (1.8 s/token vs ~0.04 s), i.e. ~100x the memory-bandwidth floor. The wired limit
+        // is device-adaptive (≈ Metal's recommendedMaxWorkingSetSize, ~75% RAM) so the 64 GB peer is
+        // safe too.
+        // Keep the resident model wired in RAM during decode (mirrors mlx_lm's `with wired_limit`).
+        // WITHOUT this, on a memory-tight box the routed-expert weight pages get evicted and EVERY
+        // gather_qmm re-faults them — measured ~13x slower (0.56 vs 7.4 tok/s on GLM-4.6 across 2 Macs).
+        // Metal's recommended working-set (115 GB on a 128 GB box) covers the 107 GB shard; mlx caps the
+        // wired limit AT that value (setting higher throws), so this is the max safe wiring.
+        let wired = MLX.GPU.maxRecommendedWorkingSetBytes() ?? (96 << 30)
+        return try await MLX.GPU.withWiredLimit(wired) {
+            try await session.respond(to: prompt)
+        }
+    }
+
+    /// DIAGNOSTIC (perf): pure-model decode benchmark — detok-free per-token rate plus a per-32-token
+    /// wall-clock curve, all in ONE thermally-consistent run. The synchronous token loop's `generateTime`
+    /// EXCLUDES the streaming detokenizer (the output is decoded once at the end), so this isolates the
+    /// model's true per-token speed from detok overhead and exposes any O(n) growth with sequence position
+    /// — disambiguating "is the gap the model or the detokenizer?" without cross-run thermal noise. Greedy
+    /// only (so the distributed ring stays lock-step when both ranks run this same loop). Logs via `log`.
+    public func generateBenchmark(
+        _ prompt: String, maxTokens: Int, temperature: Float = 0.0,
+        log: @Sendable @escaping (String) -> Void
+    ) async throws -> (output: String, tokPerSec: Double, generateTime: Double) {
+        let params = GenerateParameters(maxTokens: maxTokens, temperature: temperature, topP: 1.0)
+        let wired = MLX.GPU.maxRecommendedWorkingSetBytes() ?? (96 << 30)
+        return try await MLX.GPU.withWiredLimit(wired) {
+            try await container.perform { ctx in
+                let input = try await ctx.processor.prepare(input: UserInput(prompt: prompt))
+                let cache = ctx.model.newCache(parameters: params)
+                let iterator = try TokenIterator(
+                    input: input, model: ctx.model, cache: cache, parameters: params)
+                var blockStart = Date()
+                var lastCount = 0
+                let result = MLXLMCommon.generate(
+                    input: input, context: ctx, iterator: iterator
+                ) { tokens in
+                    let n = tokens.count
+                    if n - lastCount >= 32 {
+                        let dt = Date().timeIntervalSince(blockStart)
+                        log(String(format: "  tok %4d..%4d: %.3fs  (%.1f tok/s)",
+                                   lastCount, n, dt, Double(n - lastCount) / max(dt, 1e-9)))
+                        blockStart = Date()
+                        lastCount = n
+                    }
+                    return .more
+                }
+                return (result.output, result.tokensPerSecond, result.generateTime)
+            }
+        }
     }
 }

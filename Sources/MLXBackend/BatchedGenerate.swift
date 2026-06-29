@@ -320,8 +320,10 @@ extension MLXLanguageModel {
     /// hybrid 122B decodes without the merge crash, AND it keeps LIVE streaming: `.chunk`s are emitted
     /// incrementally via decode-then-diff detokenization (the UI sees tokens as they arrive). Stops on the
     /// adapter's stop set (its EOS strings/ids ∪ the universal turn-end floor); `</think>` is never a stop, so a
-    /// reasoning model runs through its think block to the action. No `.info` is emitted — the caller sets its
-    /// own context-token count (parity with the batched path), which keeps compaction/telemetry working.
+    /// reasoning model runs through its think block to the action. A single terminal `.info` is emitted after
+    /// the last chunk carrying the TRUE prompt+generation token counts (`genIds.count`) — so owned-render turns
+    /// report honest token usage / tok/s instead of falling back to a detok-chunk undercount (the count was
+    /// previously dropped here, leaving telemetry to a chars/4 estimate).
     ///
     /// A0 (the whitespace-spiral fix): decoding now runs through mlx's OWN logit processor + sampler
     /// (`params.processor()` / `params.sampler()`), the SAME machinery the ChatSession path uses — so a
@@ -342,7 +344,14 @@ extension MLXLanguageModel {
                     // inline continuations in this SAME Task (no hop), so the @TaskLocal reaches every resident
                     // layer's `callAsFunction` below; an EMPTY set ⇒ the resident forward returns base unchanged
                     // (byte-identical). This is the single owned-render bind site verified to propagate.
-                    LoRARuntime.$activeTraits.withValue(activeTraits) {
+                    // Keep the (100+ GB) pipeline shard GPU-resident for the WHOLE turn. Unlike model.generate
+                    // (which already wraps respond in withWiredLimit), the production turn path left the
+                    // post-warmup weights unwired, so Metal pages them out under working-set pressure and the
+                    // next prefill forward re-faults ~100 GB in ONE command buffer → trips the ~45s GPU watchdog
+                    // (kIOGPUCommandBufferCallbackErrorTimeout). Mirrors mlx_lm's `with wired_limit(model)`.
+                    let wiredLimit = MLX.GPU.maxRecommendedWorkingSetBytes() ?? (96 << 30)
+                    await MLX.GPU.withWiredLimit(wiredLimit) {
+                    await LoRARuntime.$activeTraits.withValue(activeTraits) {
                     let model = ctx.model, tok = ctx.tokenizer
                     let stops = self.batchStops(tok, adapter: adapter)
                     // Pipeline-distributed (M4d): the ring group when this model is sharded across
@@ -393,6 +402,22 @@ extension MLXLanguageModel {
                     func fwd(_ tokens: MLXArray) -> MLXArray {
                         model(LMInput.Text(tokens: tokens), cache: cache, state: nil).logits[0..., -1, 0...]
                     }
+                    // Re-fault the shard incrementally BEFORE the first (timed) forward. The load-time warmup
+                    // (PipelineParallel loadPipelineWeights) made the weights resident, but the
+                    // scheduler→backend→turn gap lets Metal evict the (until-now unwired) 100+GB leader shard;
+                    // a cold prefill would then re-fault it in ONE command buffer → GPU watchdog
+                    // (kIOGPUCommandBufferCallbackErrorTimeout — the exact crash the direct model.generate path
+                    // dodges via its immediate withWiredLimit). warmup() is a LOCAL per-layer forward (no
+                    // collective → no follower desync) that re-faults incrementally and is cheap once resident;
+                    // it now runs INSIDE withWiredLimit so the re-faulted weights stay pinned for the turn.
+                    // Distributed-leader only (the follower goes load→serve with a small gap, like the smoke).
+                    let distDbg = ProcessInfo.processInfo.environment["SWIFTLM_DIST_DEBUG"] != nil
+                    if distDbg { FileHandle.standardError.write(Data("[dist-turn] streamFromTokens reached: ringGroup=\(ringGroup != nil) distCtx=\(self.distributedContext != nil) row=\(row.count)\n".utf8)) }
+                    if ringGroup != nil {
+                        if distDbg { FileHandle.standardError.write(Data("[dist-turn r\(ringGroup?.rank ?? -1)] re-warmup start\n".utf8)) }
+                        (model as? PipelineParallel)?.warmup()
+                        if distDbg { FileHandle.standardError.write(Data("[dist-turn r\(ringGroup?.rank ?? -1)] re-warmup done; prefill start (tail=\(row.count - prefixLen), step=\(stepSize))\n".utf8)) }
+                    }
                     var logits: MLXArray
                     if let image = imageBox.image, !reuse {
                         // COLD image round: the vision encoder must run and merge image embeddings at the
@@ -418,6 +443,7 @@ extension MLXLanguageModel {
                         // KV prefix, so this tail is pure text — no vision work here.
                         logits = fwd(promptArr[0..., prefixLen..<min(prefixLen + stepSize, row.count)])
                         eval(logits)
+                        if ringGroup != nil, distDbg { FileHandle.standardError.write(Data("[dist-turn r\(ringGroup?.rank ?? -1)] first prefill chunk OK\n".utf8)) }
                         var pStart = prefixLen + stepSize
                         while pStart < row.count {
                             if Task.isCancelled { break }
@@ -428,19 +454,65 @@ extension MLXLanguageModel {
                         }
                     }
                     var genIds: [Int] = []
-                    var emitted = ""
                     var cancelled = false
+                    // Detok placement. SOLO (ringGroup == nil): decode inline — cheap vs the small-model forward,
+                    // and decoupling would unbounded-buffer when decode outpaces a fast local forward. RING: the
+                    // ~43ms GLM pipeline forward dwarfs the ~15-20ms decode, and decode sits SERIALLY between
+                    // eval(nextTok) and the `fwd` PIPELINE COLLECTIVE (which can't be asyncEval'd — it parks a
+                    // cross-machine wait in a Metal command buffer and trips the GPU watchdog, same reason the
+                    // allGather below uses stream:.cpu). So on the ring we stream each BROADCAST token to ONE
+                    // ordered consumer that owns the windowed decode + cont.yield; it decodes on another core while
+                    // the loop thread runs the next forward, lifting streaming ~16→~22 tok/s. The per-token
+                    // forward/allGather sequence stays byte-identical and the consumer issues no MLX op (tok is
+                    // Sendable + read-only). The whitespace-run tripwire is dormant on this path (the loop passes
+                    // suffix:"" — the detector's NEUTRAL case); the identical-run check (keyed on the BROADCAST
+                    // token, so cross-rank symmetric) stays active and bounds the spiral the battle-test exercises,
+                    // with maxTokens as the outer backstop.
+                    let tokSink: AsyncStream<Int>.Continuation?
+                    let detok: Task<Void, Never>?
+                    if ringGroup != nil {
+                        let (stream, sink) = AsyncStream<Int>.makeStream(bufferingPolicy: .unbounded)
+                        tokSink = sink
+                        // Sliding decode window (moved VERBATIM from the inline path → byte-identical output).
+                        detok = Task {
+                            var ids: [Int] = []
+                            var emitted = ""
+                            var windowStart = 0
+                            for await t in stream {
+                                ids.append(t)
+                                let window = windowStart == 0 ? ids : Array(ids[windowStart...])
+                                let full = tok.decode(tokenIds: window)
+                                let suffix = full.count > emitted.count ? String(full.dropFirst(emitted.count)) : ""
+                                if !suffix.isEmpty { cont.yield(.chunk(suffix)); emitted = full }
+                                if ids.count - windowStart >= 16 && !full.hasSuffix("\u{fffd}") {
+                                    windowStart = ids.count - 1
+                                    emitted = tok.decode(tokenIds: [ids[windowStart]])
+                                }
+                            }
+                        }
+                    } else { tokSink = nil; detok = nil }
+                    defer { tokSink?.finish() }   // throw/early-exit safety: the consumer's for-await always ends
+                    // Sliding decode window for the SOLO inline path (unused on the ring path). `tok.decode(genIds)`
+                    // every token is O(n) → O(n²) over a turn; we re-decode only genIds[windowStart...] and commit
+                    // at a safe char boundary (byte-level decode is concatenative → byte-identical stream).
+                    var emitted = ""
+                    var windowStart = 0
                     for _ in 0..<max(1, maxTokens) {
                         if Task.isCancelled { cancelled = true; break }   // A1: a watchdog/supersession cancel stops the decode
                         if let injectId { logits = Self.spikeLogits(like: logits, at: injectId) }
                         let processed = processor?.process(logits: logits) ?? logits
                         var nextTok = sampler.sample(logits: processed)          // [1]
-                        if let g = ringGroup {
-                            // Every rank uses RANK 0's sampled token (all-gather concatenates in rank
-                            // order; index 0 is rank 0's). The follower discards its own RNG sample —
-                            // this is what keeps a temp>0 turn byte-identical across the ring. CPU stream
-                            // (the default GPU stream parks a cross-machine wait inside a Metal command
-                            // buffer and trips the watchdog).
+                        if let g = ringGroup, params.temperature > 0 {
+                            // temp>0 ONLY: each rank's Categorical sampler draws from its own RNG, so the ranks
+                            // would pick DIFFERENT tokens and desync — broadcast rank 0's pick (all-gather
+                            // concatenates in rank order; index 0 is rank 0's). For GREEDY (temp 0) this is
+                            // SKIPPED: every rank already computes identical logits (the pipeline forward
+                            // all-gathers rank 0's hidden to all ranks → identical norm+lm_head → identical
+                            // argmax), so the broadcast is redundant — and skipping it removes a per-token
+                            // CROSS-MACHINE collective sync from the critical path (the dominant per-token cost
+                            // that scales badly with model size / rank count; it's why the turn lagged the
+                            // single-collective benchmark loop). CPU stream (the GPU stream parks the
+                            // cross-machine wait in a Metal command buffer and trips the watchdog).
                             nextTok = g.allGather(nextTok, stream: .cpu)[0 ..< 1]
                         }
                         eval(nextTok)
@@ -448,12 +520,26 @@ extension MLXLanguageModel {
                         let t = nextTok.asArray(Int.self)[0]
                         if stops.contains(t) { break }
                         genIds.append(t)
-                        let full = tok.decode(tokenIds: genIds)
-                        let suffix = full.count > emitted.count ? String(full.dropFirst(emitted.count)) : ""
-                        if !suffix.isEmpty {                                  // emit the newly-decoded suffix
-                            cont.yield(.chunk(suffix)); emitted = full
+                        // RING: hand the broadcast token to the consumer (non-blocking) and run a decode-free
+                        // tripwire (suffix:"" → identical-run only). SOLO: decode inline + full tripwire.
+                        var trippableSuffix = ""
+                        if let tokSink {
+                            tokSink.yield(t)
+                        } else {
+                            let window = windowStart == 0 ? genIds : Array(genIds[windowStart...])
+                            let full = tok.decode(tokenIds: window)
+                            let suffix = full.count > emitted.count ? String(full.dropFirst(emitted.count)) : ""
+                            if !suffix.isEmpty {                              // emit the newly-decoded suffix
+                                cont.yield(.chunk(suffix)); emitted = full
+                            }
+                            // Commit + restart the window at a safe char boundary so decode stays O(1) (not O(n²)).
+                            if genIds.count - windowStart >= 16 && !full.hasSuffix("\u{fffd}") {
+                                windowStart = genIds.count - 1
+                                emitted = tok.decode(tokenIds: [genIds[windowStart]])
+                            }
+                            trippableSuffix = suffix
                         }
-                        if let trip = tripwire.observe(token: t, suffix: suffix) {
+                        if let trip = tripwire.observe(token: t, suffix: trippableSuffix) {
                             if ProcessInfo.processInfo.environment["SWIFTLM_CTX_DEBUG"] != nil {
                                 FileHandle.standardError.write(Data(("[tripwire] degenerate decode aborted after "
                                     + "\(genIds.count) tokens: \(trip)\n").utf8))
@@ -472,7 +558,22 @@ extension MLXLanguageModel {
                         if cancelled { kvBox.reset() }
                         else { kvBox.cache = cache; kvBox.cachedRow = row + genIds.map { Int32($0) } }
                     }
+                    // Drain the ring detok consumer so ALL decoded text is yielded (in order) BEFORE cont.finish().
+                    // No-op on the solo path (detok == nil). Bounded: the consumer (~15-20ms) trails the ~43ms
+                    // forward by ~one token, so this holds the container only briefly.
+                    tokSink?.finish()
+                    await detok?.value
+                    // Telemetry: surface the TRUE generated-token count. Owned-render decode (unlike the
+                    // ChatSession path) emitted no `.info`, so the turn's token usage was lost and the smoke/UI
+                    // fell back to counting detok CHUNKS (a chunk batches ≥1 token ⇒ an UNDERcount). Emit it now,
+                    // after the detok drain so it trails every `.chunk`. promptTokenCount = the rendered row;
+                    // generationTokenCount = the tokens actually sampled (stop token excluded, matching the
+                    // KV-carry above). Times are 0 — every consumer reads only the counts.
+                    cont.yield(.info(GenerateCompletionInfo(
+                        promptTokenCount: row.count, generationTokenCount: genIds.count,
+                        promptTime: 0, generationTime: 0)))
                     }   // close LoRARuntime.$activeTraits.withValue
+                    }   // close MLX.GPU.withWiredLimit
                 }
                 cont.finish()
             }

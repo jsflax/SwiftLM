@@ -133,6 +133,9 @@ final class ChatSessionTurnBackend: AgentTurnBackend, @unchecked Sendable {
     /// telemetry the sequencer reads at result-time instead of the hardcoded `0` (OPEN ITEM T1). nil until
     /// the first round measures it.
     func finalContextTokens() -> Int? { compacting?.contextTokens }
+    /// The TRUE generated-token count this turn (from CompactingSession's accumulated `.info`) — honest
+    /// output-token telemetry / tok/s instead of the sequencer's chars/4 fallback.
+    func finalOutputTokens() -> Int? { compacting?.outputTokens }
 
     // 4-arg requirement (text-only): forward to the image-aware overload with no images.
     func round(instructions: String?, prompt: String, resume: [ResumeMessage], toolsEnabled: Bool)

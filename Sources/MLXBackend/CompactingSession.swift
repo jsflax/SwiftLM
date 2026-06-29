@@ -61,6 +61,7 @@ final class CompactingSession: @unchecked Sendable {
     private var structuredTurns: [TurnMessage] = []   // OWNED-RENDER transcript (carries reasoning_content + tool_calls)
     private var lastOwnedToolCalls: [Serving.ToolCall]? = nil // the call parsed this round, recorded into the next assistant turn
     private(set) var contextTokens = 0          // last measured prompt+gen tokens (from Generation.info)
+    private(set) var outputTokens = 0           // cumulative GENERATED tokens this turn (from .info) — honest tok/s
     private(set) var compactions = 0            // count, for the demo / observability
 
     init(model: MLXLanguageModel, instructions: String?, params: GenerateParameters,
@@ -113,7 +114,14 @@ final class CompactingSession: @unchecked Sendable {
         // C1.5: route via owned-render natively (`requiresOwnedRender`) OR whenever the bank is live — owned-render
         // is the ONLY decode path the activeTraits @TaskLocal propagates through, so when traits are in play every
         // local agent (incl. a normally-ChatSession model like the 80B) must use it. Bank OFF ⇒ unchanged.
-        if adapter.requiresOwnedRender || LoRARuntime.bankEnabled { return await ownedRound(input, toolsEnabled: toolsEnabled) }
+        // M4d: a PIPELINE-DISTRIBUTED model MUST use owned-render regardless of profile — it is the only path with
+        // the leader→follower `sendRoundInput` hook AND the only one that decodes via `streamFromTokens` (which the
+        // follower also runs). The ChatSession path runs a DIFFERENT decode loop and never feeds the follower, so
+        // the two ranks' pipeline send/recv collectives desync and the leader's command buffer hangs past the GPU
+        // watchdog (the kIOGPUCommandBufferCallbackErrorTimeout we hit). Gated on the leader's distributedContext.
+        if adapter.requiresOwnedRender || LoRARuntime.bankEnabled || model.distributedContext != nil {
+            return await ownedRound(input, toolsEnabled: toolsEnabled)
+        }
         // Past here = a NON-owned-render decode path (co-batch `batchGen` / ChatSession `streamDetails`), each of
         // which decodes inside nested unstructured Task{}s the activeTraits @TaskLocal cannot cross. Traits are
         // gated to owned-render upstream so this set is normally empty; if one ever leaks here, fail loud rather
@@ -217,6 +225,9 @@ final class CompactingSession: @unchecked Sendable {
             imageBox = r?.image ?? OwnedImageBox(nil)
         }
         contextTokens = tokens.count
+        if ProcessInfo.processInfo.environment["SWIFTLM_DIST_DEBUG"] != nil {
+            FileHandle.standardError.write(Data("[dist-turn] ownedRound: rendered \(tokens.count) tokens; distCtx=\(model.distributedContext != nil)\n".utf8))
+        }
         let maxTok = params.maxTokens ?? 512
         // M4d LEADER HOOK: feed this round's input row to the follower BEFORE decoding, so the peer's shard
         // mirrors the forward in lockstep (the only thing it can't derive — it has no Lattice/messages).
@@ -225,7 +236,10 @@ final class CompactingSession: @unchecked Sendable {
         // the leader's distributed context — nil on single-machine, so the normal path pays nothing.
         if let dctx = model.distributedContext {
             try? await dctx.sendRoundInput(FollowerRoundInput(
-                tokens: tokens, maxTokens: maxTok, reset: kvBox.cache == nil))
+                tokens: tokens, maxTokens: maxTok, reset: kvBox.cache == nil, temperature: params.temperature))
+            if ProcessInfo.processInfo.environment["SWIFTLM_DIST_DEBUG"] != nil {
+                FileHandle.standardError.write(Data("[dist-turn] ownedRound: sendRoundInput SENT (\(tokens.count) tok) → entering streamFromTokens\n".utf8))
+            }
         }
         // The owned-render generation prompt PRIMES `<think>` (enableThinking == anyTools) — the open tag is
         // in the PROMPT, not the output — so a reasoning model's generated text begins INSIDE the think span.
@@ -247,6 +261,12 @@ final class CompactingSession: @unchecked Sendable {
                             let piece = (firstChunk && primeThink) ? openTag + c : c
                             firstChunk = false
                             text += piece; cont.yield(.chunk(piece))
+                        } else if case .info(let inf) = g {
+                            // streamFromTokens' terminal token count. Accumulate the GENERATED tokens across the
+                            // turn's rounds (mirrors `outputChars`) for honest tok/s, and RE-EMIT the `.info` so
+                            // the round loop records the prompt+gen context fill (it otherwise saw only the prompt).
+                            self.outputTokens += inf.generationTokenCount
+                            cont.yield(g)
                         }
                     }
                 } catch { cont.finish(throwing: error); return }

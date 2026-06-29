@@ -39,10 +39,15 @@ public protocol AgentTurnBackend: Sendable {
     /// (OPEN ITEM T1). Default nil — a scripted stub that can't measure tokens degrades to the chars/4
     /// estimate, harmless to the test path; the MLX backend returns its CompactingSession's `.info` count.
     func finalContextTokens() -> Int?
+    /// The TRUE count of generated tokens across the turn (NOT chars/4), for honest output-token telemetry and
+    /// tok/s. Default nil — a stub degrades to the chars/4 estimate; the MLX backend returns its
+    /// CompactingSession's accumulated `.info` generation count.
+    func finalOutputTokens() -> Int?
 }
 
 public extension AgentTurnBackend {
     func finalContextTokens() -> Int? { nil }
+    func finalOutputTokens() -> Int? { nil }
     /// Default: drop images and run the text round. Lets non-VLM backends and the test stubs satisfy the new
     /// requirement unchanged; only `ChatSessionTurnBackend` overrides it to feed pixels to the model.
     func round(instructions: String?, prompt: String, resume: [ResumeMessage], toolsEnabled: Bool, images: [URL])
@@ -415,8 +420,11 @@ public func streamAgentTurn(
                 // `inputTokens` is the honest window FILL Orbital maps to `TurnTelemetry.contextTokens`.
                 // Falls back to the chars/4 estimate only for a stub backend that can't measure.
                 let ctxTokens = backend.finalContextTokens()
+                // Prefer the backend's TRUE generated-token count (genIds-based); fall back to the chars/4
+                // estimate only for a stub backend that can't measure (keeps the test path honest).
+                let outTokens = backend.finalOutputTokens() ?? max(0, outputChars / 4)
                 continuation.yield(.result(finalText: answer, inputTokens: ctxTokens ?? 0,
-                                           outputTokens: max(0, outputChars / 4), isError: false))
+                                           outputTokens: outTokens, isError: false))
                 continuation.finish()
             } catch {
                 continuation.finish(throwing: error)
