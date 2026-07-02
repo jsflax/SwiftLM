@@ -236,7 +236,7 @@ final class CompactingSession: @unchecked Sendable {
         // the leader's distributed context — nil on single-machine, so the normal path pays nothing.
         if let dctx = model.distributedContext {
             try? await dctx.sendRoundInput(FollowerRoundInput(
-                tokens: tokens, maxTokens: maxTok, reset: kvBox.cache == nil, temperature: params.temperature))
+                tokens: tokens, maxTokens: maxTok, reset: kvBox.cache == nil, params: params))
             if ProcessInfo.processInfo.environment["SWIFTLM_DIST_DEBUG"] != nil {
                 FileHandle.standardError.write(Data("[dist-turn] ownedRound: sendRoundInput SENT (\(tokens.count) tok) → entering streamFromTokens\n".utf8))
             }

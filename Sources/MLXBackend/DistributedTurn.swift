@@ -55,15 +55,35 @@ public struct FollowerRoundInput: Codable, Sendable {
     public let tokens: [Int32]
     public let maxTokens: Int
     public let reset: Bool
-    /// The LEADER's decode temperature for this round. The follower MUST decode with the SAME value so it takes
-    /// the SAME decode branch (greedy → asyncEval double-buffer; temp>0 → synchronous + token broadcast). The
-    /// follower's own Recruit-time temperature (a load-time default) can differ from the leader's per-turn
-    /// temperature, and a mismatch makes the two ranks run DIFFERENT per-token forward/collective sequences →
-    /// pipeline desync → GPU watchdog. (Defaults to 0 so older leaders that omit it stay greedy/lockstep.)
+    /// The LEADER's FULL per-round decode params. The follower MUST decode byte-identically to the leader: it
+    /// recomputes the SAME logits (the pipeline all-gathers rank-0's hidden so every rank runs norm+lm_head) and
+    /// then samples — so it must apply the SAME logit processing (rep-pen) and the SAME sampler. The load-time
+    /// `Recruit` carries only DEFAULT params (`loadDistributedLeader` gets none), and the per-turn agent params
+    /// (rep-pen/top-p/temp from the model's adapter) live HERE. BUG-E (Jun 30 2026): syncing only `temperature`
+    /// left the follower on DEFAULT rep-pen while the leader applied the adapter's — so in greedy lockstep the
+    /// ranks matched for a few tokens (rep-pen inactive) then DIVERGED once repetition built → pipeline desync
+    /// (one rank stops/tripwires, the other waits its next collective) → ~45s GPU watchdog crash. All sampler
+    /// fields now ride along per round. (`prefillStepSize` stays the follower's load-time value.)
     public let temperature: Float
-    public init(tokens: [Int32], maxTokens: Int, reset: Bool, temperature: Float = 0) {
-        self.temperature = temperature
+    public let topP: Float
+    public let topK: Int
+    public let minP: Float
+    public let repetitionPenalty: Float?
+    public let repetitionContextSize: Int
+    public init(tokens: [Int32], maxTokens: Int, reset: Bool, params: GenerateParameters) {
         self.tokens = tokens; self.maxTokens = maxTokens; self.reset = reset
+        self.temperature = params.temperature; self.topP = params.topP
+        self.topK = params.topK; self.minP = params.minP
+        self.repetitionPenalty = params.repetitionPenalty
+        self.repetitionContextSize = params.repetitionContextSize
+    }
+    /// The leader's per-round decode params, applied over the follower's load-time `base` (keeps `base`'s
+    /// `prefillStepSize`/`maxTokens` shape; overrides every sampler field that drives token selection).
+    public func decodeParams(over base: GenerateParameters) -> GenerateParameters {
+        var p = base
+        p.temperature = temperature; p.topP = topP; p.topK = topK; p.minP = minP
+        p.repetitionPenalty = repetitionPenalty; p.repetitionContextSize = repetitionContextSize
+        return p
     }
 }
 
@@ -75,9 +95,20 @@ public func serveFollower(channel: FramedChannel) async throws {
     let recruit = try await channel.receive(Recruit.self)
     distLog("[follower] recruited \(recruit.modelId) rank \(recruit.rank)/\(recruit.ringHosts.count) "
         + "boundary=\(recruit.boundary.map(String.init) ?? "even")")
+    // Ring-topology breadcrumb (one per recruit): the EXACT ringHosts this rank received + who it dials,
+    // diffable against the leader's "[leader] ring …" line when a rendezvous ever misbehaves again.
+    distLog("[follower] ringHosts=\(recruit.ringHosts) — rank \(recruit.rank) will connect to rank "
+        + "\((recruit.rank + 1) % max(1, recruit.ringHosts.count)) = "
+        + "\(recruit.ringHosts.indices.contains((recruit.rank + 1) % max(1, recruit.ringHosts.count)) ? recruit.ringHosts[(recruit.rank + 1) % recruit.ringHosts.count] : "?")")
     let (model, rank, size) = try await MLXLanguageModel.loadDistributedFromHosts(
         modelId: recruit.modelId, hosts: recruit.ringHosts, rank: recruit.rank, boundary: recruit.boundary)
-    let profile = ModelFamilyDetector.profile(forModelId: recruit.modelId, toolCallFormat: nil)
+    // BUG-E (Jun 30 2026): the follower MUST compute the SAME stop set as the leader, or in greedy lockstep a
+    // token that's a stop for one rank but not the other makes one rank `break` while the other enters its next
+    // ring collective → deadlock → 45s GPU watchdog. The leader's stops come from the CONFIG-DRIVEN `localAdapter`
+    // (the model's own generation_config eos_token_id + stop_strings); the old family `ModelFamilyDetector.profile`
+    // uses hardcoded per-family eos that differ. Use the config-driven adapter here too — the follower has the same
+    // model files, so it resolves byte-identical stops.
+    let profile = await model.localAdapter
     let params = recruit.generateParameters()
     let kvBox = OwnedKVCacheBox()
     distLog("[follower] ring formed rank \(rank)/\(size); serving round inputs …")
@@ -86,10 +117,10 @@ public func serveFollower(channel: FramedChannel) async throws {
         do { input = try await channel.receive(FollowerRoundInput.self) }
         catch { break }   // channel closed ⇒ leader done/gone ⇒ release the shard
         if input.reset { kvBox.reset() }
-        // Decode with the LEADER's temperature (not our load-time default) so we take the IDENTICAL decode
-        // branch and run the same per-token forward/collective sequence — otherwise the ranks desync.
-        var roundParams = params
-        roundParams.temperature = input.temperature
+        // Decode with the LEADER's FULL per-round params (rep-pen + sampler), not just temperature — otherwise the
+        // ranks apply DIFFERENT logit processing and diverge in greedy lockstep (BUG-E). `base` (Recruit params)
+        // contributes only the non-sampler shape (prefillStepSize).
+        let roundParams = input.decodeParams(over: params)
         for try await _ in model.streamFromTokens(
             input.tokens, maxTokens: input.maxTokens, adapter: profile, params: roundParams, kvBox: kvBox) {}
     }
@@ -129,6 +160,12 @@ extension MLXLanguageModel {
         try await channel.send(Recruit(
             modelId: modelId, ringHosts: ringHosts, rank: followerRank,
             boundary: boundary, generation: generation, params: params))
+        // Ring-topology breadcrumb (one per load): the EXACT ringHosts the leader binds + sent in the Recruit,
+        // diffable against the follower's "[follower] ringHosts=" line when a rendezvous ever misbehaves again.
+        // (A silent SYN_SENT hang here historically meant the FOLLOWER lost macOS Local-Network access — an
+        // orphaned launch; the launcher must keep it `ssh -tt` PTY-attached. See DISTRIBUTED_ROOM_HANDOFF bug D.)
+        distLog("[leader] ring rank 0/\(ringHosts.count) hosts=\(ringHosts) — binds \(ringHosts.first ?? "?"), "
+            + "rendezvous with \(ringHosts.last ?? "?") …")
         // Form the ring as rank 0 (rendezvous with the follower's loadDistributedFromHosts) + load.
         let group = try DistributedGroup(ringHosts: ringHosts, rank: 0)
         let ctx = DistributedContext(group: group, channel: channel, generation: generation)

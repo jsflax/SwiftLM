@@ -339,6 +339,17 @@ extension MLXLanguageModel {
         -> AsyncThrowingStream<Generation, Error> {
         AsyncThrowingStream { cont in
             let task = Task {
+                // BUG-F: convert MLX runtime errors on the turn path into a THROWN turn error instead of
+                // process death. mlx's Metal completion handlers can observe a command-buffer error (e.g. the
+                // ~45s GPU-watchdog kIOGPUCommandBufferCallbackErrorTimeout) on Metal's own dispatch queue —
+                // our mlx-swift fork now RECORDS those (throwing there is uncatchable → SIGABRT) and re-throws
+                // at the next sync check point, which lands inside this block. `MLX.withError`'s task-local
+                // handler turns that (and any real mid-turn GPU error) into a Swift error at block exit →
+                // cont.finish(throwing:) → the round loop finalizes the turn `.errored` → the room's storm
+                // guard pauses gracefully. Before this, a stale watchdog callback aborted the whole loop
+                // seconds AFTER a turn had already completed correctly.
+                do {
+                    try await MLX.withError {
                 await container.perform { ctx in
                     // Part C: bind this agent's role trait-set for THIS decode. `perform`→`read`→`withLock` are
                     // inline continuations in this SAME Task (no hop), so the @TaskLocal reaches every resident
@@ -588,6 +599,13 @@ extension MLXLanguageModel {
                     }   // close LoRARuntime.$activeTraits.withValue
                     }   // close MLX.GPU.withWiredLimit
                 }
+                    }   // close MLX.withError
+                } catch {
+                    // An MLX error surfaced (recorded-async or synchronous). The chunks already streamed are
+                    // whatever the model produced before the fault; the TURN is what errors — never the process.
+                    cont.finish(throwing: error)
+                    return
+                }
                 cont.finish()
             }
             cont.onTermination = { _ in task.cancel() }
@@ -644,4 +662,21 @@ extension MLXLanguageModel {
             }
         }
     }
+}
+
+/// Process-level MLX error backstop for DRIVER processes (orbital-loop). An MLX error that surfaces on a
+/// code path without a scoped `MLX.withError` handler hits mlx-swift's default handler — `fatalError` —
+/// killing a loop that owns a room lease over an error the turn machinery would have absorbed (observed:
+/// a deferred async command-buffer error surfacing through a stray `MLXArray.eval()` outside the turn's
+/// `withError` wrap; see the BUG-F notes in `streamFromTokens`). Policy for a driver: LOG loudly and keep
+/// the process — the turn-level wrap owns real recovery (errored turn → storm guard → durable pause), and
+/// the owner-lease reaper covers a genuinely wedged loop. Call once at process start.
+/// (`setErrorHandler` is deprecated in favor of scoped `withError`, but a global backstop is exactly what a
+/// long-lived driver with detached tasks needs — scoped handlers can't span `dispatchMain()`.)
+public func installMLXProcessErrorBackstop() {
+    setErrorHandler({ message, _ in
+        let m = message.map { String(cString: $0) } ?? "unknown"
+        FileHandle.standardError.write(
+            Data("[mlx] UNSCOPED MLX ERROR (process kept alive; turn-level handling owns recovery): \(m)\n".utf8))
+    }, data: nil, dtor: nil)
 }
