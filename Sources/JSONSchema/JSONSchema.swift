@@ -643,10 +643,16 @@ extension Date : JSONSchemaConvertible {
 
     public static func decode<K: CodingKey>(from container: KeyedDecodingContainer<K>, forKey key: K) throws -> Self {
         let value = try container.decode(String.self, forKey: key)
-        let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue)
-        let matches = detector?.matches(in: value, options: [], range: NSMakeRange(0, value.utf16.count))
-        return matches!.first!.date!
-        // return ISO8601DateFormatter().date(from: value)!
+        #if canImport(ObjectiveC)
+        // NSDataDetector handles loose, human-ish date strings — Darwin only
+        // (never implemented in swift-corelibs-foundation).
+        if let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue),
+           let date = detector.matches(in: value, options: [], range: NSMakeRange(0, value.utf16.count)).first?.date {
+            return date
+        }
+        #endif
+        if let date = ISO8601DateFormatter().date(from: value) { return date }
+        throw JSONDecodingError.invalidType
     }
 }
 
