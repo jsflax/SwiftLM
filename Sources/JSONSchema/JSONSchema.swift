@@ -1382,3 +1382,15 @@ public typealias OpenAIJSONSchemaConvertible = _OpenAI.JSONSchemaConvertible
 #else
 @_marker protocol OpenAIJSONSchemaConvertible {}
 #endif
+
+// MARK: - Cross-platform Generable shim
+// The @JSONSchema macro emits `extension T: _JSONSchemaGenerable {}` because an
+// extension macro cannot wrap a whole extension in `#if canImport(...)`. On
+// Darwin this IS FoundationModels.Generable; on Linux it is an empty protocol
+// so expansions still compile.
+#if canImport(FoundationModels)
+@available(iOS 26.0, macOS 26.0, *)
+public typealias _JSONSchemaGenerable = FoundationModels.Generable
+#else
+public protocol _JSONSchemaGenerable {}
+#endif
