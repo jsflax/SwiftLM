@@ -1273,13 +1273,13 @@ extension MKPointOfInterestCategory: Generable {
 
 #if canImport(FoundationModels)
 @attached(member, names: arbitrary)
-@attached(extension, conformances: JSONSchemaConvertible, CaseIterable, Generable, JSONSchemaKey,
+@attached(extension, conformances: JSONSchemaConvertible, CaseIterable, Generable, _JSONSchemaGenerable, JSONSchemaKey,
           names: arbitrary)
 public macro JSONSchema() = #externalMacro(module: "JSONSchemaMacros",
                                            type: "JSONSchemaMacro")
 #else
 @attached(member, names: arbitrary)
-@attached(extension, conformances: JSONSchemaConvertible, CaseIterable, JSONSchemaKey,
+@attached(extension, conformances: JSONSchemaConvertible, CaseIterable, _JSONSchemaGenerable, JSONSchemaKey,
           names: arbitrary)
 public macro JSONSchema() = #externalMacro(module: "JSONSchemaMacros",
                                            type: "JSONSchemaMacro")
