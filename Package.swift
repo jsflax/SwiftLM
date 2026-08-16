@@ -29,6 +29,16 @@ let package = Package(
         .library(
             name: "SelfImprove",
             targets: ["SelfImprove"]),
+        // Exported for external consumers (JoyJet trip service, engram AdviseBackend):
+        // Serving = the backend-agnostic agent turn loop (AgentTurn/AgentTurnBackend,
+        // zero MLX deps); JSONSchema = the @JSONSchema/@SchemaGuide macros without
+        // dragging the CoreML-bound SwiftLM product into Linux dependency graphs.
+        .library(
+            name: "Serving",
+            targets: ["Serving"]),
+        .library(
+            name: "JSONSchema",
+            targets: ["JSONSchema"]),
         .executable(
             name: "selfloop",
             targets: ["selfloop"]),
