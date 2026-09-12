@@ -643,10 +643,16 @@ extension Date : JSONSchemaConvertible {
 
     public static func decode<K: CodingKey>(from container: KeyedDecodingContainer<K>, forKey key: K) throws -> Self {
         let value = try container.decode(String.self, forKey: key)
-        let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue)
-        let matches = detector?.matches(in: value, options: [], range: NSMakeRange(0, value.utf16.count))
-        return matches!.first!.date!
-        // return ISO8601DateFormatter().date(from: value)!
+        #if canImport(ObjectiveC)
+        // NSDataDetector handles loose, human-ish date strings — Darwin only
+        // (never implemented in swift-corelibs-foundation).
+        if let detector = try? NSDataDetector(types: NSTextCheckingResult.CheckingType.date.rawValue),
+           let date = detector.matches(in: value, options: [], range: NSMakeRange(0, value.utf16.count)).first?.date {
+            return date
+        }
+        #endif
+        if let date = ISO8601DateFormatter().date(from: value) { return date }
+        throw JSONDecodingError.invalidType
     }
 }
 
@@ -1267,13 +1273,13 @@ extension MKPointOfInterestCategory: Generable {
 
 #if canImport(FoundationModels)
 @attached(member, names: arbitrary)
-@attached(extension, conformances: JSONSchemaConvertible, CaseIterable, Generable, JSONSchemaKey,
+@attached(extension, conformances: JSONSchemaConvertible, CaseIterable, Generable, _JSONSchemaGenerable, JSONSchemaKey,
           names: arbitrary)
 public macro JSONSchema() = #externalMacro(module: "JSONSchemaMacros",
                                            type: "JSONSchemaMacro")
 #else
 @attached(member, names: arbitrary)
-@attached(extension, conformances: JSONSchemaConvertible, CaseIterable, JSONSchemaKey,
+@attached(extension, conformances: JSONSchemaConvertible, CaseIterable, _JSONSchemaGenerable, JSONSchemaKey,
           names: arbitrary)
 public macro JSONSchema() = #externalMacro(module: "JSONSchemaMacros",
                                            type: "JSONSchemaMacro")
@@ -1375,4 +1381,16 @@ extension _OpenAI {
 public typealias OpenAIJSONSchemaConvertible = _OpenAI.JSONSchemaConvertible
 #else
 @_marker protocol OpenAIJSONSchemaConvertible {}
+#endif
+
+// MARK: - Cross-platform Generable shim
+// The @JSONSchema macro emits `extension T: _JSONSchemaGenerable {}` because an
+// extension macro cannot wrap a whole extension in `#if canImport(...)`. On
+// Darwin this IS FoundationModels.Generable; on Linux it is an empty protocol
+// so expansions still compile.
+#if canImport(FoundationModels)
+@available(iOS 26.0, macOS 26.0, *)
+public typealias _JSONSchemaGenerable = FoundationModels.Generable
+#else
+public protocol _JSONSchemaGenerable {}
 #endif

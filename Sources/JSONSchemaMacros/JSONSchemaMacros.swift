@@ -328,13 +328,18 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
 
             return [
                 // FoundationModels Generable support for enums
+                // (#if-wrapped: FoundationModels is Darwin-only — Linux consumers
+                // must still be able to expand this macro.)
                 """
+                #if canImport(FoundationModels)
                 @available(iOS 26.0, macOS 26.0, *)
                 public static var generationSchema: FoundationModels.GenerationSchema {
                     FoundationModels.GenerationSchema(type: Self.self, anyOf: [\(raw: casesString)])
                 }
+                #endif
                 """,
                 """
+                #if canImport(FoundationModels)
                 @available(iOS 26.0, macOS 26.0, *)
                 public init(_ content: FoundationModels.GeneratedContent) throws {
                     let rawValue: String = try content.value()
@@ -343,12 +348,15 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
                     }
                     self = value
                 }
+                #endif
                 """,
                 """
+                #if canImport(FoundationModels)
                 @available(iOS 26.0, macOS 26.0, *)
                 public var generatedContent: FoundationModels.GeneratedContent {
                     FoundationModels.GeneratedContent(rawValue)
                 }
+                #endif
                 """
             ]
         }
@@ -503,28 +511,34 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
                 }.joined(separator: "\n"))
             }
             """,
-            // FoundationModels Generable support
+            // FoundationModels Generable support (#if-wrapped for Linux)
             """
+            #if canImport(FoundationModels)
             @available(iOS 26.0, macOS 26.0, *)
             public static var generationSchema: FoundationModels.GenerationSchema {
                 FoundationModels.GenerationSchema(type: Self.self, properties: [
                     \(raw: generationSchemaProperties)
                 ])
             }
+            #endif
             """,
             """
+            #if canImport(FoundationModels)
             @available(iOS 26.0, macOS 26.0, *)
             public init(_ content: FoundationModels.GeneratedContent) throws {
                 \(raw: initFromGeneratedContent)
             }
+            #endif
             """,
             """
+            #if canImport(FoundationModels)
             @available(iOS 26.0, macOS 26.0, *)
             public var generatedContent: FoundationModels.GeneratedContent {
                 FoundationModels.GeneratedContent(properties: [
                     \(raw: generatedContentProperties)
                 ])
             }
+            #endif
             """
         ]
     }
@@ -640,7 +654,7 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
             let generableExtension = try ExtensionDeclSyntax(
                 """
                 @available(iOS 26.0, macOS 26.0, *)
-                extension \(type): FoundationModels.Generable {}
+                extension \(type): _JSONSchemaGenerable {}
                 """
             )
 
@@ -666,7 +680,7 @@ class JSONSchemaMacro: ExtensionMacro, MemberMacro, FreestandingMacro {
             let generableExtension = try ExtensionDeclSyntax(
                 """
                 @available(iOS 26.0, macOS 26.0, *)
-                extension \(type): FoundationModels.Generable {}
+                extension \(type): _JSONSchemaGenerable {}
                 """
             )
 
