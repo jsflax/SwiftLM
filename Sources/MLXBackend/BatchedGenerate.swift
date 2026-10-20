@@ -337,7 +337,17 @@ extension MLXLanguageModel {
                                  activeTraits: Set<TraitID> = [],
                                  image imageBox: OwnedImageBox = .init(nil))
         -> AsyncThrowingStream<Generation, Error> {
-        AsyncThrowingStream { cont in
+        streamFromTokensWithTask(row, maxTokens: maxTokens, adapter: adapter, params: params,
+                                 kvBox: kvBox, activeTraits: activeTraits, image: imageBox).stream
+    }
+
+    /// Preserve the decode owner so a round can await cache cleanup before reusing its history.
+    public func streamFromTokensWithTask(_ row: [Int32], maxTokens: Int, adapter: ModelProfile,
+                                 params: GenerateParameters, kvBox: OwnedKVCacheBox? = nil,
+                                 activeTraits: Set<TraitID> = [],
+                                 image imageBox: OwnedImageBox = .init(nil))
+        -> (stream: AsyncThrowingStream<Generation, Error>, task: Task<Void, Never>) {
+        let (stream, cont) = AsyncThrowingStream<Generation, Error>.makeStream()
             let task = Task {
                 // BUG-F: convert MLX runtime errors on the turn path into a THROWN turn error instead of
                 // process death. mlx's Metal completion handlers can observe a command-buffer error (e.g. the
@@ -609,7 +619,7 @@ extension MLXLanguageModel {
                 cont.finish()
             }
             cont.onTermination = { _ in task.cancel() }
-        }
+        return (stream, task)
     }
 
     /// Battle-test ONLY (`SWIFTLM_SPIRAL_INJECT=<tokenId>`): a `[1, vocab]` logit row peaked far above the rest

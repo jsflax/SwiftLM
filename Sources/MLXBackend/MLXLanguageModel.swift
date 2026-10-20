@@ -38,7 +38,8 @@ public final class MLXLanguageModel: Sendable {
     /// `SWIFTLM_MODEL` env var (e.g. `mlx-community/DeepSeek-R1-Distill-Qwen-32B-4bit` for the
     /// reasoning-grade prod band) without a rebuild; 7B-Coder stays the fast default test harness.
     public static func load(
-        modelId: String? = nil
+        modelId: String? = nil,
+        allowDownload: Bool = true
     ) async throws -> MLXLanguageModel {
         let id = modelId
             ?? ProcessInfo.processInfo.environment["SWIFTLM_MODEL"]
@@ -50,8 +51,16 @@ public final class MLXLanguageModel: Sendable {
         // stop the linker dead-stripping it (referencing `VLMTypeRegistry` is NOT enough). Text-only models throw
         // `unsupportedModelType` in the VLM factory and fall through to the LLM factory. Proven by the P0 spike.
         _ = MLXVLM.TrampolineModelFactory.self
-        let container = try await #huggingFaceLoadModelContainer(
-            configuration: ModelConfiguration(id: id))
+        let configuration: ModelConfiguration
+        if let snapshot = Self.localHFSnapshot(modelId: id) {
+            configuration = ModelConfiguration(directory: snapshot)
+            FileHandle.standardError.write(Data("[mlx-load] local snapshot \(snapshot.path) (no download)\n".utf8))
+        } else if allowDownload {
+            configuration = ModelConfiguration(id: id)
+        } else {
+            throw LocalModelSnapshotError.notCached(id)
+        }
+        let container = try await #huggingFaceLoadModelContainer(configuration: configuration)
         // Guard the silent-text-only regression: if MLXVLM ever fails to register, a vision model loads through the
         // text factory with NO error and just never sees pixels. Log the resolved model class so that's visible.
         let loadedClass = await container.perform { ctx in String(describing: type(of: ctx.model)) }
@@ -149,25 +158,7 @@ public final class MLXLanguageModel: Sendable {
     /// if not cached. Honors `HF_HUB_CACHE` / `HF_HOME`, else `~/.cache/huggingface/hub`. Picks the
     /// snapshot that actually has a `config.json` (skips incomplete/blob-only dirs).
     static func localHFSnapshot(modelId: String) -> URL? {
-        let env = ProcessInfo.processInfo.environment
-        let hubCache: URL
-        if let c = env["HF_HUB_CACHE"], !c.isEmpty {
-            hubCache = URL(fileURLWithPath: c)
-        } else if let h = env["HF_HOME"], !h.isEmpty {
-            hubCache = URL(fileURLWithPath: h).appendingPathComponent("hub")
-        } else {
-            hubCache = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent(".cache/huggingface/hub")
-        }
-        let munged = "models--" + modelId.replacingOccurrences(of: "/", with: "--")
-        let snapshots = hubCache.appendingPathComponent("\(munged)/snapshots")
-        guard let dirs = try? FileManager.default.contentsOfDirectory(
-            at: snapshots, includingPropertiesForKeys: nil) else { return nil }
-        for d in dirs where FileManager.default.fileExists(
-            atPath: d.appendingPathComponent("config.json").path) {
-            return d
-        }
-        return nil
+        LocalModelSnapshot.resolve(modelID: modelId)
     }
 
     /// Text completion. A repetition penalty is on by default — LoRA adapters overfit to

@@ -145,6 +145,13 @@ final class ChatSessionTurnBackend: AgentTurnBackend, @unchecked Sendable {
 
     func round(instructions: String?, prompt: String, resume: [ResumeMessage], toolsEnabled: Bool, images: [URL])
         -> AsyncThrowingStream<GenStep, Error> {
+        roundWithTask(instructions: instructions, prompt: prompt, resume: resume,
+                      toolsEnabled: toolsEnabled, images: images).stream
+    }
+
+    func roundWithTask(instructions: String?, prompt: String, resume: [ResumeMessage], toolsEnabled: Bool, images: [URL])
+        -> (stream: AsyncThrowingStream<GenStep, Error>, task: Task<Void, Never>?) {
+        if Task.isCancelled { return (AsyncThrowingStream { $0.finish(throwing: CancellationError()) }, nil) }
         if resume.isEmpty { basePrompt = prompt }   // remember the user prompt for arg constraining
         if compacting == nil {
             compacting = CompactingSession(model: model, instructions: instructions, params: params,
@@ -153,9 +160,10 @@ final class ChatSessionTurnBackend: AgentTurnBackend, @unchecked Sendable {
                                            activeTraits: activeTraits, terminalTools: terminalTools)
         }
         let comp = compacting!
-        return AsyncThrowingStream { continuation in
+        let (stream, continuation) = AsyncThrowingStream<GenStep, Error>.makeStream()
             let task = Task {
                 do {
+                    try Task.checkCancellation()
                     // Build the round's input here (not captured) — Chat.Message isn't Sendable; resume/prompt are.
                     let input: [Chat.Message] = resume.isEmpty
                         ? [.user(prompt, images: images.map { .url($0) })]
@@ -167,11 +175,13 @@ final class ChatSessionTurnBackend: AgentTurnBackend, @unchecked Sendable {
                         }
                     // Collect tool calls during the stream (text streams live); constrain AFTER it finishes so
                     // the arg-regeneration generations don't contend with the in-flight ChatSession.
-                    let stream = await comp.beginRound(input, toolsEnabled: toolsEnabled)
+                    let producer = await comp.beginRoundWithTask(input, toolsEnabled: toolsEnabled)
                     var text = ""
                     var raw: [(String, String)] = []
                     var ctxTokens: Int? = nil
-                    for try await g in stream {
+                    do {
+                    for try await g in producer.stream {
+                        try Task.checkCancellation()
                         if let tc = g.toolCall {
                             raw.append((tc.function.name, MLXLanguageModel.argsJSON(tc.function.arguments)))
                         } else if let ch = g.chunk {
@@ -180,6 +190,13 @@ final class ChatSessionTurnBackend: AgentTurnBackend, @unchecked Sendable {
                         }
                         if case .info(let info) = g { ctxTokens = info.promptTokenCount + info.generationTokenCount }
                     }
+                    } catch {
+                        producer.task?.cancel(); await producer.task?.value
+                        throw error
+                    }
+                    if Task.isCancelled { producer.task?.cancel() }
+                    await producer.task?.value
+                    try Task.checkCancellation()
                     comp.finishRound(assistantText: text, contextTokens: ctxTokens)
                     // A `<tool_call>` the parser didn't surface (profile-driven). Fire when tools were offered —
                     // INCLUDING a routing-only round under completion pressure (terminalTools live): that recovers
@@ -190,6 +207,7 @@ final class ChatSessionTurnBackend: AgentTurnBackend, @unchecked Sendable {
                     }
                     for (n0, a0) in raw {
                         let (n, a) = await constrain(n0, a0)
+                        try Task.checkCancellation()
                         continuation.yield(.toolCall(name: n, argsJSON: a))
                     }
                     continuation.finish()
@@ -198,7 +216,7 @@ final class ChatSessionTurnBackend: AgentTurnBackend, @unchecked Sendable {
                 }
             }
             continuation.onTermination = { _ in task.cancel() }
-        }
+        return (stream, task)
     }
 
     /// Make a routed tool call valid by construction (name ∈ tools, args ∈ schema) via the grammar; falls

@@ -108,6 +108,12 @@ final class CompactingSession: @unchecked Sendable {
     /// Split this way (vs a callback) so no closure crosses into an async method — keeps Swift concurrency
     /// happy while preserving live streaming.
     func beginRound(_ input: [Chat.Message], toolsEnabled: Bool) async -> AsyncThrowingStream<Generation, Error> {
+        await beginRoundWithTask(input, toolsEnabled: toolsEnabled).stream
+    }
+
+    func beginRoundWithTask(_ input: [Chat.Message], toolsEnabled: Bool) async
+        -> (stream: AsyncThrowingStream<Generation, Error>, task: Task<Void, Never>?) {
+        if Task.isCancelled { return (AsyncThrowingStream { $0.finish(throwing: CancellationError()) }, nil) }
         // OWNED RENDER (strict reasoning+tool templates, e.g. the 122B): bypass ChatSession's lossy incremental
         // restart (which drops the user query → "No user query found") and instead re-render the WHOLE
         // structured transcript each round through the model's real template, decoding live via streamFromTokens.
@@ -120,7 +126,7 @@ final class CompactingSession: @unchecked Sendable {
         // the two ranks' pipeline send/recv collectives desync and the leader's command buffer hangs past the GPU
         // watchdog (the kIOGPUCommandBufferCallbackErrorTimeout we hit). Gated on the leader's distributedContext.
         if adapter.requiresOwnedRender || LoRARuntime.bankEnabled || model.distributedContext != nil {
-            return await ownedRound(input, toolsEnabled: toolsEnabled)
+            return await ownedRoundWithTask(input, toolsEnabled: toolsEnabled)
         }
         // Past here = a NON-owned-render decode path (co-batch `batchGen` / ChatSession `streamDetails`), each of
         // which decodes inside nested unstructured Task{}s the activeTraits @TaskLocal cannot cross. Traits are
@@ -128,6 +134,7 @@ final class CompactingSession: @unchecked Sendable {
         // than silently serve base (Part C "never silently serve base" tripwire).
         LoRARuntime.assertCarriable(activeTraits, path: batchGen != nil ? "co-batch BatchGenerator" : "ChatSession.streamDetails")
         if contextTokens > budget.maxContextTokens { await compact() }
+        if Task.isCancelled { return (AsyncThrowingStream { $0.finish(throwing: CancellationError()) }, nil) }
         messages.append(contentsOf: input)
         // SLICE 3 batched path: render the WHOLE conversation (+ tools) to tokens, generate through the
         // coalescing pool (so concurrent sub-agents fuse), parse the tool call from text via the model's own
@@ -160,14 +167,15 @@ final class CompactingSession: @unchecked Sendable {
                     + "parsed=\(call?.function.name ?? "nil") hasToolCall=\(text.contains("<tool_call>")) "
                     + "text=\"\(text.replacingOccurrences(of: "\n", with: " ").prefix(120))\"\n").utf8))
             }
-            return AsyncThrowingStream { cont in
+            return (AsyncThrowingStream { cont in
                 cont.yield(.chunk(text))
                 if let call { cont.yield(.toolCall(call)) }
                 cont.finish()
-            }
+            }, nil)
         }
         session.tools = renderSpecs(toolsEnabled: toolsEnabled)   // terminal/routing tools survive completion pressure
-        return session.streamDetails(to: input)
+        let producer = session.streamDetailsWithTask(to: input)
+        return (producer.stream, producer.task)
     }
 
     /// Record a round's outcome after the caller consumed the stream: append the assistant's turn + update the
@@ -191,7 +199,8 @@ final class CompactingSession: @unchecked Sendable {
     /// OWNED-RENDER round: append the new input as structured turns, render the WHOLE transcript (user query
     /// preserved by `continuationMessages`) through the model's real template, decode live, and parse the tool
     /// call from the accumulated text (the xmlFunction/json parser the 122B needs; recover handles the rest).
-    private func ownedRound(_ input: [Chat.Message], toolsEnabled: Bool) async -> AsyncThrowingStream<Generation, Error> {
+    private func ownedRoundWithTask(_ input: [Chat.Message], toolsEnabled: Bool) async
+        -> (stream: AsyncThrowingStream<Generation, Error>, task: Task<Void, Never>?) {
         structuredTurns.append(contentsOf: input.map(Self.turnMessage))
         // BUG-2 fix: owned-render must carry the system prompt too. The ChatSession path applies it via
         // `ChatSession(instructions:)`, but the owned-render transcript is built ONLY from `structuredTurns` — so
@@ -249,14 +258,19 @@ final class CompactingSession: @unchecked Sendable {
         // reasoning renders mid-thought.
         let primeThink = anyTools && adapter.emitsReasoning
         let openTag = adapter.reasoningTags.open
-        return AsyncThrowingStream { cont in
+        if Task.isCancelled { return (AsyncThrowingStream { $0.finish(throwing: CancellationError()) }, nil) }
+        let (stream, cont) = AsyncThrowingStream<Generation, Error>.makeStream()
             let task = Task {
                 var text = ""
                 var firstChunk = true
                 do {
-                    for try await g in model.streamFromTokens(tokens, maxTokens: maxTok, adapter: adapter,
+                    try Task.checkCancellation()
+                    let producer = model.streamFromTokensWithTask(tokens, maxTokens: maxTok, adapter: adapter,
                                                               params: params, kvBox: kvBox, activeTraits: activeTraits,
-                                                              image: imageBox) {
+                                                              image: imageBox)
+                    do {
+                    for try await g in producer.stream {
+                        try Task.checkCancellation()
                         if case .chunk(let c) = g {
                             let piece = (firstChunk && primeThink) ? openTag + c : c
                             firstChunk = false
@@ -269,6 +283,13 @@ final class CompactingSession: @unchecked Sendable {
                             cont.yield(g)
                         }
                     }
+                    } catch {
+                        producer.task.cancel(); await producer.task.value
+                        throw error
+                    }
+                    if Task.isCancelled { producer.task.cancel() }
+                    await producer.task.value
+                    try Task.checkCancellation()
                 } catch { cont.finish(throwing: error); return }
                 // Parse the tool call from the full text (think stripped so the parser doesn't read reasoning as
                 // the name); reject an obviously-garbage name. A parser miss falls to the round loop's recover.
@@ -281,7 +302,7 @@ final class CompactingSession: @unchecked Sendable {
                 cont.finish()
             }
             cont.onTermination = { _ in task.cancel() }
-        }
+        return (stream, task)
     }
 
     /// Convert an mlx `Chat.Message` (user/tool/system input) → a Sendable `TurnMessage` for the owned transcript.
@@ -323,6 +344,7 @@ final class CompactingSession: @unchecked Sendable {
             "Summarize the conversation so far for an agent that must CONTINUE the task. Preserve the goal, "
             + "key decisions, facts, file paths, and tool results needed to proceed. Be concise.\n\n\(transcript)",
             maxTokens: 600)) ?? "(summary unavailable)"
+        guard !Task.isCancelled else { return }
         let boundary = Chat.Message.user("[Earlier conversation compacted to save context:\n\(stripReasoning(summary))]")
         messages = [boundary] + recent
         session = ChatSession(model.container, instructions: instructions,

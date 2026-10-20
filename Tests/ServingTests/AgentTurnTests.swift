@@ -34,6 +34,26 @@ struct AgentTurnTests {
         #expect(final == "the answer")
     }
 
+    @Test func approvalModeRequiresDecisionAndAppliesEditedArguments() async throws {
+        let blocked = StubBackend([[.toolCall(name: "write_file", argsJSON: "{}")], [.chunk("Stopped.")]])
+        let denied = streamAgentTurnWithTask(prompt: "q", instructions: nil, hooks: nil,
+            config: .init(permission: .init(mode: .approval, autopilot: false)), backend: blocked)
+        for try await _ in denied.stream {}
+        await denied.task.value
+        #expect(blocked.dispatched.isEmpty)
+
+        let allowed = StubBackend([[.toolCall(name: "write_file", argsJSON: "{}")], [.chunk("Done.")]])
+        let approved = streamAgentTurnWithTask(prompt: "q", instructions: nil, hooks: nil,
+            config: .init(permission: .init(mode: .approval, autopilot: false), approveTool: { name, input in
+                #expect(name == "write_file"); #expect(input == "{}")
+                return .init(allowed: true, argumentsJSON: #"{"path":"reviewed.txt"}"#)
+            }), backend: allowed)
+        for try await _ in approved.stream {}
+        await approved.task.value
+        #expect(allowed.dispatched.count == 1)
+        #expect(allowed.dispatched.first?.argsJSON == #"{"path":"reviewed.txt"}"#)
+    }
+
     @Test func plainTextTurnHasNoToolEvents() async throws {
         let backend = StubBackend([[.chunk("hi "), .chunk("there")]])
         let stream = streamAgentTurn(prompt: "q", instructions: nil, hooks: nil, config: .init(), backend: backend)
@@ -175,11 +195,12 @@ struct AgentTurnTests {
     }
 
     @Test func quietToolRoundsForceAnswerInsteadOfRamblingToMaxRounds() async throws {
-        // An over-eager model that keeps calling DISTINCT tools (each success) must be cut off after
+        // A read-only model that keeps calling DISTINCT tools (each success) must be cut off after
         // defaultMaxQuietToolRounds and forced to answer — NOT run all the way to maxRounds (12).
         let backend = RamblingBackend(duplicate: false)
         let stream = streamAgentTurn(prompt: "q", instructions: nil, hooks: nil,
-                                     config: .init(maxRounds: 12), backend: backend)
+                                     config: .init(maxRounds: 12, permission: .init(mode: .plan, readOnlyTools: ["peek"])),
+                                     backend: backend)
         var final: String? = nil
         for try await e in stream { if case .result(let f, _, _, _) = e { final = f } }
         #expect(backend.dispatched.count == defaultMaxQuietToolRounds)  // 4 quiet rounds, then forced answer

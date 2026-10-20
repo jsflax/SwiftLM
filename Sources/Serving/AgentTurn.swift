@@ -33,6 +33,11 @@ public protocol AgentTurnBackend: Sendable {
     /// the text `round`; only the MLX `ChatSessionTurnBackend` consumes them (attaches to the user `Chat.Message`).
     func round(instructions: String?, prompt: String, resume: [ResumeMessage], toolsEnabled: Bool, images: [URL])
         -> AsyncThrowingStream<GenStep, Error>
+    /// The same round plus its actual producer lifetime. Stream completion/cancellation alone
+    /// does not prove the producer has stopped touching session history or model state.
+    /// Stateful asynchronous backends must return their owner task; synchronous fixtures may use nil.
+    func roundWithTask(instructions: String?, prompt: String, resume: [ResumeMessage], toolsEnabled: Bool, images: [URL])
+        -> (stream: AsyncThrowingStream<GenStep, Error>, task: Task<Void, Never>?)
     /// Dispatch a tool call; return its result text + whether it errored.
     func dispatch(name: String, argsJSON: String) async -> (result: String, isError: Bool)
     /// The real running context size (prompt+gen tokens) after the final round, for honest result telemetry
@@ -46,6 +51,10 @@ public protocol AgentTurnBackend: Sendable {
 }
 
 public extension AgentTurnBackend {
+    func roundWithTask(instructions: String?, prompt: String, resume: [ResumeMessage], toolsEnabled: Bool, images: [URL])
+        -> (stream: AsyncThrowingStream<GenStep, Error>, task: Task<Void, Never>?) {
+        (round(instructions: instructions, prompt: prompt, resume: resume, toolsEnabled: toolsEnabled, images: images), nil)
+    }
     func finalContextTokens() -> Int? { nil }
     func finalOutputTokens() -> Int? { nil }
     /// Default: drop images and run the text round. Lets non-VLM backends and the test stubs satisfy the new
@@ -68,6 +77,7 @@ public struct AgentTurnConfig: Sendable {
     /// Resolves an `ExitPlanMode` call: approve → flip the turn to `.auto` and implement; reject → revise.
     /// `nil` → auto-approve (headless/Orbital default). The CLI supplies a stdin prompt.
     public var approvePlan: PlanApprover?
+    public var approveTool: ToolApprover?
     /// Per-dispatch wall-clock bound so one wedged tool can't stall the turn (`<= 0` disables it).
     public var toolTimeoutSeconds: Double
     /// TERMINAL/ROUTING tools (Orbital: `handoff`/`consult`/`done`) that completion-pressure must NEVER drop.
@@ -80,11 +90,12 @@ public struct AgentTurnConfig: Sendable {
                 toolNames: [String] = [], maxRounds: Int = 8,
                 permission: ToolPermissionPolicy = .init(),
                 approvePlan: PlanApprover? = nil,
+                approveTool: ToolApprover? = nil,
                 toolTimeoutSeconds: Double = defaultToolDispatchTimeoutSeconds,
                 terminalTools: Set<String> = []) {
         self.modelLabel = modelLabel; self.sessionID = sessionID; self.cwd = cwd
         self.toolNames = toolNames; self.maxRounds = maxRounds; self.permission = permission
-        self.approvePlan = approvePlan; self.toolTimeoutSeconds = toolTimeoutSeconds
+        self.approveTool = approveTool; self.approvePlan = approvePlan; self.toolTimeoutSeconds = toolTimeoutSeconds
         self.terminalTools = terminalTools
     }
 }
@@ -152,9 +163,20 @@ public func streamAgentTurn(
     backend: any AgentTurnBackend,
     images: [URL] = []
 ) -> AsyncThrowingStream<AgentStreamEvent, Error> {
-    AsyncThrowingStream { continuation in
-        let task = Task {
+    streamAgentTurnWithTask(prompt: prompt, instructions: instructions, hooks: hooks,
+                            config: config, backend: backend, images: images).stream
+}
+
+/// Hosts that persist a final memory snapshot must cancel and await this producer, not merely stop
+/// consuming its stream. Structured tool dispatch completes before the producer task finishes.
+public func streamAgentTurnWithTask(
+    prompt: String, instructions: String?, hooks: HookChain?, config: AgentTurnConfig,
+    backend: any AgentTurnBackend, images: [URL] = []
+) -> (stream: AsyncThrowingStream<AgentStreamEvent, Error>, task: Task<Void, Never>) {
+    let (stream, continuation) = AsyncThrowingStream<AgentStreamEvent, Error>.makeStream()
+    let task = Task {
             do {
+                try Task.checkCancellation()
                 continuation.yield(.systemInit(model: config.modelLabel, sessionID: config.sessionID,
                                                tools: config.toolNames, cwd: config.cwd))
 
@@ -195,6 +217,7 @@ public func streamAgentTurn(
                 // bounds any runaway. Matches the live loop.
                 let maxToolRounds = max(1, config.maxRounds - 1)
                 while round < config.maxRounds {
+                    try Task.checkCancellation()
                     // A BUILDER (its permission ALLOWS file mutation) must work freely across many rounds — read,
                     // edit, test, re-edit — so completion pressure must NOT apply to it: dropping its edits, or
                     // route-nudging it mid-write ("conclude, don't call other tools"), truncates a file rewrite to
@@ -210,14 +233,16 @@ public func streamAgentTurn(
                     let toolsOn = round < maxToolRounds && (isBuilder || quietToolRounds < defaultMaxQuietToolRounds)
                     // Images ride the FIRST (user) round only — the owned transcript then carries them forward
                     // across rounds (TurnMessage.imageURLs), so later rounds must not re-attach them.
-                    let stream = backend.round(instructions: instr, prompt: prompt,
+                    let ownedRound = backend.roundWithTask(instructions: instr, prompt: prompt,
                                                resume: resume, toolsEnabled: toolsOn,
                                                images: resume.isEmpty ? images : [])
                     resume = []
                     var text = ""
                     var toolCalls: [(name: String, argsJSON: String)] = []
                     var thinkFilter = ReasoningStreamFilter()   // split <think> off the visible deltas
-                    for try await step in stream {
+                    do {
+                    for try await step in ownedRound.stream {
+                        try Task.checkCancellation()
                         switch step {
                         case .chunk(let ch):
                             text += ch; outputChars += ch.count
@@ -232,6 +257,14 @@ public func streamAgentTurn(
                             toolCalls.append((name, argsJSON))
                         }
                     }
+                    } catch {
+                        ownedRound.task?.cancel()
+                        await ownedRound.task?.value
+                        throw error
+                    }
+                    if Task.isCancelled { ownedRound.task?.cancel() }
+                    await ownedRound.task?.value
+                    try Task.checkCancellation()
                     let tail = thinkFilter.flush()
                     if !tail.isEmpty { continuation.yield(.textDelta(tail)) }
                     round += 1
@@ -304,7 +337,7 @@ public func streamAgentTurn(
 
                     var results: [ResumeMessage] = []
                     var roundHadError = false, roundApproved = false, roundProgressed = false
-                    for call in toolCalls {
+                    for var call in toolCalls {
                         let id = UUID().uuidString
                         continuation.yield(.toolUse(id: id, name: call.name, inputJSON: call.argsJSON))
                         toolsCalled.append(call.name)
@@ -340,6 +373,21 @@ public func streamAgentTurn(
                             continuation.yield(.toolResult(id: id, content: blocked, isError: true))
                             results.append(.toolResult(blocked))
                             continue
+                        }
+                        if case .needsApproval = permission.decide(tool: call.name) {
+                            guard let approve = config.approveTool else {
+                                let denied = "This tool requires an approval handler; it was not executed."
+                                continuation.yield(.toolResult(id: id, content: denied, isError: true))
+                                results.append(.toolResult(denied)); roundHadError = true; continue
+                            }
+                            let decision = try await approve(call.name, call.argsJSON)
+                            try Task.checkCancellation()
+                            guard decision.allowed else {
+                                let denied = decision.reason.isEmpty ? "The user denied this tool call." : decision.reason
+                                continuation.yield(.toolResult(id: id, content: denied, isError: true))
+                                results.append(.toolResult(denied)); roundHadError = true; continue
+                            }
+                            call.argsJSON = decision.argumentsJSON ?? call.argsJSON
                         }
                         // SEAM C — PreToolUse: a hook may veto (plan-mode read-only, etc.).
                         if let hooks {
@@ -410,6 +458,7 @@ public func streamAgentTurn(
                     resume = results
                 }
 
+                try Task.checkCancellation()
                 // Strip reasoning (with the conclusion fallback) so the final result is clean for Orbital.
                 let stripped = displayAnswer(finalText)
                 let answer = !stripped.isEmpty ? stripped
@@ -430,6 +479,6 @@ public func streamAgentTurn(
                 continuation.finish(throwing: error)
             }
         }
-        continuation.onTermination = { _ in task.cancel() }
-    }
+    continuation.onTermination = { _ in task.cancel() }
+    return (stream, task)
 }

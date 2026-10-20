@@ -135,3 +135,14 @@ public struct ToolPermissionPolicy: Sendable, Equatable {
         }
     }
 }
+
+/// A consumer-owned decision at the exact dispatch boundary; edited arguments apply only to this call.
+public struct ToolApproval: Sendable {
+    public var allowed: Bool
+    public var argumentsJSON: String?
+    public var reason: String
+    public init(allowed: Bool, argumentsJSON: String? = nil, reason: String = "") {
+        self.allowed = allowed; self.argumentsJSON = argumentsJSON; self.reason = reason
+    }
+}
+public typealias ToolApprover = @Sendable (_ tool: String, _ argumentsJSON: String) async throws -> ToolApproval

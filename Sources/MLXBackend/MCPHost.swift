@@ -46,6 +46,7 @@ public actor MCPHost {
     }
 
     private var processes: [Process] = []
+    private var exitWaiters: [ObjectIdentifier: DispatchGroup] = [:]
     private var dispatchMap: [String: Client] = [:]      // namespaced tool name -> owning client
     private var originalToolName: [String: String] = [:] // namespaced name -> the server's bare tool name
     public private(set) var specs: [ToolSpec] = []       // OpenAI fn-schema for the model
@@ -82,8 +83,10 @@ public actor MCPHost {
         }
         proc.standardInput = inPipe
         proc.standardOutput = outPipe
+        let exited = DispatchGroup(); exited.enter()
+        proc.terminationHandler = { _ in exited.leave() }
         try proc.run()
-        processes.append(proc)
+        processes.append(proc); exitWaiters[ObjectIdentifier(proc)] = exited
 
         let transport = StdioTransport(
             input: FileDescriptor(rawValue: outPipe.fileHandleForReading.fileDescriptor),
@@ -192,6 +195,25 @@ public actor MCPHost {
         for p in processes where p.isRunning { p.terminate() }
         processes.removeAll()
     }
+
+    /// The host supplies its platform process-tree reaper. Awaiting this method confirms all direct
+    /// MCP processes have exited after their subtrees were stopped, before a graph is sealed.
+    public func shutdownAndDrain(terminate: @escaping @Sendable (Process) async -> Void) async {
+        let running = processes, waiters = exitWaiters
+        processes.removeAll(); exitWaiters.removeAll()
+        for process in running {
+            await terminate(process)
+            if let waiter = waiters[ObjectIdentifier(process)] {
+                await withCheckedContinuation { continuation in
+                    DispatchQueue.global(qos: .utility).async { waiter.wait(); continuation.resume() }
+                }
+            }
+        }
+        var closed = Set<ObjectIdentifier>()
+        for client in dispatchMap.values where closed.insert(ObjectIdentifier(client)).inserted { await client.disconnect() }
+        dispatchMap.removeAll(); originalToolName.removeAll()
+    }
+
 }
 
 extension MLXLanguageModel {
